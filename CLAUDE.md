@@ -71,7 +71,7 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - 动态跟踪止盈：持仓时间越长宽度越大（0.5%→1.0%）
 - **MOMENTUM_EXHAUSTED最小持仓20分钟（2026-03-30）**：5-15min止出75%是过早的（54笔中36笔），加最小持仓4根K线。32天PnL +634→+735pt（+16%），breakeven滑点2.5→4.0pt
 - 平仓后15分钟同方向冷却期
-- 开仓窗口：09:45~11:20, 13:05~14:15（`NO_OPEN_EOD = "06:15"` = 14:15 BJ）
+- 开仓窗口：09:45~11:20, 13:05~14:30（`NO_OPEN_EOD = "06:30"` = 14:30 BJ，从14:15推迟，尾盘信号WR=67-80%）
 
 ### VRP 计算（2026-03-26重构）
 - **VRP = IV - Blended RV**（不再直接用 GARCH）
@@ -97,25 +97,25 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - thr=60 交易更少但每笔更精准，盈亏平衡滑点更高
 - 可通过 `--threshold` 参数覆盖回测阈值
 
-### Monitor 盘口显示（2026-03-26新增）
-- 信号触发时显示期货 bid/ask 价格和挂单量
-- 建议限价：做多挂 ask1 排队，做空挂 bid1 排队；激进价 ±0.2 点吃盘口
-- 交互确认提示也带限价建议，控制滑点在 1-2 点以内
+### Monitor/Executor 职责分离（2026-03-31重构）
+- **Monitor只负责信号生成**：评分→写`/tmp/signal_pending.json`→注册shadow持仓→面板显示。不prompt，不阻塞
+- **Executor负责交易执行**：轮询JSON(1秒)→展示→Y/N确认→TQ限价单→撤单→记录
+- Monitor exit触发时写CLOSE JSON供executor平仓
+- 所有CLOSE信号超时持续提醒（不只止损）
+- shadow trades用期货价格记录entry/exit/PnL（不是现货）
 
 ### 仓位管理（2026-03-28决定）
 - **Fixed Risk 0.5%**：每笔最大亏损 = 账户权益 × 0.5%
-- 手数 = max(1, int(最大亏损 / (entry_price × 200 × 0.5%)))
-- 640万账户 × 0.5% = 32,000元，IM@7500 止损0.5% = 7,500元/手 → 建议4手
-- Monitor 信号触发时自动显示建议手数
-- 30天回测：Fixed Risk 0.5% 比 Fixed 1手 PnL 提升 3倍（+286K vs +92K），MaxDD 0.82%
-- **order_executor 实际下单手数 = 建议手数 ÷ 2**（保守起步）
+- 手数三级递减：monitor建议N手 → executor减半N/2手 → **实际执行1手**（`EXEC_MAX_LOTS=1`实盘验证期）
+- 品种乘数：`CONTRACT_MULT = {IF:300, IH:300, IM:200, IC:200}`
+- 安全规则：单日最多10单、亏损超1%停止开仓、信号>5分钟过期不执行
 
-### 半自动下单（2026-03-28新增）
-- Monitor 信号触发时写 `/tmp/signal_pending.json`
-- `scripts/order_executor.py` 监控文件 → 展示订单 → 操作者确认 → TQ限价单
-- 做多挂 ask1 排队，做空挂 bid1 排队，60秒未成交撤单
-- 开仓超时自动放弃，止损超时持续警告直到确认
-- 安全规则：单日最多10单、亏损超1%停止开仓
+### Executor 信号记录（2026-03-31新增）
+- `executor_log`表：每个收到的信号完整记录生命周期
+- 字段：signal_time/receive_time/operator_response(Y/N/TIMEOUT/EXPIRED)/order_status/filled_lots/cancel_time
+- signal_json保留原始JSON留底
+- 撤单机制：开仓60秒/平仓30秒未成交自动撤单，平仓未成交提示改激进价(±2跳)
+- 持仓追踪：executor内部`_positions`字典，无持仓忽略CLOSE、重复开仓跳过
 
 ### 股指期货平今手续费（2026-03-28决定）
 - 中金所股指期货（IM/IF/IH/IC）平今手续费万分之2.3，是开仓/平昨的10倍

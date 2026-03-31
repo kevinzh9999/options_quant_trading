@@ -585,10 +585,27 @@ Breakeven滑点：~2.5pt → ~4.0pt
 - 逆势：dm=0.8（做多做空对称）｜顺势：dm=1.2｜中性：dm=1.0
 - sensitivity thr=60: slip=0→+543pt, slip=2→+287pt, slip=3→+159pt, breakeven≈4.2pt
 
+### Monitor/Executor 重构（2026-03-31）
+
+- [x] **Monitor不再prompt**：信号触发直接写JSON+注册shadow，不阻塞等输入
+- [x] **Executor负责所有交易确认**：读JSON→展示→Y/N→TQ下单
+- [x] **所有CLOSE信号超时持续提醒**（不只止损，TRAILING_STOP等也持续提醒）
+- [x] **executor_log表**：每个信号完整记录（response/order_status/filled/cancel/signal_json）
+- [x] **撤单机制**：开仓60秒/平仓30秒未成交自动撤单，平仓提示改激进价
+- [x] **信号过期**：>5分钟的信号标记EXPIRED不执行
+- [x] **持仓追踪**：executor内部_positions，无持仓忽略CLOSE、重复开仓跳过
+- [x] **实际执行限定1手**（EXEC_MAX_LOTS=1，实盘验证期）
+- [x] **品种乘数修正**：IF/IH=300, IM/IC=200（monitor+executor统一）
+- [x] **Shadow M/V/Q key修正**：momentum→s_momentum（之前全部记为0）
+- [x] **SQLite WAL统一**：所有脚本sqlite3.connect加timeout=30+WAL+busy_timeout
+- [x] **开仓截止推迟到14:30**（NO_OPEN_EOD从14:15改为14:30，尾盘信号WR=67-80%）
+- [x] **DB损坏修复**：dump+reimport修复Google Drive同步导致的corruption
+
 ---
 
 ## 已知问题 / TODO
 
+- [ ] **Morning Briefing外盘数据滞后（2026-03-31）**：`make briefing` 未自动更新本地DB，若忘记先跑 `download_briefing_history.py --update`，`global_index_daily` 会用旧数据（如3/31 briefing用了3/27的IXIC -2.15%而非实际-0.73%）。修复方案：在 `Makefile` 的 `briefing` target 中自动先跑 `--update`，或在 `morning_briefing.py` 启动时检查DB数据是否超过1个交易日并警告。
 - [ ] TqSdk 异步架构需要特殊处理（事件循环）
 - [ ] 期货分钟线数据量大，需要分批下载和压缩存储
 - [ ] 多标的同时运行时的相关性处理
