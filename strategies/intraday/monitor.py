@@ -326,6 +326,10 @@ class IntradayMonitor:
         self._sentiment: Optional[SentimentData] = None
         # 影子交易簿：记录所有信号的完整生命周期，key=symbol
         self._shadow_positions: Dict[str, Dict] = {}
+        # 项目 tmp 目录（信号文件、持仓文件等）
+        from config.config_loader import ConfigLoader
+        self._tmp_dir: str = ConfigLoader().get_tmp_dir()
+        self._signal_file: str = os.path.join(self._tmp_dir, "signal_pending.json")
 
     def _load_daily_data(self) -> None:
         """从数据库加载日线数据 + 解析近月合约 + 用现货指数算Z-Score。"""
@@ -476,7 +480,7 @@ class IntradayMonitor:
             "reason": action.get("reason", ""),
         }
         try:
-            with open("/tmp/signal_pending.json", "w") as f:
+            with open(self._signal_file, "w") as f:
                 _json.dump(signal, f, indent=2)
         except Exception as e:
             print(f"  [WARN] 写入信号文件失败: {e}")
@@ -562,6 +566,36 @@ class IntradayMonitor:
         except Exception as e:
             print(f"  [警告] 情绪数据加载失败: {e}")
 
+    def _update_futures_positions(self, api) -> None:
+        """从 TQ 读取期货实盘持仓，写入共享文件供 executor 对账。"""
+        try:
+            positions = {}
+            for sym in ["IM", "IF", "IH", "IC"]:
+                fut_sym = self._tq_symbols.get(sym)
+                if not fut_sym:
+                    continue
+                pos = api.get_position(fut_sym)
+                if pos.pos_long > 0 or pos.pos_short > 0:
+                    positions[sym] = {
+                        "contract": fut_sym,
+                        "long": pos.pos_long,
+                        "short": pos.pos_short,
+                        "long_today": pos.pos_long_today,
+                        "short_today": pos.pos_short_today,
+                        "last_price": float(pos.last_price or 0),
+                        "float_profit_long": float(pos.float_profit_long or 0),
+                        "float_profit_short": float(pos.float_profit_short or 0),
+                    }
+            import json as _json
+            path = os.path.join(self._tmp_dir, "futures_positions.json")
+            with open(path, "w") as f:
+                _json.dump({
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "positions": positions,
+                }, f, indent=2)
+        except Exception as e:
+            print(f"  [WARN] 期货持仓写出失败: {e}")
+
     def run(self) -> None:
         """主循环：连接天勤获取实时K线。"""
         from data.sources.tq_client import TqClient
@@ -633,13 +667,19 @@ class IntradayMonitor:
                     continue
 
                 # 检查是否有新K线（用现货指数触发信号）
+                bar_updated = False
                 for sym in self.symbols:
                     sk = spot_klines_5m.get(sym)
                     if sk is not None and api.is_changing(sk):
+                        bar_updated = True
                         self._on_new_bar(
                             sym, spot_klines_5m, spot_klines_15m,
                             fut_quotes, fut_klines_5m,
                         )
+
+                # 每次有新bar时刷新期货持仓（跟随5分钟频率）
+                if bar_updated:
+                    self._update_futures_positions(api)
 
         except KeyboardInterrupt:
             print("\n  Monitor stopped by user")
@@ -914,7 +954,7 @@ class IntradayMonitor:
                     "pnl_pts": round(pnl_pts, 1),
                 }
                 try:
-                    with open("/tmp/signal_pending.json", "w") as f:
+                    with open(self._signal_file, "w") as f:
                         _json.dump(close_signal, f, indent=2)
                     print(f"     → 已写入signal_pending.json(CLOSE)，等待executor确认")
                 except Exception:

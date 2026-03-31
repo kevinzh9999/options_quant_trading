@@ -98,10 +98,13 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - 可通过 `--threshold` 参数覆盖回测阈值
 
 ### Monitor/Executor 职责分离（2026-03-31重构）
-- **Monitor只负责信号生成**：评分→写`/tmp/signal_pending.json`→注册shadow持仓→面板显示。不prompt，不阻塞
-- **Executor负责交易执行**：轮询JSON(1秒)→展示→Y/N确认→TQ限价单→撤单→记录
+- **Monitor只负责信号生成**：评分→写`tmp/signal_pending.json`→注册shadow持仓→面板显示。不prompt，不阻塞
+- **Monitor额外职责**：每5分钟bar更新时写出期货持仓到`tmp/futures_positions.json`供executor对账
+- **Executor负责交易执行**：轮询JSON(1秒)→展示→确认→TQ限价单→撤单→记录
+- **平仓信号opt-out**：60s无响应自动执行（开仓仍为opt-in：超时自动放弃）
+- **激进价自动追单**：平仓限价未成交→自动以±2点激进价重新下单，不再手工确认
+- **平仓否决记录**：操作者按n否决平仓→记录CLOSE_DENIED→写`tmp/denied_positions.json`→次日启动提醒
 - Monitor exit触发时写CLOSE JSON供executor平仓
-- 所有CLOSE信号超时持续提醒（不只止损）
 - shadow trades用期货价格记录entry/exit/PnL（不是现货）
 
 ### 仓位管理（2026-03-28决定）
@@ -114,8 +117,9 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - `executor_log`表：每个收到的信号完整记录生命周期
 - 字段：signal_time/receive_time/operator_response(Y/N/TIMEOUT/EXPIRED)/order_status/filled_lots/cancel_time
 - signal_json保留原始JSON留底
-- 撤单机制：开仓60秒/平仓30秒未成交自动撤单，平仓未成交提示改激进价(±2跳)
+- 撤单机制：开仓60秒/平仓30秒未成交自动撤单，平仓未成交自动以激进价追单
 - 持仓追踪：executor内部`_positions`字典，无持仓忽略CLOSE、重复开仓跳过
+- 持仓对账：每60秒读取`tmp/futures_positions.json`（monitor写出），与内部positions对账；TQ无持仓但executor有记录→自动清除
 
 ### 股指期货平今手续费（2026-03-28决定）
 - 中金所股指期货（IM/IF/IH/IC）平今手续费万分之2.3，是开仓/平昨的10倍
@@ -128,7 +132,7 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 ### Morning Briefing（2026-03-29新增）
 - 盘前运行 `python scripts/morning_briefing.py`，综合5维度评分输出方向Guidance
 - 数据源：Tushare（A50/美股/恒生/涨跌家数/成交额）+ 本地DB（IV/VRP/价格位置）
-- 输出 JSON 到 `/tmp/morning_briefing.json`，Monitor 启动时读取覆盖 daily_mult
+- 输出 JSON 到 `tmp/morning_briefing.json`，Monitor 启动时读取覆盖 daily_mult
 - 结果写入 `morning_briefing` 表 + `logs/briefing/YYYYMMDD.md`
 - **本地DB优先**：`download_briefing_history.py` 预下载历史数据到7个表，briefing优先读本地（快速），Tushare作fallback
 - 增量更新：`python scripts/download_briefing_history.py --update`

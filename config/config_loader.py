@@ -182,6 +182,12 @@ class ConfigLoader:
             p = _PROJECT_ROOT / p
         return str(p)
 
+    def get_tmp_dir(self) -> str:
+        """项目级 tmp 目录，所有运行时临时文件放这里。"""
+        tmp_dir = _PROJECT_ROOT / "tmp"
+        tmp_dir.mkdir(exist_ok=True)
+        return str(tmp_dir)
+
     def get_strategy_config(self, strategy_name: str) -> Dict[str, Any]:
         """
         获取指定策略的完整配置字典。
