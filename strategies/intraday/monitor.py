@@ -906,10 +906,20 @@ class IntradayMonitor:
             b5 = bar_data.get(sym)
             if b5 is None or len(b5) < 2:
                 continue
-            # 用现货价格驱动exit逻辑（和信号评分一致）
+            # exit逻辑用现货K线（和回测/信号评分一致），PnL用期货
             cur_price = float(b5.iloc[-1]["close"])
             high = float(b5.iloc[-1]["high"])
             low = float(b5.iloc[-1]["low"])
+            # 但highest_since/lowest_since也参考期货价格（trailing stop保护真实PnL）
+            fq = fut_quotes.get(sym)
+            if fq is not None:
+                try:
+                    fp = float(fq.last_price)
+                    if fp > 0:
+                        high = max(high, fp)
+                        low = min(low, fp)
+                except Exception:
+                    pass
             b15 = bar_15m_data.get(sym)
             b15_arg = b15 if (b15 is not None and len(b15) > 0) else None
             if rp["direction"] == "LONG":
