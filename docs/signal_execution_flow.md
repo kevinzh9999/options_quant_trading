@@ -31,53 +31,57 @@
 **计算流程**：
 
 ```
-现货5分钟K线 ─▶ SignalGeneratorV2/V3.score_all()
+现货5分钟K线 ─▶ SignalGeneratorV2/V3.score_all() 内部：
                   │
-                  ├── 动量维度 (s_mom)
-                  ├── 趋势维度 (s_trend)
-                  ├── 波动维度 (s_vol)
-                  ├── 量能维度 (s_volume)
-                  ├── 多周期一致性 (s_multi)
-                  ├── 布林带突破 (s_boll)
-                  └── 总分 + 方向
+                  ├── 维度计算: raw = s_mom + s_vol + s_qty + s_breakout
+                  ├── × daily_mult（顺势1.2 / 中性1.0 / 逆势0.8）
+                  ├── × intraday_filter（日内涨跌幅折扣，方向感知）
+                  ├── × time_weight（时段权重）
+                  ├── × sentiment_mult（期权情绪：IV变动/Skew/PCR/期限结构）
+                  ├── clamp(0, 100)
+                  ├── Z-Score 硬过滤（极端Z值可能归零）
+                  └── RSI 回归 bonus
                   │
                   ▼
-              score >= 60?  ──否──▶ 不生成信号（记录score=0到signal_log）
+              score_all() 返回最终 total + direction
+                  │
+                  ▼
+              Monitor: total >= 60?  ──否──▶ 记录score=0到signal_log
                   │
                  是
-                  │
-                  ▼
-              Z-Score 过滤（4层）
                   │
                   ▼
               is_open_allowed() 时间窗口检查
               （09:45~11:20, 13:05~14:30）
                   │
                   ▼
-              daily_mult 日线方向乘数
-              sentiment_mult 情绪乘数
-              intraday_filter 日内涨跌幅折扣
-                  │
-                  ▼
-              最终信号（方向 + 分数）
+              写JSON + 注册shadow持仓
 ```
 
-**生成 JSON 信号**（`_write_signal_file`）：
+注意：daily_mult、intraday_filter、sentiment_mult 等乘数在 `score_all()` **内部**作用于分数，
+不是在阈值判断之后。Monitor 拿到的 `total` 已经是经过所有乘数调整后的最终值。
+
+**生成 JSON 信号**（`_append_signal` 追加到列表）：
+
+`signal_pending.json` 存储 **JSON 数组**，每个元素是一个信号对象。
+Executor 读取后按顺序处理所有信号（CLOSE 在 OPEN 之前），然后删除文件。
 
 ```json
-{
-  "timestamp": "2026-03-31 02:15:00",   // UTC时间
-  "symbol": "IM",
-  "direction": "LONG",
-  "action": "OPEN",
-  "score": 72,
-  "bid1": 7648.2,
-  "ask1": 7648.8,
-  "last": 7648.6,
-  "suggested_lots": 3,                  // Fixed Risk 0.5% 计算
-  "limit_price": 7648.8,                // LONG用ask1排队, SHORT用bid1排队
-  "reason": ""
-}
+[
+  {
+    "timestamp": "2026-03-31 02:15:00",
+    "symbol": "IM",
+    "direction": "LONG",
+    "action": "OPEN",
+    "score": 72,
+    "bid1": 7648.2,
+    "ask1": 7648.8,
+    "last": 7648.6,
+    "suggested_lots": 3,
+    "limit_price": 7648.8,
+    "reason": ""
+  }
+]
 ```
 
 **限价计算规则**：
@@ -147,7 +151,7 @@ suggested_lots = risk_per_trade / stop_loss_amount
           │
           ▼
      api.insert_order()
-     合约: CFFEX.IM2604（当月主力）
+     合约: 主力合约（_resolve_near_month 自动检测当月/季月）
      方向: BUY(做多) / SELL(做空)
      开平: OPEN
      价格: 限价单（排队价）
@@ -210,7 +214,9 @@ shadow_positions[sym] ─▶ check_exit()
                           └── should_exit=True → 生成平仓信号
 ```
 
-**PnL 计算**：使用期货价格（entry 和 exit 都用期货价，不是现货）
+**数据源区分**：
+- **退出条件判断**（布林带、ATR、中轨突破等）：使用**现货 K 线**（与回测一致）
+- **退出价格和 PnL**：使用**期货价格**（entry 和 exit 都用期货 bid/ask/last）
 
 **生成 CLOSE JSON**：
 
@@ -241,15 +247,17 @@ shadow_positions[sym] ─▶ check_exit()
 
 ### 2.2 Executor 端：平仓处理
 
-**与开仓的关键区别**：
+**与开仓的关键区别（三级确认模式）**：
 
-| 维度 | 开仓 | 平仓 |
-|------|------|------|
-| 确认模式 | opt-in（必须按y） | **opt-out**（60s无响应自动执行） |
-| 超时行为 | 自动放弃 | **自动下单** |
-| 未成交追单 | 无 | **自动以激进价重新下单** |
-| 手数 | 三级递减 | 等于当前持仓手数（全部平仓） |
-| 成交超时 | 60秒 | **30秒**（更紧急） |
+| 维度 | 开仓 | 紧急平仓 | 非紧急平仓 |
+|------|------|---------|-----------|
+| 触发原因 | — | STOP_LOSS / EOD_CLOSE / LUNCH_CLOSE | TRAILING_STOP / TREND_COMPLETE / 其他 |
+| 确认模式 | opt-in | **opt-out** | opt-in |
+| 超时行为 | 自动放弃 | **自动下单** | 自动放弃 |
+| 未成交追单 | 无 | **自动激进价追单** | 无 |
+| 按n否决 | SKIPPED | CLOSE_DENIED | CLOSE_DENIED |
+| 手数 | 三级递减 | 持仓手数（全部平仓） | 持仓手数（全部平仓） |
+| 成交超时 | 60秒 | **30秒** | **30秒** |
 
 **处理流程**：
 
@@ -281,10 +289,19 @@ shadow_positions[sym] ─▶ check_exit()
               └──────────────────────────────────────────────┘
                    │
                    ▼
-              操作者确认 [y/n] (60s无响应将自动执行)
-              ├── y → 立即下单
-              ├── n → CLOSE_DENIED（见2.4）
-              └── 超时(无输入) → AUTO_TIMEOUT，自动下单
+              操作者确认 [y/n]
+              │
+              ├─ 紧急(STOP_LOSS/EOD/LUNCH):
+              │   提示 "60s无响应将自动执行"
+              │   ├── y → 下单
+              │   ├── n → CLOSE_DENIED
+              │   └── 超时 → AUTO_TIMEOUT，自动下单
+              │
+              └─ 非紧急(TRAILING_STOP等):
+                  提示 "60s timeout"
+                  ├── y → 下单
+                  ├── n → CLOSE_DENIED
+                  └── 超时 → TIMEOUT_SKIP，放弃
 ```
 
 ### 2.3 TQ 下单 + 激进价追单
@@ -453,7 +470,7 @@ order_log 推断  →  TQ 实盘校正  →  最终 positions
 
 | 文件 | 写入方 | 读取方 | 说明 |
 |------|--------|--------|------|
-| `tmp/signal_pending.json` | Monitor | Executor | 开仓/平仓信号（读后即删） |
+| `tmp/signal_pending.json` | Monitor | Executor | 信号列表（JSON数组，追加写入，executor读后即删） |
 | `tmp/futures_positions.json` | Monitor | Executor | 期货实盘持仓（每5分钟更新） |
 | `tmp/denied_positions.json` | Executor | Executor | 被否决的平仓记录（次日提醒后清除） |
 | `tmp/morning_briefing.json` | morning_briefing.py | Monitor | 盘前方向 Guidance |

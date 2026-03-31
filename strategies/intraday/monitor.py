@@ -459,9 +459,26 @@ class IntradayMonitor:
                 ny += 1
             return f"{ny:02d}{nm:02d}"
 
-    def _write_signal_file(self, action: dict, dt_str: str) -> None:
-        """写入信号JSON文件供 order_executor 读取。"""
+    def _append_signal(self, signal_dict: dict) -> None:
+        """追加信号到JSON列表（解决同根K线CLOSE被OPEN覆盖的竞态）。"""
         import json as _json
+        signals = []
+        if os.path.exists(self._signal_file):
+            try:
+                with open(self._signal_file, "r") as f:
+                    data = _json.load(f)
+                signals = data if isinstance(data, list) else [data]
+            except (ValueError, IOError):
+                signals = []
+        signals.append(signal_dict)
+        try:
+            with open(self._signal_file, "w") as f:
+                _json.dump(signals, f, indent=2)
+        except Exception as e:
+            print(f"  [WARN] 写入信号文件失败: {e}")
+
+    def _write_signal_file(self, action: dict, dt_str: str) -> None:
+        """构建开仓信号并追加到JSON文件供 order_executor 读取。"""
         direction = action.get("direction", "")
         bid1 = action.get("bid1", 0)
         ask1 = action.get("ask1", 0)
@@ -479,11 +496,7 @@ class IntradayMonitor:
             "limit_price": bid1 if direction == "SHORT" else ask1,
             "reason": action.get("reason", ""),
         }
-        try:
-            with open(self._signal_file, "w") as f:
-                _json.dump(signal, f, indent=2)
-        except Exception as e:
-            print(f"  [WARN] 写入信号文件失败: {e}")
+        self._append_signal(signal)
 
     _CONTRACT_MULT = {"IF": 300, "IH": 300, "IM": 200, "IC": 200}
 
@@ -939,7 +952,6 @@ class IntradayMonitor:
                         exit_last = float(fq.last_price) or cur_price
                     except Exception:
                         pass
-                import json as _json
                 close_signal = {
                     "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                     "symbol": sym,
@@ -953,12 +965,8 @@ class IntradayMonitor:
                     "limit_price": exit_bid if d_cn == "LONG" else exit_ask,
                     "pnl_pts": round(pnl_pts, 1),
                 }
-                try:
-                    with open(self._signal_file, "w") as f:
-                        _json.dump(close_signal, f, indent=2)
-                    print(f"     → 已写入signal_pending.json(CLOSE)，等待executor确认")
-                except Exception:
-                    pass
+                self._append_signal(close_signal)
+                print(f"     → 已写入signal_pending.json(CLOSE)，等待executor确认")
 
                 del self._shadow_positions[sym]
 

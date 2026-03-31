@@ -232,17 +232,23 @@ def _record_denied_position(symbol: str, contract: str, direction: str,
 # 信号读取
 # ---------------------------------------------------------------------------
 
-def _read_signal() -> Optional[dict]:
-    """读取并删除 pending signal 文件。"""
+def _read_signals() -> list:
+    """读取所有待处理信号（列表），读后删除文件。兼容旧单对象格式。"""
     if not os.path.exists(SIGNAL_FILE):
-        return None
+        return []
     try:
         with open(SIGNAL_FILE, "r") as f:
             data = json.load(f)
         os.remove(SIGNAL_FILE)
-        return data
+        if isinstance(data, list):
+            return data
+        return [data]  # 兼容旧格式
     except Exception:
-        return None
+        try:
+            os.remove(SIGNAL_FILE)
+        except OSError:
+            pass
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +366,9 @@ def _execute_order(
     # 判断是否用锁仓（股指期货平今手续费10倍）
     is_close = action == "CLOSE"
     use_lock = is_close and sym in CFFEX_INDEX_FUTURES
-    is_urgent_close = is_close
+    # 紧急平仓(opt-out: 超时自动执行)：STOP_LOSS / EOD_CLOSE / LUNCH_CLOSE
+    _URGENT_REASONS = {"STOP_LOSS", "EOD_CLOSE", "LUNCH_CLOSE"}
+    is_urgent_close = is_close and reason in _URGENT_REASONS
 
     # 展示订单
     if not is_close:
@@ -397,10 +405,15 @@ def _execute_order(
                     operator_response="DRY_RUN", order_status="NOT_SUBMITTED")
         return {"status": "DRY_RUN"}
 
-    # 确认（平仓: opt-out 60s无响应自动执行; 开仓: opt-in 60s无响应自动放弃）
+    # 确认逻辑分三级：
+    #   紧急平仓(STOP_LOSS/EOD/LUNCH): opt-out，60s无响应自动执行
+    #   非紧急平仓(其他CLOSE原因):     opt-in，60s无响应自动放弃
+    #   开仓:                          opt-in，60s无响应自动放弃
     if is_urgent_close:
         resp = _confirm(
             f" 确认平仓？[y/n] (60s无响应将自动执行)", 60.0)
+    elif is_close:
+        resp = _confirm(f" 确认平仓？[y/n] (60s timeout)", 60.0)
     else:
         resp = _confirm(f" 确认下单？[y/n] (60s timeout)", 60.0)
 
@@ -408,8 +421,8 @@ def _execute_order(
         _update_log(db_path, log_id, operator_response="Y",
                     response_reason="手工确认")
     elif resp == "n":
-        if is_urgent_close:
-            # 平仓被否决 → CLOSE_DENIED
+        if is_close:
+            # 所有平仓被否决 → CLOSE_DENIED + 写入denied_positions.json
             print(f"  -> CLOSE_DENIED（操作者否决平仓）")
             _update_log(db_path, log_id, operator_response="N",
                         response_reason="手工否决平仓",
@@ -421,7 +434,6 @@ def _execute_order(
                 "status": "CLOSE_DENIED", "signal_score": score,
                 "reason": reason,
             })
-            # 记录到 denied_positions.json（模块3）
             _record_denied_position(
                 sym, _get_main_contract(sym), direction, lots,
                 reason, positions.get(sym, {}).get("entry_price", 0))
@@ -438,9 +450,8 @@ def _execute_order(
             })
             return {"status": "SKIPPED"}
     else:
-        # 超时
+        # 超时：只有紧急平仓自动执行，其余全部放弃
         if is_urgent_close:
-            # 平仓超时 → 自动执行
             print(f"\n  ⚠ 60s无响应，自动执行平仓（{reason}）")
             _update_log(db_path, log_id, operator_response="AUTO_TIMEOUT",
                         response_reason="60秒超时自动执行平仓")
@@ -887,8 +898,8 @@ def main():
                 _reconcile_positions(positions)
                 last_reconcile = now_ts
 
-            signal = _read_signal()
-            if signal:
+            pending = _read_signals()
+            for signal in pending:
                 signals_received += 1
                 result = _execute_order(
                     signal, args.dry_run, db_path,
@@ -902,6 +913,7 @@ def main():
                     if pnl < 0:
                         daily_loss += abs(pnl)
 
+            if pending:
                 # 显示状态
                 print(f"\n 持仓: ", end="")
                 if positions:
