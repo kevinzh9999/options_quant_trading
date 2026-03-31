@@ -844,7 +844,17 @@ class IntradayMonitor:
             if exit_info["should_exit"]:
                 reason = exit_info["exit_reason"]
                 entry_p = sp["entry_price"]
-                pnl_pts = (cur_price - entry_p) if sp["direction"] == "LONG" else (entry_p - cur_price)
+                # 用期货价格计算PnL（entry是期货价，exit也用期货）
+                fut_exit = cur_price  # fallback
+                fq = fut_quotes.get(sym)
+                if fq is not None:
+                    try:
+                        fp = float(fq.last_price)
+                        if fp > 0:
+                            fut_exit = fp
+                    except Exception:
+                        pass
+                pnl_pts = (fut_exit - entry_p) if sp["direction"] == "LONG" else (entry_p - fut_exit)
                 try:
                     e_h, e_m = int(sp["entry_time_utc"][:2]), int(sp["entry_time_utc"][3:5])
                     c_h, c_m = int(utc_hm[:2]), int(utc_hm[3:5])
@@ -866,7 +876,7 @@ class IntradayMonitor:
                     "entry_v": sp.get("entry_v", 0),
                     "entry_q": sp.get("entry_q", 0),
                     "exit_time": datetime.now().strftime("%H:%M"),
-                    "exit_price": cur_price,
+                    "exit_price": fut_exit,
                     "exit_reason": reason,
                     "pnl_pts": round(pnl_pts, 1),
                     "hold_minutes": hold_min,
