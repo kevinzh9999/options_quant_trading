@@ -741,6 +741,34 @@ CREATE TABLE IF NOT EXISTS shadow_trades (
 CREATE INDEX IF NOT EXISTS idx_shadow_date ON shadow_trades (trade_date);
 """
 
+EXECUTOR_LOG_SQL = """
+CREATE TABLE IF NOT EXISTS executor_log (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_time       TEXT,              -- monitor产生信号的时间
+    receive_time      TEXT,              -- executor收到JSON的时间
+    symbol            TEXT,
+    direction         TEXT,              -- LONG / SHORT
+    action            TEXT,              -- OPEN / CLOSE
+    score             INT,
+    reason            TEXT,              -- 信号原因（exit reason for CLOSE）
+    limit_price       REAL,
+    suggested_lots    INT,               -- monitor建议手数
+    actual_lots       INT,               -- 实际下单手数（÷2后）
+    operator_response TEXT,              -- Y / N / TIMEOUT
+    response_reason   TEXT,              -- 备注
+    order_submitted   INT DEFAULT 0,     -- 是否提交了TQ订单
+    order_id          TEXT,              -- TQ订单ID
+    filled_lots       INT DEFAULT 0,     -- 实际成交手数
+    filled_price      REAL,              -- 成交均价
+    order_status      TEXT,              -- FILLED/PARTIAL/CANCELLED/TIMEOUT_CANCEL/EXPIRED/NOT_SUBMITTED
+    cancel_time       TEXT,
+    cancel_reason     TEXT,
+    signal_json       TEXT               -- 原始JSON完整内容（留底）
+);
+CREATE INDEX IF NOT EXISTS idx_execlog_time ON executor_log (receive_time);
+CREATE INDEX IF NOT EXISTS idx_execlog_sym ON executor_log (symbol, receive_time);
+"""
+
 # 所有建表语句按依赖顺序排列
 ALL_TABLES: list[str] = [
     FUTURES_DAILY_SQL,
@@ -782,6 +810,8 @@ ALL_TABLES: list[str] = [
     OPTION_PCR_DAILY_SQL,
     # 日内影子交易簿（记录所有信号完整生命周期）
     SHADOW_TRADES_SQL,
+    # Executor完整信号记录
+    EXECUTOR_LOG_SQL,
 ]
 
 # 向后兼容别名（db_manager.py 等现有代码使用 ALL_DDL）

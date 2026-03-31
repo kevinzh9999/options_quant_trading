@@ -7,8 +7,10 @@ order_executor.py
 设计原则：
   - 限价单（做多ask1排队，做空bid1排队）
   - 手数 = monitor建议手数 ÷ 2（保守起步）
-  - 必须手工确认，60秒超时自动放弃（止损除外）
-  - 成交后记录到 order_log 表
+  - 开仓：60秒超时自动放弃
+  - 平仓：超时持续提醒直到确认
+  - 所有信号无论是否下单都记录到 executor_log 表
+  - 下单后60秒未成交自动撤单（止损30秒后提示改市价）
 
 用法：
     python scripts/order_executor.py           # 持续监控
@@ -41,10 +43,13 @@ from config.config_loader import ConfigLoader
 from data.storage.db_manager import DBManager
 
 SIGNAL_FILE = "/tmp/signal_pending.json"
-IM_MULT = 200
+CONTRACT_MULT = {"IF": 300, "IH": 300, "IM": 200, "IC": 200}
 STOP_LOSS_PCT = 0.005
 MAX_DAILY_ORDERS = 10
 MAX_DAILY_LOSS_PCT = 0.01  # 1% of account
+SIGNAL_EXPIRY_SECS = 300   # 5分钟过期
+OPEN_FILL_TIMEOUT = 60     # 开仓等成交60秒
+CLOSE_FILL_TIMEOUT = 30    # 平仓等成交30秒（更紧急）
 # 中金所股指期货品种（平今手续费10倍，用锁仓代替平今）
 CFFEX_INDEX_FUTURES = {"IM", "IF", "IH", "IC"}
 
@@ -55,11 +60,16 @@ W = 60  # panel width
 # 数据库
 # ---------------------------------------------------------------------------
 
-def _ensure_order_log(db_path: str):
-    """确保 order_log 表存在。"""
+def _open_db_conn(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
+def _ensure_tables(db_path: str):
+    """确保 order_log 和 executor_log 表存在。"""
+    conn = _open_db_conn(db_path)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS order_log (
             datetime     TEXT,
@@ -76,34 +86,88 @@ def _ensure_order_log(db_path: str):
             PRIMARY KEY (datetime, symbol, action)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS executor_log (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_time       TEXT,
+            receive_time      TEXT,
+            symbol            TEXT,
+            direction         TEXT,
+            action            TEXT,
+            score             INT,
+            reason            TEXT,
+            limit_price       REAL,
+            suggested_lots    INT,
+            actual_lots       INT,
+            operator_response TEXT,
+            response_reason   TEXT,
+            order_submitted   INT DEFAULT 0,
+            order_id          TEXT,
+            filled_lots       INT DEFAULT 0,
+            filled_price      REAL,
+            order_status      TEXT,
+            cancel_time       TEXT,
+            cancel_reason     TEXT,
+            signal_json       TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
 
+# Keep old function names for backward compatibility (tests import these)
+_ensure_order_log = _ensure_tables
+
+
 def _record_order(db_path: str, record: dict):
-    """记录下单结果。"""
-    conn = sqlite3.connect(db_path, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
+    """记录下单结果到 order_log（向后兼容）。"""
+    conn = _open_db_conn(db_path)
     conn.execute(
         "INSERT OR REPLACE INTO order_log "
         "(datetime, symbol, direction, action, limit_price, lots, "
         "filled_lots, filled_price, status, signal_score, reason) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            record.get("datetime", ""),
-            record.get("symbol", ""),
-            record.get("direction", ""),
-            record.get("action", "OPEN"),
-            record.get("limit_price", 0),
-            record.get("lots", 0),
-            record.get("filled_lots", 0),
-            record.get("filled_price", 0),
-            record.get("status", ""),
-            record.get("signal_score", 0),
-            record.get("reason", ""),
-        ),
+        (record.get("datetime", ""), record.get("symbol", ""),
+         record.get("direction", ""), record.get("action", "OPEN"),
+         record.get("limit_price", 0), record.get("lots", 0),
+         record.get("filled_lots", 0), record.get("filled_price", 0),
+         record.get("status", ""), record.get("signal_score", 0),
+         record.get("reason", "")),
     )
+    conn.commit()
+    conn.close()
+
+
+def _log_signal(db_path: str, signal: dict, receive_time: str,
+                actual_lots: int) -> int:
+    """写入 executor_log，返回 row id。"""
+    conn = _open_db_conn(db_path)
+    cur = conn.execute(
+        "INSERT INTO executor_log "
+        "(signal_time, receive_time, symbol, direction, action, score, "
+        "reason, limit_price, suggested_lots, actual_lots, signal_json) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (signal.get("timestamp", ""), receive_time,
+         signal.get("symbol", ""), signal.get("direction", ""),
+         signal.get("action", "OPEN"), signal.get("score", 0),
+         signal.get("reason", ""), signal.get("limit_price", 0),
+         signal.get("suggested_lots", 0), actual_lots,
+         json.dumps(signal, ensure_ascii=False)),
+    )
+    log_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return log_id
+
+
+def _update_log(db_path: str, log_id: int, **fields):
+    """更新 executor_log 的指定字段。"""
+    if not fields:
+        return
+    sets = ", ".join(f"{k} = ?" for k in fields)
+    vals = list(fields.values()) + [log_id]
+    conn = _open_db_conn(db_path)
+    conn.execute(f"UPDATE executor_log SET {sets} WHERE id = ?", vals)
     conn.commit()
     conn.close()
 
@@ -122,7 +186,6 @@ def _get_main_contract(symbol: str) -> str:
             return f"CFFEX.{symbol}{months[0]}"
     except Exception:
         pass
-    # fallback: 用当前年月估算
     now = datetime.now()
     ym = f"{now.year % 100:02d}{now.month:02d}"
     return f"CFFEX.{symbol}{ym}"
@@ -150,7 +213,7 @@ def _read_signal() -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def _confirm(prompt: str, timeout: float = 60.0) -> str:
-    """等待用户输入，超时返回空字符串。"""
+    """等待用户输入，超时返回空字符串。按c撤单。"""
     print(prompt)
     try:
         ready, _, _ = select.select([sys.stdin], [], [], timeout)
@@ -171,9 +234,11 @@ def _confirm(prompt: str, timeout: float = 60.0) -> str:
 def _execute_order(
     signal: dict, dry_run: bool, db_path: str,
     daily_orders: int, daily_loss: float, account: float,
+    positions: dict,
 ) -> dict:
     """处理一个信号。返回 {status, filled_lots, ...}。"""
-    ts = signal.get("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    receive_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts = signal.get("timestamp", receive_time)
     sym = signal.get("symbol", "IM")
     direction = signal.get("direction", "")
     action = signal.get("action", "OPEN")
@@ -185,30 +250,80 @@ def _execute_order(
     suggested = signal.get("suggested_lots", 1)
     reason = signal.get("reason", "")
     pnl_pts = signal.get("pnl_pts", 0)
+    mult = CONTRACT_MULT.get(sym, 200)
 
     # 计算下单手数
     if action == "CLOSE":
-        lots = signal.get("lots", 1)
+        # 用实际持仓手数（如果有）
+        pos = positions.get(sym)
+        lots = pos["lots"] if pos else signal.get("lots", max(1, suggested // 2))
     else:
         lots = max(1, suggested // 2)
+
+    # 记录到 executor_log（无论后续是否下单）
+    log_id = _log_signal(db_path, signal, receive_time, lots)
+
+    # 信号过期检查
+    try:
+        sig_dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+        age = (datetime.now() - sig_dt).total_seconds()
+        # UTC时间可能差8小时，用utcnow比较
+        age_utc = (datetime.utcnow() - sig_dt).total_seconds()
+        age = min(abs(age), abs(age_utc))
+    except Exception:
+        age = 0
+    if age > SIGNAL_EXPIRY_SECS:
+        print(f"  信号已过期（{age:.0f}秒前），跳过")
+        _update_log(db_path, log_id,
+                    operator_response="EXPIRED",
+                    response_reason=f"信号{age:.0f}秒前产生，超过{SIGNAL_EXPIRY_SECS}秒",
+                    order_status="EXPIRED")
+        return {"status": "EXPIRED"}
 
     # 安全检查
     if action == "OPEN":
         if daily_orders >= MAX_DAILY_ORDERS:
             print(f"  ⚠ 已达单日最大下单次数({MAX_DAILY_ORDERS})，拒绝开仓")
+            _update_log(db_path, log_id,
+                        operator_response="REJECTED",
+                        response_reason="MAX_ORDERS",
+                        order_status="NOT_SUBMITTED")
             return {"status": "REJECTED", "reason": "MAX_ORDERS"}
         if account > 0 and daily_loss > account * MAX_DAILY_LOSS_PCT:
             print(f"  ⚠ 单日亏损已超{MAX_DAILY_LOSS_PCT*100:.0f}%，拒绝开仓")
+            _update_log(db_path, log_id,
+                        operator_response="REJECTED",
+                        response_reason="MAX_LOSS",
+                        order_status="NOT_SUBMITTED")
             return {"status": "REJECTED", "reason": "MAX_LOSS"}
+        # 检查是否已有同品种持仓
+        if sym in positions:
+            pos = positions[sym]
+            if pos["direction"] == direction:
+                print(f"  {sym} 已有{pos['direction']}持仓{pos['lots']}手，跳过重复开仓")
+                _update_log(db_path, log_id,
+                            operator_response="REJECTED",
+                            response_reason=f"已有{pos['direction']}持仓",
+                            order_status="NOT_SUBMITTED")
+                return {"status": "REJECTED", "reason": "DUPLICATE"}
+
+    if action == "CLOSE" and sym not in positions:
+        print(f"  {sym} 无实际持仓，忽略平仓信号")
+        _update_log(db_path, log_id,
+                    operator_response="REJECTED",
+                    response_reason="无实际持仓",
+                    order_status="NOT_SUBMITTED")
+        return {"status": "REJECTED", "reason": "NO_POSITION"}
 
     # 止损金额
     stop_loss_price = limit_price * (1 + STOP_LOSS_PCT) if direction == "SHORT" \
         else limit_price * (1 - STOP_LOSS_PCT)
-    max_loss = abs(limit_price - stop_loss_price) * IM_MULT * lots
+    max_loss = abs(limit_price - stop_loss_price) * mult * lots
 
     # 判断是否用锁仓（股指期货平今手续费10倍）
     is_close = action == "CLOSE"
     use_lock = is_close and sym in CFFEX_INDEX_FUTURES
+    is_urgent_close = is_close
 
     # 展示订单
     if not is_close:
@@ -224,33 +339,34 @@ def _execute_order(
     print(f" 品种: {sym}          方向: {dir_cn}")
     print(f" 限价: {limit_price:.1f}        手数: {lots}手")
     if not is_close:
-        print(f" 信号分数: {score}        建议手数: {suggested}手(已÷2)")
+        print(f" 信号分数: {score}        建议手数: {suggested}手(已÷2={lots})")
         print(f" 止损价: {stop_loss_price:.1f}      最大亏损: ¥{max_loss:,.0f}")
     else:
         print(f" 平仓原因: {reason}")
         if pnl_pts:
-            print(f" 预计盈亏: {pnl_pts:+.0f}pt = ¥{pnl_pts * IM_MULT * lots:+,.0f}")
+            print(f" 预计盈亏: {pnl_pts:+.0f}pt = ¥{pnl_pts * mult * lots:+,.0f}")
         if use_lock:
             print(f" 说明: 股指期货平今手续费10倍，改用锁仓。明日开盘后双向平仓。")
 
-    # 记录用的 action 标签
     record_action = "LOCK" if use_lock else action
-    is_urgent_close = is_close  # 所有平仓信号超时都持续提醒
 
     if dry_run:
         print(f"\n [DRY RUN] 不实际下单")
         print(f"{'═' * W}")
+        _update_log(db_path, log_id,
+                    operator_response="DRY_RUN", order_status="NOT_SUBMITTED")
         return {"status": "DRY_RUN"}
 
     # 确认
-    timeout = 60.0
-    resp = _confirm(
-        f" 确认下单？[y/n] (60s timeout, 默认放弃)", timeout)
+    resp = _confirm(f" 确认下单？[y/n] (60s timeout)", 60.0)
 
     if resp == "y":
-        pass  # continue to execution
+        _update_log(db_path, log_id, operator_response="Y",
+                    response_reason="手工确认")
     elif resp == "n":
         print(f"  -> SKIPPED")
+        _update_log(db_path, log_id, operator_response="N",
+                    response_reason="手工拒绝", order_status="NOT_SUBMITTED")
         _record_order(db_path, {
             "datetime": ts, "symbol": sym, "direction": direction,
             "action": record_action, "limit_price": limit_price, "lots": lots,
@@ -261,15 +377,21 @@ def _execute_order(
     else:
         # 超时
         if is_urgent_close:
-            # 平仓超时：持续警告直到确认
-            print(f"\n  ⚠ 平仓信号({reason})未确认！请手动处理持仓")
+            _update_log(db_path, log_id, operator_response="TIMEOUT",
+                        response_reason="60秒超时，平仓持续提醒")
+            print(f"\n  ⚠ 平仓信号({reason})未确认！请处理持仓")
             while True:
                 resp2 = _confirm(
-                    f"  ⚠ {sym} {reason} 未执行！确认处理？[y/n] (30s)", 30.0)
+                    f"  ⚠ {sym} {reason} 未执行！确认？[y/n] (30s)", 30.0)
                 if resp2 == "y":
+                    _update_log(db_path, log_id, operator_response="Y",
+                                response_reason="超时后手工确认")
                     break
                 elif resp2 == "n":
                     print(f"  -> 平仓放弃（手动处理）")
+                    _update_log(db_path, log_id, operator_response="N",
+                                response_reason="超时后手工拒绝",
+                                order_status="NOT_SUBMITTED")
                     _record_order(db_path, {
                         "datetime": ts, "symbol": sym, "direction": direction,
                         "action": action, "limit_price": limit_price,
@@ -279,9 +401,12 @@ def _execute_order(
                     })
                     return {"status": "CLOSE_SKIP"}
                 else:
-                    print(f"  ⚠ {sym} {reason} 未执行！请手动处理")
+                    print(f"  ⚠ {sym} {reason} 未执行！请处理")
         else:
             print(f"  -> TIMEOUT_SKIP")
+            _update_log(db_path, log_id, operator_response="TIMEOUT",
+                        response_reason="60秒超时自动放弃",
+                        order_status="NOT_SUBMITTED")
             _record_order(db_path, {
                 "datetime": ts, "symbol": sym, "direction": direction,
                 "action": record_action, "limit_price": limit_price, "lots": lots,
@@ -292,6 +417,11 @@ def _execute_order(
 
     # === 实际下单 ===
     print(f"\n  下单中...")
+    _update_log(db_path, log_id, order_submitted=1)
+    filled = 0
+    trade_price = 0.0
+    status = "ERROR"
+
     try:
         from data.sources.tq_client import TqClient
 
@@ -314,11 +444,9 @@ def _execute_order(
                 tq_dir = "SELL" if direction == "SHORT" else "BUY"
                 tq_offset = "OPEN"
             elif use_lock:
-                # 股指期货锁仓：反向开仓（避免平今10倍手续费）
                 tq_dir = "SELL" if direction == "LONG" else "BUY"
                 tq_offset = "OPEN"
             else:
-                # 普通平仓（期权或平昨仓）
                 tq_dir = "BUY" if direction == "SHORT" else "SELL"
                 tq_offset = "CLOSE"
 
@@ -326,43 +454,79 @@ def _execute_order(
                 contract, direction=tq_dir, offset=tq_offset,
                 volume=lots, limit_price=limit_price,
             )
+            order_id = getattr(order, "order_id", "")
+            _update_log(db_path, log_id, order_id=str(order_id))
             print(f"  订单已提交: {contract} {tq_dir} {tq_offset}"
                   f" {lots}手 @ {limit_price:.1f}")
 
-            # 等待成交（最多60秒）
-            deadline = time.time() + 60
+            # 等待成交（带倒计时和手动撤单支持）
+            fill_timeout = CLOSE_FILL_TIMEOUT if is_close else OPEN_FILL_TIMEOUT
+            deadline = time.time() + fill_timeout
+            last_print = 0
             while not order.is_dead:
                 api.wait_update()
+                remaining = int(deadline - time.time())
+                cur_filled = order.volume_orign - order.volume_left
+                # 每10秒打印一次
+                if remaining != last_print and remaining % 10 == 0 and remaining > 0:
+                    last_print = remaining
+                    print(f"  等待成交... {remaining}秒"
+                          f" 已成交{cur_filled}/{order.volume_orign}手")
                 if time.time() > deadline:
-                    api.cancel_order(order)
-                    print(f"  超时未成交，已撤单")
                     break
 
             filled = order.volume_orign - order.volume_left
             trade_price = getattr(order, "trade_price", limit_price)
 
+            # 未完全成交 → 撤单
+            if order.volume_left > 0 and not order.is_dead:
+                api.cancel_order(order)
+                cancel_time = datetime.now().strftime("%H:%M:%S")
+                print(f"  撤单: {order.volume_left}手未成交，已撤销")
+                # 等撤单确认
+                cancel_deadline = time.time() + 5
+                while not order.is_dead:
+                    api.wait_update()
+                    if time.time() > cancel_deadline:
+                        break
+                filled = order.volume_orign - order.volume_left
+                _update_log(db_path, log_id, cancel_time=cancel_time,
+                            cancel_reason=f"{fill_timeout}秒未全部成交")
+
             if filled == 0:
-                status = "TIMEOUT"
+                status = "TIMEOUT_CANCEL"
                 print(f"  未成交，限价{limit_price:.1f}未触及")
+                # 平仓未成交：提示改激进价
                 if is_urgent_close:
+                    quote = api.get_quote(contract)
+                    api.wait_update()
+                    if direction == "LONG":
+                        aggr_price = float(quote.bid_price1) - 2.0
+                    else:
+                        aggr_price = float(quote.ask_price1) + 2.0
                     resp3 = _confirm(
-                        f"  ⚠ {reason}未成交！改市价单？[y/n]", 30.0)
+                        f"  ⚠ {reason}未成交！改激进价{aggr_price:.1f}？[y/n]",
+                        30.0)
                     if resp3 == "y":
                         order2 = api.insert_order(
                             contract, direction=tq_dir, offset=tq_offset,
-                            volume=lots,
+                            volume=lots, limit_price=aggr_price,
                         )
-                        deadline2 = time.time() + 10
+                        deadline2 = time.time() + 15
                         while not order2.is_dead:
                             api.wait_update()
                             if time.time() > deadline2:
+                                if not order2.is_dead:
+                                    api.cancel_order(order2)
                                 break
                         filled = order2.volume_orign - order2.volume_left
-                        trade_price = getattr(order2, "trade_price", 0)
-                        status = "FILLED_MARKET" if filled > 0 else "FAILED"
-                        print(f"  市价单: {filled}手成交"
-                              f" @ {trade_price:.1f}" if filled > 0
-                              else "  市价单也未成交")
+                        trade_price = getattr(order2, "trade_price", aggr_price)
+                        status = "FILLED" if filled == lots else (
+                            "PARTIAL" if filled > 0 else "FAILED")
+                        if filled > 0:
+                            print(f"  激进价成交 {filled}手 @ {trade_price:.1f}")
+                        else:
+                            print(f"  激进价也未成交")
             elif filled == lots:
                 status = "FILLED"
                 print(f"  全部成交 {filled}手 @ {trade_price:.1f}")
@@ -379,7 +543,12 @@ def _execute_order(
         trade_price = 0
         print(f"  下单失败: {e}")
 
-    # 记录
+    # 更新 executor_log
+    _update_log(db_path, log_id,
+                filled_lots=filled, filled_price=trade_price,
+                order_status=status)
+
+    # 记录到 order_log（向后兼容）
     _record_order(db_path, {
         "datetime": ts, "symbol": sym, "direction": direction,
         "action": record_action, "limit_price": limit_price, "lots": lots,
@@ -387,14 +556,25 @@ def _execute_order(
         "status": status, "signal_score": score, "reason": reason,
     })
 
+    # 更新内部持仓追踪
+    if filled > 0:
+        if action == "OPEN":
+            positions[sym] = {
+                "direction": direction, "lots": filled,
+                "entry_price": trade_price,
+                "entry_time": datetime.now().strftime("%H:%M"),
+            }
+        elif action == "CLOSE":
+            positions.pop(sym, None)
+
     print(f"{'═' * W}")
-    return {
-        "status": status,
-        "filled_lots": filled,
-        "pnl_yuan": (trade_price - limit_price) * IM_MULT * filled
-        if direction == "LONG" else
-        (limit_price - trade_price) * IM_MULT * filled,
-    }
+    pnl_yuan = 0.0
+    if filled > 0 and action == "OPEN":
+        pnl_yuan = 0  # 开仓无PnL
+    elif filled > 0 and action == "CLOSE" and pnl_pts:
+        pnl_yuan = pnl_pts * mult * filled
+
+    return {"status": status, "filled_lots": filled, "pnl_yuan": pnl_yuan}
 
 
 # ---------------------------------------------------------------------------
@@ -417,11 +597,11 @@ def _check_locked_positions(db_path: str, dry_run: bool):
         for _, row in locks.iterrows():
             sym = row.get("symbol", "")
             direction = row.get("direction", "")
-            lots = int(row.get("filled_lots", 0))
+            lots_val = int(row.get("filled_lots", 0))
             price = float(row.get("filled_price", 0))
             orig_dir = "多头" if direction == "SHORT" else "空头"
             lock_dir = "空头" if direction == "SHORT" else "多头"
-            print(f"   {sym}: 原{orig_dir}{lots}手 + 锁{lock_dir}{lots}手"
+            print(f"   {sym}: 原{orig_dir}{lots_val}手 + 锁{lock_dir}{lots_val}手"
                   f" @ {price:.1f} → 建议双向平仓")
 
         if not dry_run:
@@ -448,7 +628,7 @@ def main():
     args = parser.parse_args()
 
     db_path = ConfigLoader().get_db_path()
-    _ensure_order_log(db_path)
+    _ensure_tables(db_path)
 
     # 读取账户权益
     account = 0.0
@@ -463,6 +643,9 @@ def main():
     except Exception:
         pass
 
+    # 内部持仓追踪
+    positions: dict = {}
+
     print(f"{'═' * W}")
     print(f" Order Executor | {'DRY RUN' if args.dry_run else 'LIVE'}")
     print(f" 账户: {account:,.0f}  信号文件: {SIGNAL_FILE}")
@@ -473,24 +656,42 @@ def main():
     # 检查昨日锁仓持仓
     _check_locked_positions(db_path, args.dry_run)
 
-    print(f" 等待信号...\n")
-
     daily_orders = 0
     daily_loss = 0.0
+    signals_received = 0
+    signals_executed = 0
+
+    print(f" 等待信号...\n")
 
     try:
         while True:
             signal = _read_signal()
             if signal:
+                signals_received += 1
                 result = _execute_order(
                     signal, args.dry_run, db_path,
                     daily_orders, daily_loss, account,
+                    positions,
                 )
-                if result.get("status") in ("FILLED", "PARTIAL", "FILLED_MARKET"):
+                if result.get("status") in ("FILLED", "PARTIAL"):
                     daily_orders += 1
+                    signals_executed += 1
                     pnl = result.get("pnl_yuan", 0)
                     if pnl < 0:
                         daily_loss += abs(pnl)
+
+                # 显示状态
+                print(f"\n 持仓: ", end="")
+                if positions:
+                    for s, p in positions.items():
+                        d = "L" if p["direction"] == "LONG" else "S"
+                        print(f"{s} {d}{p['lots']}手@{p['entry_price']:.0f}", end="  ")
+                    print()
+                else:
+                    print("无")
+                print(f" 今日: 收到{signals_received}信号  "
+                      f"成交{signals_executed}单  亏损¥{daily_loss:,.0f}")
+                print(f" 等待信号...\n")
 
             # 检查时间
             now = datetime.now()
@@ -498,7 +699,7 @@ def main():
                 print(f"\n  收盘，退出")
                 break
 
-            time.sleep(1)  # 每秒检查一次信号文件
+            time.sleep(1)
 
     except KeyboardInterrupt:
         print(f"\n  退出")
