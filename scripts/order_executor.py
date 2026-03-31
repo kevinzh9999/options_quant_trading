@@ -50,6 +50,7 @@ MAX_DAILY_LOSS_PCT = 0.01  # 1% of account
 SIGNAL_EXPIRY_SECS = 300   # 5分钟过期
 OPEN_FILL_TIMEOUT = 60     # 开仓等成交60秒
 CLOSE_FILL_TIMEOUT = 30    # 平仓等成交30秒（更紧急）
+EXEC_MAX_LOTS = 1          # 实盘验证期，限定最大1手（稳定后改回None）
 # 中金所股指期货品种（平今手续费10倍，用锁仓代替平今）
 CFFEX_INDEX_FUTURES = {"IM", "IF", "IH", "IC"}
 
@@ -252,13 +253,13 @@ def _execute_order(
     pnl_pts = signal.get("pnl_pts", 0)
     mult = CONTRACT_MULT.get(sym, 200)
 
-    # 计算下单手数
+    # 计算下单手数（三级：建议 → 减半 → 实际执行上限）
     if action == "CLOSE":
-        # 用实际持仓手数（如果有）
         pos = positions.get(sym)
         lots = pos["lots"] if pos else signal.get("lots", max(1, suggested // 2))
     else:
-        lots = max(1, suggested // 2)
+        half_lots = max(1, suggested // 2)
+        lots = min(half_lots, EXEC_MAX_LOTS) if EXEC_MAX_LOTS else half_lots
 
     # 记录到 executor_log（无论后续是否下单）
     log_id = _log_signal(db_path, signal, receive_time, lots)
@@ -337,11 +338,14 @@ def _execute_order(
     print(f" {'平仓信号' if is_close else '新信号'} | {ts}")
     print(f"{'═' * W}")
     print(f" 品种: {sym}          方向: {dir_cn}")
-    print(f" 限价: {limit_price:.1f}        手数: {lots}手")
+    print(f" 限价: {limit_price:.1f}")
     if not is_close:
-        print(f" 信号分数: {score}        建议手数: {suggested}手(已÷2={lots})")
+        half = max(1, suggested // 2)
+        print(f" 手数: 建议{suggested}手 → 减半{half}手 → 实际执行{lots}手")
+        print(f" 信号分数: {score}")
         print(f" 止损价: {stop_loss_price:.1f}      最大亏损: ¥{max_loss:,.0f}")
     else:
+        print(f" 手数: {lots}手")
         print(f" 平仓原因: {reason}")
         if pnl_pts:
             print(f" 预计盈亏: {pnl_pts:+.0f}pt = ¥{pnl_pts * mult * lots:+,.0f}")
