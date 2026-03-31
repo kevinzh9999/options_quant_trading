@@ -589,6 +589,7 @@ Breakeven滑点：~2.5pt → ~4.0pt
 
 ## 已知问题 / TODO
 
+- [ ] **Morning Briefing外盘数据滞后（2026-03-31）**：`make briefing` 未自动更新本地DB，若忘记先跑 `download_briefing_history.py --update`，`global_index_daily` 会用旧数据（如3/31 briefing用了3/27的IXIC -2.15%而非实际-0.73%）。修复方案：在 `Makefile` 的 `briefing` target 中自动先跑 `--update`，或在 `morning_briefing.py` 启动时检查DB数据是否超过1个交易日并警告。
 - [ ] TqSdk 异步架构需要特殊处理（事件循环）
 - [ ] 期货分钟线数据量大，需要分批下载和压缩存储
 - [ ] 多标的同时运行时的相关性处理
