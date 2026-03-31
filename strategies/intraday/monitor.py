@@ -874,17 +874,49 @@ class IntradayMonitor:
                     "is_executed": sp.get("is_executed", 0),
                 })
                 d_s = sp["direction"]
-                exec_s = "已执行" if sp.get("is_executed") else "未执行"
-                print(f"  [SHADOW] {sym} {d_s} {sp['entry_time_bj']}@{entry_p:.0f}"
-                      f" → {datetime.now().strftime('%H:%M')}@{cur_price:.0f}"
-                      f" {'+' if pnl_pts >= 0 else ''}{pnl_pts:.0f}pt"
-                      f" {reason} ({exec_s})")
+                d_cn = "LONG" if d_s == "LONG" else "SHORT"
+                print(f"\n *** EXIT: {sym} {d_cn} → {reason}  "
+                      f"PnL={pnl_pts:+.0f}pt ***")
+
+                # 写平仓信号供executor
+                # 获取期货盘口价格
+                fq = fut_quotes.get(sym)
+                exit_bid = exit_ask = exit_last = cur_price
+                if fq is not None:
+                    try:
+                        exit_bid = float(fq.bid_price1) or cur_price
+                        exit_ask = float(fq.ask_price1) or cur_price
+                        exit_last = float(fq.last_price) or cur_price
+                    except Exception:
+                        pass
+                import json as _json
+                close_signal = {
+                    "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                    "symbol": sym,
+                    "direction": d_s,
+                    "action": "CLOSE",
+                    "reason": reason,
+                    "bid1": exit_bid,
+                    "ask1": exit_ask,
+                    "last": exit_last,
+                    "suggested_lots": self._calc_suggested_lots(entry_p, sym),
+                    "limit_price": exit_bid if d_cn == "LONG" else exit_ask,
+                    "pnl_pts": round(pnl_pts, 1),
+                }
+                try:
+                    with open("/tmp/signal_pending.json", "w") as f:
+                        _json.dump(close_signal, f, indent=2)
+                    print(f"     → 已写入signal_pending.json(CLOSE)，等待executor确认")
+                except Exception:
+                    pass
+
                 del self._shadow_positions[sym]
 
         # 打印状态面板（传入现货bar和期货行情）
         self._print_status(bar_data, fut_quotes, actions)
 
-        # 写入信号文件（供 order_executor 读取）+ 交互式确认
+        # 写入信号文件（供 order_executor 读取）+ 注册shadow持仓
+        # Monitor不prompt，executor负责确认
         for act in actions:
             sym = act.get("symbol", "")
             bar_dt = self._last_bar_time.get(sym)
@@ -894,14 +926,34 @@ class IntradayMonitor:
                 if key in self._prompted_bars:
                     continue
                 self._prompted_bars.add(key)
-                # 写信号JSON供 order_executor
-                self._write_signal_file(act, current_time_utc)
-                op_action = self._prompt_decision(current_time_utc, act)
 
-                # 注册影子持仓（无论操作者Y/N/NOTE/TIMEOUT）
                 direction = act.get("direction", "")
-                entry_price = (act.get("ask1") or act.get("last") or 0) if direction == "LONG" \
-                    else (act.get("bid1") or act.get("last") or 0)
+                bid1 = act.get("bid1", 0)
+                ask1 = act.get("ask1", 0)
+                last = act.get("last", 0)
+                sugg_lots = self._calc_suggested_lots(last, sym)
+
+                # 写信号JSON供 executor
+                self._write_signal_file(act, current_time_utc)
+
+                # 面板打印信号（不等确认）
+                d_cn = "LONG" if direction == "LONG" else "SHORT"
+                if d_cn == "LONG":
+                    limit_s = f"排队{ask1:.1f}/吃{ask1 + 0.2:.1f}" if ask1 > 0 else ""
+                else:
+                    limit_s = f"排队{bid1:.1f}/吃{bid1 - 0.2:.1f}" if bid1 > 0 else ""
+                print(f"\n *** SIGNAL: {sym} {d_cn} score={act.get('score', 0)} ***")
+                print(f"     盘口: {limit_s}  建议{sugg_lots}手")
+                print(f"     → 已写入signal_pending.json，等待executor确认")
+
+                # 记录信号决策
+                self.recorder.record_decision(
+                    current_time_utc, sym, act.get("score", 0),
+                    direction, "SIGNAL")
+
+                # 注册shadow持仓（所有信号自动进入）
+                entry_price = (ask1 or last or 0) if direction == "LONG" \
+                    else (bid1 or last or 0)
                 sc = self._get_routed_score(sym) or {}
                 self._shadow_positions[sym] = {
                     "direction": direction,
@@ -917,11 +969,12 @@ class IntradayMonitor:
                     "entry_f": sc.get("intraday_filter", 0),
                     "entry_t": sc.get("time_weight", 0),
                     "entry_s": sc.get("sentiment_mult", 0),
-                    "entry_m": sc.get("momentum", 0),
-                    "entry_v": sc.get("volatility", 0),
-                    "entry_q": sc.get("volume", 0),
-                    "operator_action": op_action,
-                    "is_executed": 1 if op_action == "Y" else 0,
+                    "entry_m": sc.get("s_momentum", 0),
+                    "entry_v": sc.get("s_volatility", 0),
+                    "entry_q": sc.get("s_volume", 0),
+                    "operator_action": "SIGNAL",
+                    "is_executed": 0,
+                    "fut_symbol": self._tq_symbols.get(sym, ""),
                 }
 
     def _get_latest_signal(
@@ -938,63 +991,6 @@ class IntradayMonitor:
         daily = self._daily_data.get(symbol)
         qd = quote_dict.get(symbol)
         return self.strategy.signal_gen.update(symbol, bar_data[symbol], b15, daily, qd)
-
-    def _prompt_decision(self, dt_str: str, action: Dict) -> str:
-        """信号确认（30秒超时，非阻塞）。返回操作者动作 Y/N/NOTE/TIMEOUT。"""
-        import select
-
-        sym = action["symbol"]
-        score = action.get("score", 0)
-        direction = action.get("direction", "")
-        dir_cn = "LONG" if direction == "LONG" else "SHORT"
-
-        bid1 = action.get("bid1", 0)
-        ask1 = action.get("ask1", 0)
-        last = action.get("last", 0)
-        sugg_lots = self._calc_suggested_lots(last, sym)
-        if dir_cn == "LONG":
-            limit_s = f"排队{ask1:.1f}/吃{ask1 + 0.2:.1f}" if ask1 > 0 else ""
-        else:
-            limit_s = f"排队{bid1:.1f}/吃{bid1 - 0.2:.1f}" if bid1 > 0 else ""
-        print(f"\n  *** {sym} {dir_cn} score={score}  {limit_s}"
-              f"  建议{sugg_lots}手 *** [y/n/note] (30s timeout)")
-
-        try:
-            ready, _, _ = select.select([sys.stdin], [], [], 30.0)
-        except Exception:
-            ready = []
-
-        if not ready:
-            self.recorder.record_decision(
-                dt_str, sym, score, direction, "TIMEOUT")
-            print(f"  -> timeout, recorded as NOTED")
-            return "TIMEOUT"
-
-        try:
-            resp = sys.stdin.readline().strip().lower()
-        except Exception:
-            return "TIMEOUT"
-
-        if resp == "y":
-            self.recorder.record_decision(
-                dt_str, sym, score, direction, "EXECUTED")
-            print(f"  -> EXECUTED")
-            return "Y"
-        elif resp == "n":
-            self.recorder.record_decision(
-                dt_str, sym, score, direction, "SKIPPED")
-            print(f"  -> SKIPPED")
-            return "N"
-        elif resp:
-            self.recorder.record_decision(
-                dt_str, sym, score, direction, "NOTED", resp)
-            print(f"  -> NOTED: {resp}")
-            return "NOTE"
-        else:
-            self.recorder.record_decision(
-                dt_str, sym, score, direction, "TIMEOUT")
-            print(f"  -> no input, recorded as TIMEOUT")
-            return "TIMEOUT"
 
     @staticmethod
     def _calc_display_data(
@@ -1233,30 +1229,6 @@ class IntradayMonitor:
                         f" {'+' if pnl >= 0 else ''}{pnl:.0f}pt")
             if shadow_parts:
                 print(f" SHADOW: {' | '.join(shadow_parts)}")
-
-        for act in actions:
-            if act.get("action") == "OPEN":
-                d_en = "LONG" if act["direction"] == "LONG" else "SHORT"
-                bid1 = act.get("bid1", 0)
-                ask1 = act.get("ask1", 0)
-                bid_v = act.get("bid_vol1", 0)
-                ask_v = act.get("ask_vol1", 0)
-                last = act.get("last", 0)
-                # 建议限价：做多挂ask1排队，做空挂bid1排队
-                if d_en == "LONG":
-                    limit_queue = ask1       # 排队价（被动）
-                    limit_aggr = ask1 + 0.2  # 吃盘口（激进）
-                else:
-                    limit_queue = bid1
-                    limit_aggr = bid1 - 0.2
-                sugg_lots = self._calc_suggested_lots(last, act['symbol'])
-                print(f"\n *** SIGNAL: {act['symbol']} {d_en} "
-                      f"score={act.get('score', 0)} ***")
-                print(f"     盘口: bid={bid1:.1f}×{bid_v} "
-                      f" ask={ask1:.1f}×{ask_v}  last={last:.1f}")
-                print(f"     建议: 排队{limit_queue:.1f} / "
-                      f"吃盘口{limit_aggr:.1f}"
-                      f" | 建议手数: {sugg_lots}手(风险0.5%)")
 
         print(f"{'=' * W}")
 
