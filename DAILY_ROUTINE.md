@@ -91,7 +91,7 @@ python scripts/order_executor.py --dry-run # 只显示不下单
 
 ---
 
-## 三、盘中交易时段（9:45 - 14:15）
+## 三、盘中交易时段（9:45 - 14:30）
 
 ### 持续关注
 
@@ -115,10 +115,21 @@ python scripts/order_executor.py --dry-run # 只显示不下单
 ### 关键决策点
 
 **信号触发时（得分 >= 60）**
-- monitor 会显示盘口 bid/ask 和建议限价，提示 [y/n/note]
+
+Monitor产生信号后自动写入signal_pending.json并记录shadow trade，不等待输入。
+切换到executor窗口（Ctrl-b 3）查看信号详情并确认是否下单。
+
+信号执行流程：
+1. Monitor产生信号 → 面板打印`*** SIGNAL ***` → 自动写JSON + 注册shadow
+2. Executor收到JSON → 展示：建议4手 → 减半2手 → 实际执行1手
+3. Executor等待确认 [y/n]（60秒超时自动放弃）
+4. 开仓限价单60秒未成交自动撤单，平仓30秒后提示改激进价
+
+> 实盘验证期executor限定每笔1手（EXEC_MAX_LOTS=1）
+
+判断要点：
 - 信号和你的 Guidance 一致吗？
 - 信号是在趋势中间还是趋势末端？（日内已涨跌>1.5%要警惕）
-- 盘口支持吗？（monitor会显示bid/ask和建议限价）
 
 **每次你有交易冲动时**
 - 不管有没有执行，记录下来：
@@ -141,8 +152,8 @@ python scripts/order_executor.py --dry-run # 只显示不下单
 | 9:45-10:30 | 突破时段 | 信号最佳入场窗口 |
 | 10:30-11:20 | 趋势延续最稳定 | 顺势持仓，不轻易平 |
 | 11:20-13:05 | 午休 | 系统禁止开仓 |
-| 13:05-14:15 | 下午主时段 | 正常交易 |
-| 14:15-15:00 | 尾盘 | 系统禁止开仓，观察不操作 |
+| 13:05-14:30 | 下午主时段 | 正常交易 |
+| 14:30-15:00 | 尾盘 | 系统禁止开仓，观察不操作 |
 
 ### 想要取得的结论
 
@@ -166,6 +177,9 @@ python scripts/vol_monitor.py --snapshot
 
 # 4. 象限状态记录
 python scripts/quadrant_monitor.py --once
+
+# 5. 回测今天的日内信号
+python scripts/backtest_signals_day.py --symbol IM --date $(date +%Y%m%d)
 ```
 
 ### 检查清单
@@ -177,6 +191,9 @@ python scripts/quadrant_monitor.py --once
 - [ ] 5分钟线归档成功（应该有48根，每天4小时/5分钟=48根）？
 - [ ] 象限判定和持仓匹配度正常？
 - [ ] Markdown报告已保存？
+- [ ] shadow_trades表有今天的记录？
+- [ ] executor_log表记录完整？
+- [ ] 回测结果和实盘信号是否一致？
 
 ---
 
@@ -193,26 +210,44 @@ python scripts/quadrant_monitor.py --once
 
 **信号层面**
 ```bash
-# 查看今日signal_log
+# 查看今日shadow trades（系统理想交易）
 python -c "
-import sqlite3, pandas as pd
+import sqlite3
 conn = sqlite3.connect('data/storage/trading.db')
-df = pd.read_sql('''
-    SELECT datetime, symbol, direction, score, signal_version,
-           score_breakout, score_vwap, score_multiframe,
-           score_volume, score_daily
-    FROM signal_log
-    WHERE datetime >= date('now', '-1 day')
-    AND score > 30
-    ORDER BY score DESC LIMIT 20
-''', conn)
-print(df.to_string())
+rows = conn.execute('''
+    SELECT entry_time, symbol, direction, entry_price,
+           exit_time, exit_price, exit_reason, pnl_pts
+    FROM shadow_trades
+    WHERE trade_date = strftime('%Y%m%d', 'now')
+    ORDER BY entry_time
+''').fetchall()
+print('Shadow trades (理想交易):')
+for r in rows:
+    print(f'  {r[0]} {r[1]} {r[2]} @{r[3]:.0f} -> {r[4]} @{r[5]:.0f} {r[6]} {r[7]:+.1f}pt')
+conn.close()
+"
+
+# 查看今日executor log（实际执行）
+python -c "
+import sqlite3
+conn = sqlite3.connect('data/storage/trading.db')
+rows = conn.execute('''
+    SELECT signal_time, symbol, direction, action,
+           operator_response, filled_lots, filled_price, order_status
+    FROM executor_log
+    WHERE receive_time >= date('now')
+    ORDER BY receive_time
+''').fetchall()
+print('Executor log (实际执行):')
+for r in rows:
+    print(f'  {r[0]} {r[1]} {r[2]} {r[3]} resp={r[4]} filled={r[5]}@{r[6]} status={r[7]}')
 conn.close()
 "
 ```
 
 - 今天最强的信号是什么？得分多少？方向对了吗？
-- 信号触发时你选择了执行还是观察？结果如何？
+- shadow trades vs 实际执行：差异多大？你选N跳过的信号后来赚了还是亏了？
+- executor有没有撤单或超时？原因是什么？
 - 有没有信号系统漏掉的交易机会（你有感觉但系统没给分）？
 
 **波动率层面**
