@@ -57,9 +57,7 @@ W = 60  # panel width
 
 def _ensure_order_log(db_path: str):
     """确保 order_log 表存在。"""
-    conn = sqlite3.connect(db_path, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
+    conn = sqlite3.connect(db_path)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS order_log (
             datetime     TEXT,
@@ -82,9 +80,7 @@ def _ensure_order_log(db_path: str):
 
 def _record_order(db_path: str, record: dict):
     """记录下单结果。"""
-    conn = sqlite3.connect(db_path, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
+    conn = sqlite3.connect(db_path)
     conn.execute(
         "INSERT OR REPLACE INTO order_log "
         "(datetime, symbol, direction, action, limit_price, lots, "

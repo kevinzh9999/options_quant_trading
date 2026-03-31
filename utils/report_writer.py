@@ -48,9 +48,7 @@ def save_report(
             db_path = str(ROOT / "data" / "storage" / "trading.db")
 
     try:
-        conn = sqlite3.connect(db_path, timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=30000")
+        conn = sqlite3.connect(db_path)
         conn.execute(
             "CREATE TABLE IF NOT EXISTS daily_reports ("
             "trade_date TEXT NOT NULL, report_type TEXT NOT NULL, "

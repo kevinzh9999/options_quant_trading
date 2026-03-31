@@ -58,16 +58,9 @@ class IntradayRecorder:
         self.db_path = db_path
         self._ensure_tables()
 
-    def _open_conn(self) -> sqlite3.Connection:
-        """Open a WAL-mode connection with busy timeout."""
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=30000")
-        return conn
-
     def _ensure_tables(self) -> None:
         """确保盘中记录表存在。"""
-        conn = self._open_conn()
+        conn = sqlite3.connect(self.db_path)
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS orderbook_snapshots (
                 symbol       TEXT NOT NULL,
@@ -148,7 +141,7 @@ class IntradayRecorder:
 
     def record_shadow_trade(self, trade: Dict) -> None:
         """Write a completed shadow trade to the database."""
-        conn = self._open_conn()
+        conn = sqlite3.connect(self.db_path)
         try:
             conn.execute(
                 "INSERT INTO shadow_trades "
@@ -178,7 +171,7 @@ class IntradayRecorder:
     def record_orderbook(
         self, dt_str: str, symbol: str, quote: Dict,
     ) -> None:
-        conn = self._open_conn()
+        conn = sqlite3.connect(self.db_path)
         conn.execute(
             "INSERT OR REPLACE INTO orderbook_snapshots "
             "(symbol, datetime, bid_price1, ask_price1, bid_volume1, "
@@ -247,7 +240,7 @@ class IntradayRecorder:
                    sd.get("pre_z_total"), sd.get("total"),
                    sd.get("z_filter", ""))
 
-        conn = self._open_conn()
+        conn = sqlite3.connect(self.db_path)
         conn.execute(
             "INSERT OR REPLACE INTO signal_log "
             "(datetime, symbol, direction, score, score_breakout, score_vwap, "
@@ -272,7 +265,7 @@ class IntradayRecorder:
         decision: str,
         note: str = "",
     ) -> None:
-        conn = self._open_conn()
+        conn = sqlite3.connect(self.db_path)
         conn.execute(
             "INSERT OR REPLACE INTO trade_decisions "
             "(datetime, symbol, signal_score, signal_direction, decision, "
@@ -333,8 +326,6 @@ class IntradayMonitor:
         self._sentiment: Optional[SentimentData] = None
         # 影子交易簿：记录所有信号的完整生命周期，key=symbol
         self._shadow_positions: Dict[str, Dict] = {}
-        # 真实持仓追踪：选Y后加入，用于exit信号和POS显示，key=symbol
-        self._real_positions: Dict[str, Dict] = {}
 
     def _load_daily_data(self) -> None:
         """从数据库加载日线数据 + 解析近月合约 + 用现货指数算Z-Score。"""
@@ -853,17 +844,7 @@ class IntradayMonitor:
             if exit_info["should_exit"]:
                 reason = exit_info["exit_reason"]
                 entry_p = sp["entry_price"]
-                # 用期货价格计算PnL（entry已经是期货价）
-                fut_exit = cur_price  # fallback to spot
-                fq = fut_quotes.get(sym)
-                if fq is not None:
-                    try:
-                        fp = float(fq.last_price)
-                        if fp > 0:
-                            fut_exit = fp
-                    except Exception:
-                        pass
-                pnl_pts = (fut_exit - entry_p) if sp["direction"] == "LONG" else (entry_p - fut_exit)
+                pnl_pts = (cur_price - entry_p) if sp["direction"] == "LONG" else (entry_p - cur_price)
                 try:
                     e_h, e_m = int(sp["entry_time_utc"][:2]), int(sp["entry_time_utc"][3:5])
                     c_h, c_m = int(utc_hm[:2]), int(utc_hm[3:5])
@@ -885,7 +866,7 @@ class IntradayMonitor:
                     "entry_v": sp.get("entry_v", 0),
                     "entry_q": sp.get("entry_q", 0),
                     "exit_time": datetime.now().strftime("%H:%M"),
-                    "exit_price": fut_exit,
+                    "exit_price": cur_price,
                     "exit_reason": reason,
                     "pnl_pts": round(pnl_pts, 1),
                     "hold_minutes": hold_min,
@@ -895,97 +876,10 @@ class IntradayMonitor:
                 d_s = sp["direction"]
                 exec_s = "已执行" if sp.get("is_executed") else "未执行"
                 print(f"  [SHADOW] {sym} {d_s} {sp['entry_time_bj']}@{entry_p:.0f}"
-                      f" → {datetime.now().strftime('%H:%M')}@{fut_exit:.0f}"
+                      f" → {datetime.now().strftime('%H:%M')}@{cur_price:.0f}"
                       f" {'+' if pnl_pts >= 0 else ''}{pnl_pts:.0f}pt"
                       f" {reason} ({exec_s})")
                 del self._shadow_positions[sym]
-
-        # 更新真实持仓（选Y的）— exit触发时通知executor平仓
-        for sym in list(self._real_positions.keys()):
-            rp = self._real_positions[sym]
-            b5 = bar_data.get(sym)
-            if b5 is None or len(b5) < 2:
-                continue
-            # exit逻辑用现货K线（和回测/信号评分一致），PnL用期货
-            cur_price = float(b5.iloc[-1]["close"])
-            high = float(b5.iloc[-1]["high"])
-            low = float(b5.iloc[-1]["low"])
-            # 但highest_since/lowest_since也参考期货价格（trailing stop保护真实PnL）
-            fq = fut_quotes.get(sym)
-            if fq is not None:
-                try:
-                    fp = float(fq.last_price)
-                    if fp > 0:
-                        high = max(high, fp)
-                        low = min(low, fp)
-                except Exception:
-                    pass
-            b15 = bar_15m_data.get(sym)
-            b15_arg = b15 if (b15 is not None and len(b15) > 0) else None
-            if rp["direction"] == "LONG":
-                rp["highest_since"] = max(rp.get("highest_since", rp["entry_price"]), high)
-            else:
-                rp["lowest_since"] = min(rp.get("lowest_since", rp["entry_price"]), low)
-            exit_info = check_exit(
-                rp, cur_price, b5, b15_arg,
-                utc_hm, reverse_signal_score=0, is_high_vol=self._is_high_vol,
-            )
-            if exit_info["should_exit"]:
-                reason = exit_info["exit_reason"]
-                entry_p = rp["entry_price"]
-                # 用期货价格计算实际PnL
-                fut_pnl = 0.0
-                fut_exit = entry_p
-                fq = fut_quotes.get(sym)
-                if fq is not None:
-                    try:
-                        fp = float(fq.last_price)
-                        if fp > 0:
-                            fut_exit = fp
-                    except Exception:
-                        pass
-                if rp["direction"] == "LONG":
-                    fut_pnl = fut_exit - entry_p
-                else:
-                    fut_pnl = entry_p - fut_exit
-                # 获取盘口价格
-                bid1 = ask1 = fut_exit
-                if fq is not None:
-                    try:
-                        bid1 = float(fq.bid_price1) or fut_exit
-                        ask1 = float(fq.ask_price1) or fut_exit
-                    except Exception:
-                        pass
-                d_cn = "LONG" if rp["direction"] == "LONG" else "SHORT"
-                if d_cn == "LONG":
-                    limit_s = f"排队{bid1:.1f}/吃{bid1 - 0.2:.1f}"
-                else:
-                    limit_s = f"排队{ask1:.1f}/吃{ask1 + 0.2:.1f}"
-                sugg_lots = self._calc_suggested_lots(entry_p, sym)
-                print(f"\n *** EXIT: {sym} {d_cn} → {reason}  "
-                      f"{limit_s}  {sugg_lots}手  "
-                      f"PnL={fut_pnl:+.0f}pt ***")
-                # 写平仓信号供executor
-                import json as _json
-                close_signal = {
-                    "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                    "symbol": sym,
-                    "direction": rp["direction"],
-                    "action": "CLOSE",
-                    "reason": reason,
-                    "bid1": bid1,
-                    "ask1": ask1,
-                    "last": fut_exit,
-                    "suggested_lots": sugg_lots,
-                    "limit_price": bid1 if d_cn == "LONG" else ask1,
-                    "pnl_pts": round(fut_pnl, 1),
-                }
-                try:
-                    with open("/tmp/signal_pending.json", "w") as f:
-                        _json.dump(close_signal, f, indent=2)
-                except Exception:
-                    pass
-                del self._real_positions[sym]
 
         # 打印状态面板（传入现货bar和期货行情）
         self._print_status(bar_data, fut_quotes, actions)
@@ -1023,27 +917,12 @@ class IntradayMonitor:
                     "entry_f": sc.get("intraday_filter", 0),
                     "entry_t": sc.get("time_weight", 0),
                     "entry_s": sc.get("sentiment_mult", 0),
-                    "entry_m": sc.get("s_momentum", 0),
-                    "entry_v": sc.get("s_volatility", 0),
-                    "entry_q": sc.get("s_volume", 0),
+                    "entry_m": sc.get("momentum", 0),
+                    "entry_v": sc.get("volatility", 0),
+                    "entry_q": sc.get("volume", 0),
                     "operator_action": op_action,
                     "is_executed": 1 if op_action == "Y" else 0,
-                    "fut_symbol": self._tq_symbols.get(sym, ""),
                 }
-
-                # 选Y后加入真实持仓追踪（exit时通知executor平仓）
-                if op_action == "Y":
-                    self._real_positions[sym] = {
-                        "direction": direction,
-                        "entry_time_utc": datetime.utcnow().strftime("%H:%M"),
-                        "entry_time_bj": datetime.now().strftime("%H:%M"),
-                        "entry_price": float(entry_price),
-                        "highest_since": float(entry_price),
-                        "lowest_since": float(entry_price),
-                        "volume": 1,
-                        "bars_below_mid": 0,
-                        "fut_symbol": self._tq_symbols.get(sym, ""),
-                    }
 
     def _get_latest_signal(
         self,
@@ -1324,57 +1203,34 @@ class IntradayMonitor:
 
         print(SEP)
 
-        # 真实持仓（选Y的，用期货价格计算PnL）
-        if self._real_positions:
-            rp_parts = []
-            for s_sym, rp in self._real_positions.items():
-                d = "L" if rp["direction"] == "LONG" else "S"
-                # 用期货价格计算PnL
-                fut_price_now = rp["entry_price"]
-                fq = quotes.get(s_sym)
-                if fq is not None:
-                    try:
-                        fp = float(fq.last_price)
-                        if fp > 0:
-                            fut_price_now = fp
-                    except Exception:
-                        pass
-                pnl = (fut_price_now - rp["entry_price"]) if rp["direction"] == "LONG" \
-                    else (rp["entry_price"] - fut_price_now)
-                try:
-                    e_h, e_m = int(rp["entry_time_utc"][:2]), int(rp["entry_time_utc"][3:5])
-                    c_h, c_m = int(datetime.utcnow().strftime("%H:%M")[:2]), int(datetime.utcnow().strftime("%H:%M")[3:5])
-                    bars = max(1, ((c_h * 60 + c_m) - (e_h * 60 + e_m)) // 5)
-                except Exception:
-                    bars = 0
-                rp_parts.append(
-                    f"{s_sym} {d}@{rp['entry_price']:.0f}"
-                    f" {'+' if pnl >= 0 else ''}{pnl:.0f}pt({bars}bar)")
-            print(f" POS: {' | '.join(rp_parts)}")
+        # 持仓
+        nets = self.strategy.position_mgr.get_net_positions()
+        if nets:
+            pos_parts = []
+            for s, v in nets.items():
+                d = "L" if v > 0 else "S"
+                pos_parts.append(f"{s}{d}{abs(v)}")
+            print(f" POS: {' | '.join(pos_parts)}")
         else:
             print(f" POS: none")
 
-        # 影子持仓状态（用期货价格计算PnL）
+        summary = self.strategy.position_mgr.get_exposure_summary()
+        print(f" P&L: {summary['daily_pnl']:+,.0f}  Trades: {summary['daily_trades']}")
+
+        # 影子持仓状态
         if self._shadow_positions:
             shadow_parts = []
             for s_sym, sp in self._shadow_positions.items():
-                # 用期货价格
-                fut_price_now = sp["entry_price"]
-                fq = quotes.get(s_sym)
-                if fq is not None:
-                    try:
-                        fp = float(fq.last_price)
-                        if fp > 0:
-                            fut_price_now = fp
-                    except Exception:
-                        pass
-                pnl = (fut_price_now - sp["entry_price"]) if sp["direction"] == "LONG" \
-                    else (sp["entry_price"] - fut_price_now)
-                d = "L" if sp["direction"] == "LONG" else "S"
-                exec_flag = "*" if sp.get("is_executed") else ""
-                shadow_parts.append(
-                    f"{s_sym}{exec_flag} {d}@{sp['entry_price']:.0f}"
-                    f" {'+' if pnl >= 0 else ''}{pnl:.0f}pt")
+                b5 = bar_data.get(s_sym)
+                if b5 is not None and len(b5) > 0:
+                    cur = float(b5.iloc[-1]["close"])
+                    pnl = (cur - sp["entry_price"]) if sp["direction"] == "LONG" \
+                        else (sp["entry_price"] - cur)
+                    d = "L" if sp["direction"] == "LONG" else "S"
+                    exec_flag = "*" if sp.get("is_executed") else ""
+                    shadow_parts.append(
+                        f"{s_sym}{exec_flag} {d}@{sp['entry_price']:.0f}"
+                        f" {'+' if pnl >= 0 else ''}{pnl:.0f}pt")
             if shadow_parts:
                 print(f" SHADOW: {' | '.join(shadow_parts)}")
 

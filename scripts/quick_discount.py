@@ -35,9 +35,7 @@ if not db_path:
     sys.exit(1)
 
 print(f"数据库: {db_path}\n")
-conn = sqlite3.connect(db_path, timeout=30)
-conn.execute("PRAGMA journal_mode=WAL")
-conn.execute("PRAGMA busy_timeout=30000")
+conn = sqlite3.connect(db_path)
 
 # ── 1. 现货：000852.SH（中证1000） ─────────────────────────────────────────
 spot_df = None

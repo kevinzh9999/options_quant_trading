@@ -160,7 +160,7 @@ EOD_CLOSE_UTC = "06:45"         # 14:45 BJ
 LUNCH_CLOSE_UTC = "03:25"       # 11:25 BJ
 NO_OPEN_LUNCH_START = "03:20"   # 11:20 BJ
 NO_OPEN_LUNCH_END = "05:05"     # 13:05 BJ
-NO_OPEN_EOD = "06:30"           # 14:30 BJ
+NO_OPEN_EOD = "06:15"           # 14:15 BJ
 
 
 def _boll_zone(price: float, mid: float, std: float) -> str:

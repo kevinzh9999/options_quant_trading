@@ -120,9 +120,7 @@ class IntradayBacktester:
     # ------------------------------------------------------------------
 
     def load_data(self, start_date: str, end_date: str) -> None:
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=30000")
+        conn = sqlite3.connect(self.db_path)
 
         # 分钟线
         for sym in self.symbols:
