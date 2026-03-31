@@ -18,7 +18,9 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 ### IML 连续合约映射（重要！）
 - Tushare 命名：`IM.CFX`/`IML.CFX` = 当月，`IML1.CFX` = 次月，`IML2.CFX` = 当季，`IML3.CFX` = 隔季
 - 映射数组：`_IML_CODES = ["IM.CFX", "IML1.CFX", "IML2.CFX", "IML3.CFX"]`（index 0 = 当月）
-- 单一真相来源：`utils/cffex_calendar.py`，包含 `active_im_months()` 和 `get_im_futures_prices()`
+- 单一真相来源：`utils/cffex_calendar.py`，包含 `active_im_months()`、`get_im_futures_prices()`、`get_main_contract()`
+- **主力合约选择**：`get_main_contract(symbol, api=None)` 有TQ时按持仓量(open_interest)选主力，离线fallback到按到期日选近月
+- Monitor和Executor统一调用此函数，不再各自实现合约选择逻辑
 - 历史教训：off-by-one 会导致贴水计算错乱，不要在 cffex_calendar 以外重复实现合约映射
 
 ### 贴水计算

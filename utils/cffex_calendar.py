@@ -127,6 +127,99 @@ def get_im_futures_prices(db, trade_date: str) -> dict[str, float]:
     return prices
 
 
+# ---------------------------------------------------------------------------
+# 主力合约选择（按持仓量）
+# ---------------------------------------------------------------------------
+
+def _third_friday(year: int, month: int) -> pd.Timestamp:
+    """计算指定月份的第三个周五（CFFEX 股指期货到期日）。"""
+    first_day = pd.Timestamp(year, month, 1)
+    days_to_fri = (4 - first_day.weekday()) % 7
+    first_fri = first_day + pd.Timedelta(days=days_to_fri)
+    return first_fri + pd.Timedelta(weeks=2)
+
+
+def _near_month_by_expiry() -> str:
+    """按到期日选近月合约（离线 fallback）。当月未到期用当月，否则下月。"""
+    today = pd.Timestamp.now()
+    tf = _third_friday(today.year, today.month)
+    if today.date() <= tf.date():
+        return _yymm(today.year, today.month)
+    else:
+        return _yymm(today.year, today.month + 1)
+
+
+def get_candidate_months() -> list[str]:
+    """
+    生成当前日期下所有候选合约月份（YYMM），排除已到期合约。
+    CFFEX 股指期货有：当月、下月、随后两个季月（3/6/9/12）。
+    """
+    today = pd.Timestamp.now()
+    y, m = today.year, today.month
+    raw = set()
+
+    # 当月和往后3个月
+    for i in range(4):
+        raw.add(_yymm(y, m + i))
+
+    # 季月
+    for qm in [3, 6, 9, 12]:
+        qy = y if qm >= m else y + 1
+        raw.add(_yymm(qy, qm))
+
+    # 过滤已到期合约
+    candidates = []
+    for code in sorted(raw):
+        cm = int(code[2:])
+        cy = 2000 + int(code[:2])
+        expiry = _third_friday(cy, cm)
+        if today.date() <= expiry.date():
+            candidates.append(code)
+
+    return candidates[:6]
+
+
+def get_main_contract(symbol_prefix: str, api=None) -> str:
+    """
+    确定主力合约：比较候选合约的持仓量，返回最大的。
+
+    Parameters
+    ----------
+    symbol_prefix : str
+        品种前缀，如 "IM", "IF", "IH", "IC"
+    api : TqApi | None
+        天勤 API 实例。传入时从 TQ 实时查询 open_interest；
+        不传时 fallback 到按到期日选近月。
+
+    Returns
+    -------
+    str
+        完整合约代码，如 "CFFEX.IM2606"
+    """
+    candidates = get_candidate_months()
+
+    if api is not None:
+        best_contract = None
+        max_oi = 0
+        for month in candidates:
+            contract = f"CFFEX.{symbol_prefix}{month}"
+            try:
+                quote = api.get_quote(contract)
+                api.wait_update()
+                oi = int(quote.open_interest or 0)
+                if oi > max_oi:
+                    max_oi = oi
+                    best_contract = contract
+            except Exception:
+                continue
+        if best_contract:
+            return best_contract
+
+    # 离线 fallback：按到期日选近月
+    near = _near_month_by_expiry()
+    return f"CFFEX.{symbol_prefix}{near}"
+
+
 def map_expiry_to_futures_price(
     expire_months: list[str],
     im_prices: dict[str, float],

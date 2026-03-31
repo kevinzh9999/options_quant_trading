@@ -179,18 +179,9 @@ def _update_log(db_path: str, log_id: int, **fields):
 # ---------------------------------------------------------------------------
 
 def _get_main_contract(symbol: str) -> str:
-    """获取当月主力合约。"""
-    try:
-        from utils.cffex_calendar import active_im_months
-        today = datetime.now().strftime("%Y%m%d")
-        months = active_im_months(today)
-        if months:
-            return f"CFFEX.{symbol}{months[0]}"
-    except Exception:
-        pass
-    now = datetime.now()
-    ym = f"{now.year % 100:02d}{now.month:02d}"
-    return f"CFFEX.{symbol}{ym}"
+    """获取主力合约（离线模式，按到期日选近月）。"""
+    from utils.cffex_calendar import get_main_contract
+    return get_main_contract(symbol)
 
 
 # ---------------------------------------------------------------------------
@@ -485,11 +476,13 @@ def _execute_order(
             "account_id": os.getenv("TQ_ACCOUNT_ID", ""),
             "broker_password": os.getenv("TQ_BROKER_PASSWORD", ""),
         }
-        contract = _get_main_contract(sym)
-
         client = TqClient(**creds)
         client.connect()
         api = client._api
+
+        # 用 TQ 按持仓量选主力合约（与 monitor 一致）
+        from utils.cffex_calendar import get_main_contract
+        contract = get_main_contract(sym, api=api)
 
         try:
             # TQ 方向和开平

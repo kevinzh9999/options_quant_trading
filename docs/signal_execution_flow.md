@@ -151,7 +151,7 @@ suggested_lots = risk_per_trade / stop_loss_amount
           │
           ▼
      api.insert_order()
-     合约: 主力合约（_resolve_near_month 自动检测当月/季月）
+     合约: 主力合约（get_main_contract 按持仓量选择，如 CFFEX.IM2606）
      方向: BUY(做多) / SELL(做空)
      开平: OPEN
      价格: 限价单（排队价）

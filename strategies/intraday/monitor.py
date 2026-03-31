@@ -341,12 +341,11 @@ class IntradayMonitor:
             from config.config_loader import ConfigLoader
             db = DBManager(ConfigLoader().get_db_path())
 
-            # 1. 解析近月合约月份
-            near_month = self._resolve_near_month(db)
+            # 1. 解析合约（离线 fallback，TQ连接后会按持仓量重新选择）
+            from utils.cffex_calendar import get_main_contract
             for sym in self.symbols:
-                tq_sym = f"CFFEX.{sym}{near_month}"
-                self._tq_symbols[sym] = tq_sym
-            print(f"  近月合约: {near_month} → {list(self._tq_symbols.values())}")
+                self._tq_symbols[sym] = get_main_contract(sym)
+            print(f"  合约(离线): {list(self._tq_symbols.values())}")
 
             # 2. 加载现货指数日线数据（用于信号计算：daily_mult, intraday_return）
             for sym in self.symbols:
@@ -430,34 +429,6 @@ class IntradayMonitor:
 
         except Exception as e:
             print(f"  [WARNING] daily data load failed: {e}")
-
-    @staticmethod
-    def _resolve_near_month(db) -> str:
-        """确定近月合约月份（YYMM），到期前用当月，到期后用下月。"""
-        import pandas as pd
-        today = pd.Timestamp.now()
-        yy = today.year % 100
-        mm = today.month
-
-        # CFFEX规则：到期日是每月第三个周五
-        # 计算本月第三个周五
-        first_day = pd.Timestamp(today.year, mm, 1)
-        # 找第一个周五
-        days_to_fri = (4 - first_day.weekday()) % 7
-        first_fri = first_day + pd.Timedelta(days=days_to_fri)
-        third_fri = first_fri + pd.Timedelta(weeks=2)
-
-        if today.date() <= third_fri.date():
-            # 本月合约尚未到期
-            return f"{yy:02d}{mm:02d}"
-        else:
-            # 本月已到期，用下月
-            nm = mm + 1
-            ny = yy
-            if nm > 12:
-                nm = 1
-                ny += 1
-            return f"{ny:02d}{nm:02d}"
 
     def _append_signal(self, signal_dict: dict) -> None:
         """追加信号到JSON列表（解决同根K线CLOSE被OPEN覆盖的竞态）。"""
@@ -634,6 +605,12 @@ class IntradayMonitor:
         api = client._api
 
         try:
+            # 用 TQ 按持仓量重新选择主力合约
+            from utils.cffex_calendar import get_main_contract
+            for sym in self.symbols:
+                self._tq_symbols[sym] = get_main_contract(sym, api=api)
+            print(f"  主力合约(按OI): {list(self._tq_symbols.values())}")
+
             # 订阅现货指数K线（信号计算用）
             spot_klines_5m: Dict[str, pd.DataFrame] = {}
             spot_klines_15m: Dict[str, pd.DataFrame] = {}
@@ -649,7 +626,7 @@ class IntradayMonitor:
                     spot_klines_15m[sym] = api.get_kline_serial(spot_sym, 900, 100)
 
                 # 期货
-                fut_sym = self._tq_symbols.get(sym, f"CFFEX.{sym}2604")
+                fut_sym = self._tq_symbols[sym]
                 fut_klines_5m[sym] = api.get_kline_serial(fut_sym, 300, 200)
                 fut_quotes[sym] = api.get_quote(fut_sym)
 
