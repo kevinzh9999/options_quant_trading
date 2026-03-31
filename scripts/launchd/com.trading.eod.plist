@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  每个工作日 18:30 自动运行延迟 EOD（等 Tushare 数据更新）
+
+  安装:
+    cp scripts/launchd/*.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.trading.eod.plist
+
+  查看: launchctl list | grep trading
+  卸载: launchctl unload ~/Library/LaunchAgents/com.trading.eod.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.trading.eod</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>scripts/run_eod_delayed.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/kevinzhao/Library/CloudStorage/GoogleDrive-kevinzh@gmail.com/我的云端硬盘/options_quant_trading</string>
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
+    </array>
+    <key>StandardOutPath</key>
+    <string>/Users/kevinzhao/Library/CloudStorage/GoogleDrive-kevinzh@gmail.com/我的云端硬盘/options_quant_trading/logs/runtime/eod_auto.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/kevinzhao/Library/CloudStorage/GoogleDrive-kevinzh@gmail.com/我的云端硬盘/options_quant_trading/logs/runtime/eod_auto.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/Caskroom/miniforge/base/envs/quant/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

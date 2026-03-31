@@ -1,0 +1,60 @@
+# ============================================================
+# A股股指期货/期权波动率交易系统 - Git 忽略规则
+# ============================================================
+
+# ------ 敏感配置（绝对不能提交！）------
+config/config.yaml
+.env
+*.env
+secrets.yaml
+
+# ------ 数据库文件 ------
+*.db
+*.sqlite
+*.sqlite3
+data/*.db
+data/market_data.db
+
+# ------ 日志 ------
+logs/
+*.log
+
+# ------ Jupyter Notebook 输出 ------
+notebooks/**/*.ipynb
+# 保留空目录标记（若有的话）
+
+# ------ Python 编译文件 ------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+
+# ------ Python 包/虚拟环境 ------
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+env/
+.env/
+
+# ------ 测试和覆盖率 ------
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ------ IDE / 编辑器 ------
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ------ 临时文件 ------
+*.tmp
+*.bak
+*.orig

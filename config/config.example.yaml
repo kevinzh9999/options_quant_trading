@@ -1,0 +1,148 @@
+# ============================================================
+# A股股指期货/期权波动率交易系统 - 示例配置文件
+# 使用前请复制为 config.yaml 并填入真实值
+# 注意：config.yaml 已加入 .gitignore，请勿提交真实密钥
+# ============================================================
+
+tushare:
+  token: "YOUR_TUSHARE_PRO_TOKEN_HERE"
+
+tq:
+  # 天勤平台认证（TqAuth）——用于行情权限
+  account: "YOUR_TIANQIN_ACCOUNT_EMAIL_HERE"      # 天勤平台登录邮箱
+  password: "YOUR_TIANQIN_PLATFORM_PASSWORD_HERE" # 天勤平台密码（环境变量: TQ_PASSWORD）
+  # 期货公司实盘账户（TqAccount）——用于下单和持仓查询
+  broker: "H宏源期货"         # 期货公司代码，宏源期货固定为 "H宏源期货"（含 H 前缀）
+  account_id: "YOUR_FUTURES_ACCOUNT_ID_HERE"      # 期货公司资金账号（环境变量: TQ_ACCOUNT_ID）
+  broker_password: "YOUR_FUTURES_ACCOUNT_PASSWORD_HERE"  # 期货账户密码（环境变量: TQ_BROKER_PASSWORD）
+
+database:
+  path: "data/market_data.db"
+
+strategy:
+  # VRP 入场阈值：(GARCH预测波动率 - IV) / IV 超过此值时触发做空波动率信号
+  vrp_threshold: 0.05
+  # 持仓周期（交易日）
+  holding_period: 5
+  # 用于计算已实现波动率的历史窗口（交易日）
+  rv_window: 20
+  # 用于 GARCH 模型拟合的历史数据长度（交易日）
+  garch_lookback: 252
+
+risk:
+  # 最大保证金占用比例（占账户净值）
+  max_margin_ratio: 0.50
+  # 单日最大亏损比例（占账户净值）
+  max_daily_loss_ratio: 0.02
+  # 最大 Delta 敞口（以标的名义市值计，单位：元）
+  max_delta_exposure: 500000
+  # 最大 Vega 敞口（单位：元/每1%波动率变动）
+  max_vega_exposure: 100000
+
+strategies:
+  # 启用的策略列表（strategy_id 必须与代码中的 strategy_id 一致）
+  enabled:
+    - vol_arb_IO      # 沪深300期权波动率套利
+    - vol_arb_MO      # 中证1000期权波动率套利
+    # - trend_IF      # IF 趋势跟踪（暂未启用）
+    # - spread_IF_IH  # IF/IH 价差套利（暂未启用）
+
+  vol_arb:
+    vrp_threshold: 0.05         # VRP 入场阈值
+    holding_period: 5           # 持仓周期（交易日）
+    rv_window: 20               # RV 计算窗口
+    garch_lookback: 252         # GARCH 拟合历史窗口
+    target_delta: 0.25          # 目标 Delta（OTM 程度）
+    option_strategy: "strangle" # strangle 或 straddle
+    min_days_to_expire: 7       # 最短剩余到期天数
+    max_days_to_expire: 45      # 最长剩余到期天数
+
+  trend_following:
+    short_window: 20            # 短期均线窗口
+    long_window: 60             # 长期均线窗口
+    adx_threshold: 25.0         # ADX 趋势确认阈值
+    stop_loss_atr_multiple: 2.0 # 止损幅度（ATR 倍数）
+    take_profit_atr_multiple: 4.0
+
+  spread_trading:
+    coint_lookback: 120         # 协整检验历史窗口
+    recheck_coint_days: 20      # 协整重检频率
+    pairs:
+      - leg1: "IF"
+        leg2: "IH"
+        entry_zscore: 2.0
+        exit_zscore: 0.5
+        stop_zscore: 3.5
+      - leg1: "IC"
+        leg2: "IM"
+        entry_zscore: 2.0
+        exit_zscore: 0.5
+        stop_zscore: 3.5
+
+  mean_reversion:
+    rsi_window: 14
+    rsi_overbought: 70.0
+    rsi_oversold: 30.0
+    bb_window: 20
+    bb_std: 2.0
+    max_half_life: 20.0         # 最大允许半衰期（交易日）
+    stop_loss_pct: 0.02         # 止损幅度
+
+  intraday:
+    enabled: true
+    capital_allocation: 0.3         # 分配30%资金给日内策略
+    symbols: ["IF", "IH", "IM"]
+    params:
+      # 信号参数
+      opening_range_minutes: 30
+      vwap_deviation_threshold: 0.002
+      volume_surge_ratio: 1.5
+      trend_fast_period: 10
+      trend_slow_period: 30
+      min_signal_score: 60          # 最低信号分数
+
+      # 仓位参数
+      max_lots_per_symbol: 1
+      max_total_lots: 2
+      stop_loss_bps: 100
+      use_lock: true
+
+      # 移动止盈
+      trailing_stop_activate_bps: 50
+      trailing_stop_levels:
+        - {profit_bps: 50, lock_bps: 0}      # 盈50bps → 止损移到平保
+        - {profit_bps: 80, lock_bps: 50}     # 盈80bps → 锁定50bps
+        - {profit_bps: 120, lock_bps: 80}    # 盈120bps → 锁定80bps
+
+      # 风控参数
+      max_daily_loss: 50000
+      max_daily_trades_per_symbol: 5
+      max_consecutive_losses: 3
+
+      # 手续费（万分之几）
+      commission:
+        open_rate: 0.000023
+        intraday_close_rate: 0.000345
+        overnight_close_rate: 0.000023
+
+  discount_capture:
+    enabled: true
+    capital_allocation: 0.3     # 账户资金分配比例
+    symbols: ["CFFEX.IM"]
+    params:
+      min_discount_rate: 0.08   # 最低年化贴水率入场阈值
+      target_days_range: [30, 120]  # 目标剩余到期天数区间
+      put_delta: -0.15          # 目标保护 Put Delta
+      max_loss_per_trade: 0.05  # 每笔最大亏损（相对账户权益）
+      roll_days_before_expiry: 5  # 到期前N天滚仓
+
+portfolio_risk:
+  # 组合级别风险控制（跨策略）
+  max_total_margin_ratio: 0.60  # 组合总保证金占净值上限
+  max_single_strategy_weight: 0.50  # 单策略风险权重上限
+  max_correlation_threshold: 0.70   # 策略相关性告警阈值
+  daily_var_limit: 0.03         # 每日 VaR 上限（95% 置信水平）
+
+logging:
+  level: "INFO"   # DEBUG / INFO / WARNING / ERROR
+  dir: "logs/"

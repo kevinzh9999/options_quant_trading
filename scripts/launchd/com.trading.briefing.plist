@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  每个工作日 8:55 自动运行 Morning Briefing
+
+  安装:
+    cp scripts/launchd/*.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.trading.briefing.plist
+
+  查看: launchctl list | grep trading
+  卸载: launchctl unload ~/Library/LaunchAgents/com.trading.briefing.plist
+
+  注意: 修改下面的 WorkingDirectory 为你的项目实际路径
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.trading.briefing</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/Caskroom/miniforge/base/envs/quant/bin/python</string>
+        <string>scripts/morning_briefing.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <!-- 修改为你的项目实际路径 -->
+    <string>/Users/kevinzhao/Library/CloudStorage/GoogleDrive-kevinzh@gmail.com/我的云端硬盘/options_quant_trading</string>
+    <key>StartCalendarInterval</key>
+    <array>
+        <!-- 周一到周五 8:55 -->
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>55</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>55</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>55</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>55</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>55</integer></dict>
+    </array>
+    <key>StandardOutPath</key>
+    <string>/Users/kevinzhao/Library/CloudStorage/GoogleDrive-kevinzh@gmail.com/我的云端硬盘/options_quant_trading/logs/runtime/briefing_auto.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/kevinzhao/Library/CloudStorage/GoogleDrive-kevinzh@gmail.com/我的云端硬盘/options_quant_trading/logs/runtime/briefing_auto.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/Caskroom/miniforge/base/envs/quant/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
