@@ -57,7 +57,9 @@ W = 60  # panel width
 
 def _ensure_order_log(db_path: str):
     """确保 order_log 表存在。"""
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS order_log (
             datetime     TEXT,
@@ -80,7 +82,9 @@ def _ensure_order_log(db_path: str):
 
 def _record_order(db_path: str, record: dict):
     """记录下单结果。"""
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute(
         "INSERT OR REPLACE INTO order_log "
         "(datetime, symbol, direction, action, limit_price, lots, "
@@ -231,7 +235,7 @@ def _execute_order(
 
     # 记录用的 action 标签
     record_action = "LOCK" if use_lock else action
-    is_stop_loss = is_close and reason == "STOP_LOSS"
+    is_urgent_close = is_close  # 所有平仓信号超时都持续提醒
 
     if dry_run:
         print(f"\n [DRY RUN] 不实际下单")
@@ -256,26 +260,26 @@ def _execute_order(
         return {"status": "SKIPPED"}
     else:
         # 超时
-        if is_stop_loss:
-            # 止损超时：持续警告
-            print(f"\n  ⚠ 止损信号未确认！请手动处理持仓")
+        if is_urgent_close:
+            # 平仓超时：持续警告直到确认
+            print(f"\n  ⚠ 平仓信号({reason})未确认！请手动处理持仓")
             while True:
                 resp2 = _confirm(
-                    f"  ⚠ {sym} 止损未执行！确认处理？[y/n] (30s)", 30.0)
+                    f"  ⚠ {sym} {reason} 未执行！确认处理？[y/n] (30s)", 30.0)
                 if resp2 == "y":
                     break
                 elif resp2 == "n":
-                    print(f"  -> 止损放弃（手动处理）")
+                    print(f"  -> 平仓放弃（手动处理）")
                     _record_order(db_path, {
                         "datetime": ts, "symbol": sym, "direction": direction,
                         "action": action, "limit_price": limit_price,
                         "lots": lots, "filled_lots": 0, "filled_price": 0,
-                        "status": "STOP_SKIP", "signal_score": score,
+                        "status": "CLOSE_SKIP", "signal_score": score,
                         "reason": reason,
                     })
-                    return {"status": "STOP_SKIP"}
+                    return {"status": "CLOSE_SKIP"}
                 else:
-                    print(f"  ⚠ 止损信号未确认！请手动处理持仓")
+                    print(f"  ⚠ {sym} {reason} 未执行！请手动处理")
         else:
             print(f"  -> TIMEOUT_SKIP")
             _record_order(db_path, {
@@ -340,9 +344,9 @@ def _execute_order(
             if filled == 0:
                 status = "TIMEOUT"
                 print(f"  未成交，限价{limit_price:.1f}未触及")
-                if is_stop_loss:
+                if is_urgent_close:
                     resp3 = _confirm(
-                        f"  ⚠ 止损未成交！改市价单？[y/n]", 30.0)
+                        f"  ⚠ {reason}未成交！改市价单？[y/n]", 30.0)
                     if resp3 == "y":
                         order2 = api.insert_order(
                             contract, direction=tq_dir, offset=tq_offset,
