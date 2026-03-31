@@ -44,9 +44,10 @@ class DBManager:
         if db_path != ":memory:":
             p = Path(db_path)
             p.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES)
+        self._conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES, timeout=30)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=30000")
         self.initialize_tables()
 
     # ------------------------------------------------------------------

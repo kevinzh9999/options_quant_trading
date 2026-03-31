@@ -752,7 +752,9 @@ def print_briefing(trade_date, direction, confidence, score,
 # ---------------------------------------------------------------------------
 
 def _save_to_db(db_path, trade_date, data):
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS morning_briefing (
             trade_date       TEXT PRIMARY KEY,
