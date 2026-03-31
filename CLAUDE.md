@@ -119,6 +119,7 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - signal_json保留原始JSON留底
 - 撤单机制：开仓60秒/平仓30秒未成交自动撤单，平仓未成交自动以激进价追单
 - 持仓追踪：executor内部`_positions`字典，无持仓忽略CLOSE、重复开仓跳过
+- 持仓恢复：启动时从`order_log`推断当天净持仓（OPEN-CLOSE/LOCK），再用TQ实盘对账校正。解决盘中重启后positions丢失的问题
 - 持仓对账：每60秒读取`tmp/futures_positions.json`（monitor写出），与内部positions对账；TQ无持仓但executor有记录→自动清除
 
 ### 股指期货平今手续费（2026-03-28决定）

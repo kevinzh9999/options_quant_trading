@@ -752,6 +752,80 @@ def _reconcile_positions(positions: dict):
 
 
 # ---------------------------------------------------------------------------
+# 持仓恢复（重启后从 order_log 推断）
+# ---------------------------------------------------------------------------
+
+def _restore_positions_from_log(db_path: str, positions: dict):
+    """从当天 order_log 推断应有持仓，用于 executor 重启后恢复。
+
+    逻辑：当天 OPEN(FILLED) - CLOSE/LOCK(FILLED) = 净持仓。
+    恢复后再由 _reconcile_positions 用 TQ 实盘数据校正。
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        db = DBManager(db_path)
+        rows = db.query_df(
+            "SELECT symbol, direction, action, filled_lots, filled_price "
+            "FROM order_log "
+            "WHERE datetime >= ? AND status = 'FILLED'",
+            params=(today,),
+        )
+    except Exception as e:
+        print(f"  [WARN] 持仓恢复查询失败: {e}")
+        return
+
+    if rows is None or rows.empty:
+        return
+
+    # 按品种汇总：OPEN 加仓，CLOSE/LOCK 减仓
+    net: dict = {}  # sym -> {"long": lots, "short": lots, "last_price": float}
+    for _, r in rows.iterrows():
+        sym = str(r["symbol"])
+        d = str(r["direction"])
+        act = str(r["action"])
+        lots = int(r.get("filled_lots", 0) or 0)
+        price = float(r.get("filled_price", 0) or 0)
+        if lots <= 0:
+            continue
+
+        if sym not in net:
+            net[sym] = {"long": 0, "short": 0, "last_price": 0}
+
+        if act == "OPEN":
+            if d == "LONG":
+                net[sym]["long"] += lots
+            else:
+                net[sym]["short"] += lots
+            net[sym]["last_price"] = price
+        elif act in ("CLOSE", "LOCK", "CLOSE_DENIED"):
+            # CLOSE/LOCK 减去对应方向
+            if d == "LONG":
+                net[sym]["long"] = max(0, net[sym]["long"] - lots)
+            else:
+                net[sym]["short"] = max(0, net[sym]["short"] - lots)
+
+    # 写入 positions
+    restored = []
+    for sym, info in net.items():
+        net_long = info["long"] - info["short"]
+        if net_long == 0:
+            continue
+        direction = "LONG" if net_long > 0 else "SHORT"
+        lots = abs(net_long)
+        positions[sym] = {
+            "direction": direction,
+            "lots": lots,
+            "entry_price": info["last_price"],
+            "entry_time": "restored",
+        }
+        d_cn = "多" if direction == "LONG" else "空"
+        restored.append(f"{sym} {d_cn}{lots}手@{info['last_price']:.0f}")
+
+    if restored:
+        print(f" 从order_log恢复持仓: {', '.join(restored)}")
+
+
+# ---------------------------------------------------------------------------
 # 主循环
 # ---------------------------------------------------------------------------
 
@@ -788,10 +862,13 @@ def main():
           f"  亏损上限{MAX_DAILY_LOSS_PCT*100:.0f}%")
     print(f"{'═' * W}")
 
-    # 检查昨日锁仓持仓
+    # 检查昨日锁仓持仓 + 否决平仓提醒
     _check_locked_positions(db_path, args.dry_run)
 
-    # 启动时对账
+    # 从 order_log 恢复当天持仓（重启后内存清空的恢复手段）
+    _restore_positions_from_log(db_path, positions)
+
+    # 启动时用 TQ 实盘持仓对账（覆盖 order_log 推断的结果）
     _reconcile_positions(positions)
 
     daily_orders = 0

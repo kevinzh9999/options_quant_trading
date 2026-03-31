@@ -338,10 +338,57 @@ shadow_positions[sym] ─▶ check_exit()
 
 ---
 
-## 三、持仓对账
+## 三、Executor 启动与持仓恢复
 
-### 3.1 数据流
+### 3.1 启动流程
 
+Executor 启动时按顺序执行以下检查：
+
+```
+main() 启动
+  │
+  ▼
+① _check_locked_positions()     ← 前日锁仓提醒
+  │
+  ▼
+② _check_denied_positions()     ← 前日否决平仓提醒
+  │
+  ▼
+③ _restore_positions_from_log() ← 从 order_log 恢复当天持仓
+  │
+  ▼
+④ _reconcile_positions()        ← 用 TQ 实盘数据校正
+  │
+  ▼
+  进入主循环（每1秒轮询信号）
+```
+
+### 3.2 持仓恢复（重启场景）
+
+**问题**：Executor 的 `positions` 字典存在内存中。盘中崩溃重启后字典清空，后续平仓信号会被 REJECTED（NO_POSITION）。
+
+**解决**：启动时从 `order_log` 表推断当天应有持仓。
+
+```
+查询当天 order_log WHERE status='FILLED'
+  │
+  ▼
+按品种汇总：
+  action=OPEN  → 对应方向加仓
+  action=CLOSE/LOCK → 对应方向减仓
+  │
+  ▼
+net_long - net_short ≠ 0 → 写入 positions 字典
+  │
+  ▼
+打印: "从order_log恢复持仓: IM 多1手@7648"
+```
+
+**恢复后**由 `_reconcile_positions()` 用 TQ 实盘数据二次校正——如果 order_log 和 TQ 实际不一致（如手动操作），以 TQ 为准。
+
+### 3.3 持仓对账（盘中持续）
+
+**数据流**：
 ```
 Monitor (每5分钟) ─▶ tmp/futures_positions.json ─▶ Executor (每60秒读取)
      │                                                    │
@@ -350,7 +397,7 @@ Monitor (每5分钟) ─▶ tmp/futures_positions.json ─▶ Executor (每60秒
   TQ 实盘持仓                                    executor.positions 字典
 ```
 
-### 3.2 对账逻辑
+**对账规则**：
 
 | 场景 | 处理 |
 |------|------|
@@ -359,11 +406,21 @@ Monitor (每5分钟) ─▶ tmp/futures_positions.json ─▶ Executor (每60秒
 | TQ 有持仓，Executor **无记录** | 打印提醒（可能是手动开仓），**不自动补录** |
 | TQ **无持仓**，Executor 有记录 | 打印警告（已被手动平仓），**自动清除executor记录** |
 
-### 3.3 数据新鲜度
-
+**数据新鲜度**：
 - `futures_positions.json` 中包含 `timestamp` 字段
 - Executor 只使用 10 分钟内的数据（Monitor 可能已停止）
 - 超过 10 分钟的数据静默忽略
+
+### 3.4 恢复优先级
+
+```
+order_log 推断  →  TQ 实盘校正  →  最终 positions
+  (第一手段)        (第二手段，权威)
+```
+
+- order_log 恢复的是"executor 自己开过什么"，覆盖了重启丢失的内存
+- TQ 对账修正"实际还剩什么"，处理手动操作和部分成交等边界情况
+- 两步顺序不能反：先恢复再校正，确保 TQ 有持仓但 executor 无记录时能正确判断是"恢复后匹配"还是"手动开仓"
 
 ---
 
