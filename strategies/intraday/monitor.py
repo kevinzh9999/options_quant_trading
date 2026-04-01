@@ -1146,8 +1146,10 @@ class IntradayMonitor:
                 last = act.get("last", 0)
                 sugg_lots = self._calc_suggested_lots(last, sym)
 
-                # 写信号JSON供 executor
-                self._write_signal_file(act, current_time_utc)
+                # 写信号JSON供executor（只有实盘品种）
+                _TRADEABLE = {"IM", "IC"}  # IF观察中，IH放弃日内
+                if sym in _TRADEABLE:
+                    self._write_signal_file(act, current_time_utc)
 
                 # 面板打印信号（不等确认）
                 d_cn = "LONG" if direction == "LONG" else "SHORT"
