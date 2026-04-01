@@ -529,17 +529,24 @@ class IntradayMonitor:
     # ------------------------------------------------------------------
 
     def _save_shadow_state(self) -> None:
-        """将活跃shadow持仓持久化到JSON文件，供重启恢复。"""
+        """将活跃shadow持仓+信号去重状态持久化到JSON文件。
+
+        包含: shadow_positions, prompted_bars（信号去重防重启重复）
+        使用原子写入（先写tmp再rename）防止crash导致JSON损坏。
+        """
         import json as _json
         state = {
             "trade_date": datetime.now().strftime("%Y%m%d"),
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "positions": self._shadow_positions,
+            "prompted_bars": [list(k) for k in self._prompted_bars],
         }
         path = os.path.join(self._tmp_dir, "shadow_state.json")
+        tmp_path = path + ".tmp"
         try:
-            with open(path, "w") as f:
+            with open(tmp_path, "w") as f:
                 _json.dump(state, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)  # 原子替换
         except Exception as e:
             print(f"  [WARN] shadow_state write failed: {e}")
 
@@ -574,6 +581,13 @@ class IntradayMonitor:
                         parts = [f"{s} {sp['direction']}@{sp['entry_price']:.0f}"
                                  for s, sp in restored.items()]
                         print(f"  恢复shadow持仓: {', '.join(parts)}")
+                    # 恢复信号去重集合（防止重启后重复发送同bar信号）
+                    pb = state.get("prompted_bars", [])
+                    for item in pb:
+                        if isinstance(item, list) and len(item) == 2:
+                            self._prompted_bars.add(tuple(item))
+                    if pb:
+                        print(f"  恢复信号去重: {len(pb)}个bar已标记")
                 else:
                     # 非当天的状态文件，忽略
                     pass
@@ -1124,6 +1138,10 @@ class IntradayMonitor:
                 del self._shadow_positions[sym]
                 self.strategy.position_mgr.remove_by_symbol(sym)
                 self._save_shadow_state()
+
+        # 持久化shadow状态（极值更新后checkpoint，防crash丢失）
+        if self._shadow_positions:
+            self._save_shadow_state()
 
         # 打印状态面板（传入现货bar和期货行情）
         self._print_status(bar_data, fut_quotes, actions)
