@@ -94,13 +94,76 @@ def _load_positions(db: DBManager) -> list[dict]:
 
 
 def _load_account(db: DBManager) -> dict:
-    """最新账户快照。"""
+    """最新账户快照（DB fallback）。"""
     df = db.query_df(
         "SELECT * FROM account_snapshots ORDER BY trade_date DESC LIMIT 1"
     )
     if df is None or df.empty:
         return {}
     return df.iloc[0].to_dict()
+
+
+def _load_tq_account_and_positions() -> tuple[dict, list[dict]]:
+    """从TQ实时读取账户和持仓。失败返回空。"""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(Path(ROOT) / ".env")
+    except ImportError:
+        pass
+    try:
+        from data.sources.tq_client import TqClient
+        import time as _time
+        creds = {
+            "auth_account": os.getenv("TQ_ACCOUNT", ""),
+            "auth_password": os.getenv("TQ_PASSWORD", ""),
+            "broker_id": os.getenv("TQ_BROKER", ""),
+            "account_id": os.getenv("TQ_ACCOUNT_ID", ""),
+            "broker_password": os.getenv("TQ_BROKER_PASSWORD", ""),
+        }
+        if not creds["auth_account"]:
+            return {}, []
+        client = TqClient(**creds)
+        client.connect()
+        api = client._api
+
+        # 等待数据到达
+        api.wait_update(deadline=_time.time() + 5)
+
+        # 账户
+        account_obj = api.get_account()
+        account = {
+            "balance": float(getattr(account_obj, "balance", 0) or 0),
+            "margin": float(getattr(account_obj, "margin", 0) or 0),
+            "float_profit": float(getattr(account_obj, "float_profit", 0) or 0),
+            "available": float(getattr(account_obj, "available", 0) or 0),
+            "source": "TQ实时",
+        }
+
+        # 持仓
+        positions = []
+        tq_pos = api.get_position()
+        for sym_key in tq_pos:
+            pos_obj = tq_pos[sym_key]
+            vol_long = int(getattr(pos_obj, "pos_long", 0) or 0)
+            vol_short = int(getattr(pos_obj, "pos_short", 0) or 0)
+            if vol_long > 0:
+                positions.append({
+                    "symbol": sym_key.replace("CFFEX.", ""),
+                    "direction": "多",
+                    "volume": vol_long,
+                })
+            if vol_short > 0:
+                positions.append({
+                    "symbol": sym_key.replace("CFFEX.", ""),
+                    "direction": "空",
+                    "volume": vol_short,
+                })
+
+        client.disconnect()
+        return account, positions
+    except Exception as e:
+        print(f"  [WARN] TQ实时数据读取失败: {e}")
+        return {}, []
 
 
 # ---------------------------------------------------------------------------
@@ -482,25 +545,26 @@ def print_panel(
     print(f"  20日范围位置  : {rp*100:.0f}%"
           f"  ({dir_detail.get('low_20', 0):.0f} ~ {dir_detail.get('high_20', 0):.0f})")
 
-    # 贴水
+    # 贴水（val是年化百分比）
     if discount:
         print(f"\n{'【贴水】'}")
-        # 计算分位数（从daily_model_output历史）
-        cols = ["discount_rate_iml1", "discount_rate_iml2", "discount_rate_iml3"]
+        _disc_contracts = ["IML1", "IML2", "IML3"]
+        # DTE 近似：IML1~45天, IML2~90天, IML3~180天
+        _dte_approx = [45, 90, 180]
         for i, (label, val) in enumerate(discount.items()):
             pct_s = ""
-            if i < len(cols):
+            if db and i < len(_disc_contracts):
                 try:
-                    hist = db.query_df(
-                        f"SELECT {cols[i]} FROM daily_model_output "
-                        f"WHERE {cols[i]} IS NOT NULL")
-                    if hist is not None and len(hist) >= 5:
-                        vals = hist[cols[i]].astype(float).dropna().values
-                        rate = val / 100
-                        pct = float(np.mean(vals <= rate) * 100)
-                        tag = ("历史极深" if pct <= 10 else "偏深" if pct <= 30
-                               else "偏浅" if pct >= 70 else "")
-                        pct_s = f"  P{pct:.0f}" + (f"({tag})" if tag else "")
+                    from strategies.discount_capture.signal import DiscountSignal
+                    ds = DiscountSignal(db)
+                    # 年化百分比→日贴水率绝对值（用近似DTE反推）
+                    dte = _dte_approx[i] if i < len(_dte_approx) else 90
+                    daily_rate_abs = abs(val) / 100 * dte / 365
+                    pct = ds.get_discount_percentile(
+                        daily_rate_abs, contract_type=_disc_contracts[i])
+                    tag = ("历史极深" if pct >= 90 else "偏深" if pct >= 70
+                           else "偏浅" if pct <= 10 else "")
+                    pct_s = f"  P{pct:.0f}" + (f"({tag})" if tag else "")
                 except Exception:
                     pass
             print(f"  {label:16s}: {val:+.1f}%{pct_s}")
@@ -519,7 +583,8 @@ def print_panel(
         equity = float(account.get("balance", 0) or account.get("equity", 0) or 0)
         margin = float(account.get("margin", 0) or 0)
         margin_pct = margin / equity * 100 if equity > 0 else 0
-        print(f"\n{'【账户】'}")
+        src = account.get("source", "DB快照")
+        print(f"\n{'【账户】'} ({src})")
         print(f"  权益: {equity:,.0f}  保证金: {margin:,.0f} ({margin_pct:.1f}%)")
 
     print(f"\n{'═' * W}")
@@ -529,14 +594,24 @@ def print_panel(
 # 主流程
 # ---------------------------------------------------------------------------
 
-def run_once(db: DBManager, prev_quadrant: str = "") -> str:
+def run_once(db: DBManager, prev_quadrant: str = "",
+             tq_account: dict = None, tq_positions: list = None) -> str:
     """刷新一次面板。返回当前象限名称。"""
     # 加载数据
     snap = _load_vol_snapshot(db)
     model = _load_model_output(db)
     daily = _load_daily_prices(db, 25)
-    positions = _load_positions(db)
-    account = _load_account(db)
+
+    # 持仓和账户：优先TQ实时，fallback DB快照
+    if tq_positions is not None:
+        positions_raw = tq_positions
+    else:
+        positions_raw = _load_positions(db)
+    if tq_account is not None:
+        account = tq_account
+    else:
+        account = _load_account(db)
+    positions = positions_raw
 
     # IV 分位
     atm_iv = float(snap.get("atm_iv", 0) or model.get("atm_iv", 0) or 0)
@@ -575,14 +650,22 @@ def run_once(db: DBManager, prev_quadrant: str = "") -> str:
     pos_info = _parse_positions(positions)
     pos_icon, pos_desc = evaluate_position_match(quadrant, pos_info, vrp=vrp)
 
-    # 贴水
+    # 贴水：优先vol_monitor_snapshots实时年化%，fallback daily_model_output日贴水率
     discount = {}
-    for label, col in [("次月(IML1)", "discount_rate_iml1"),
-                        ("当季(IML2)", "discount_rate_iml2"),
-                        ("隔季(IML3)", "discount_rate_iml3")]:
-        val = model.get(col)
-        if val is not None and val != "":
-            discount[label] = float(val) * 100
+    for label, snap_col, model_col in [
+        ("次月(IML1)", "discount_iml1", "discount_rate_iml1"),
+        ("当季(IML2)", "discount_iml2", "discount_rate_iml2"),
+        ("隔季(IML3)", None,            "discount_rate_iml3"),
+    ]:
+        # 优先实时（snap已是年化百分比）
+        val = snap.get(snap_col) if snap_col else None
+        if val is not None and val != "" and not (isinstance(val, float) and np.isnan(val)):
+            discount[label] = float(val)
+        else:
+            # fallback: daily_model_output 存的是日贴水率小数
+            val2 = model.get(model_col)
+            if val2 is not None and val2 != "":
+                discount[label] = float(val2) * 100
 
     # 象限切换
     switch_alert = None
@@ -605,18 +688,21 @@ def main():
     db = DBManager(ConfigLoader().get_db_path())
 
     if "--once" in sys.argv:
-        run_once(db)
+        tq_acc, tq_pos = _load_tq_account_and_positions()
+        run_once(db, tq_account=tq_acc or None, tq_positions=tq_pos or None)
         return
 
-    print("  策略象限监控启动 | 每5分钟刷新")
+    print("  策略象限监控启动 | 每5分钟刷新（TQ实时账户+持仓）")
     prev_q = ""
     while True:
         try:
-            prev_q = run_once(db, prev_q)
+            tq_acc, tq_pos = _load_tq_account_and_positions()
+            prev_q = run_once(db, prev_q,
+                              tq_account=tq_acc or None,
+                              tq_positions=tq_pos or None)
         except Exception as e:
             print(f"\n  [ERROR] {e}")
         try:
-            # 等待到下一个整5分钟
             now = datetime.now()
             wait = (5 - now.minute % 5) * 60 - now.second
             if wait <= 0:
