@@ -764,6 +764,31 @@ def _get_time_weight(utc_time: time) -> float:
     return 1.0
 
 
+def _find_session_start(bar_5m: pd.DataFrame) -> int:
+    """Find the array index of the last session's first bar.
+
+    Returns the positional index (0-based) of today's first bar within bar_5m.
+    If no session boundary is found, returns 0 (entire array is same session).
+    """
+    n = len(bar_5m)
+    if n < 2:
+        return 0
+    # Extract datetime values as numpy array for fast access
+    if isinstance(bar_5m.index, pd.DatetimeIndex):
+        dts = bar_5m.index.values
+    elif "datetime" in bar_5m.columns:
+        dts = pd.to_datetime(bar_5m["datetime"]).values
+    else:
+        return 0
+    # Scan backwards for a gap > 30 minutes (= session boundary)
+    for i in range(n - 1, 0, -1):
+        gap_ns = int(dts[i]) - int(dts[i - 1])
+        gap_sec = gap_ns / 1e9
+        if gap_sec > 1800:  # 30 minutes
+            return i
+    return 0
+
+
 def _atr(highs, lows, closes, period: int) -> float:
     if len(highs) < period + 1:
         return 0.0
