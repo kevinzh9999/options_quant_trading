@@ -255,93 +255,142 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
         # Check exit first (if we have a position)
         action_str = ""
         if position is not None:
-            # Update extremes
-            if position["direction"] == "LONG":
-                position["highest_since"] = max(position["highest_since"], high)
-            else:
-                position["lowest_since"] = min(position["lowest_since"], low)
+            # P0: Bar high/low 止损检查（优先级最高，在更新极值之前）
+            # 实盘中止损单挂在stop_price，bar内触及即成交
+            stop_price = position.get("stop_loss", 0)
+            bar_stopped = False
+            if stop_price > 0:
+                if position["direction"] == "LONG" and low <= stop_price:
+                    bar_stopped = True
+                elif position["direction"] == "SHORT" and high >= stop_price:
+                    bar_stopped = True
 
-            # Check reverse signal
-            reverse_score = 0
-            if result and direction and direction != position["direction"]:
-                reverse_score = score
-
-            exit_info = check_exit(
-                position, price, bar_5m_signal,
-                bar_15m if not bar_15m.empty else None,
-                utc_hm, reverse_score, is_high_vol=is_high_vol,
-            )
-
-            if exit_info["should_exit"]:
-                exit_vol = exit_info["exit_volume"]
-                reason = exit_info["exit_reason"]
+            if bar_stopped:
+                # 止损触发：exit_price = stop_price（不是bar close）
                 entry_p = position["entry_price"]
-                # Apply slippage adversely on exit
-                exit_p = price - slippage if position["direction"] == "LONG" else price + slippage
+                exit_p = stop_price - slippage if position["direction"] == "LONG" else stop_price + slippage
                 if position["direction"] == "LONG":
                     pnl_pts = exit_p - entry_p
                 else:
                     pnl_pts = entry_p - exit_p
-
                 elapsed = _calc_minutes(position["entry_time_utc"], utc_hm)
-
-                if exit_vol >= position["volume"]:
-                    # Full close
-                    action_str = (f"EXIT {reason} "
-                                  f"{'+'if pnl_pts>=0 else ''}{pnl_pts:.0f}pt "
-                                  f"{elapsed}min")
-                    completed_trades.append({
-                        "entry_time": _utc_to_bj(position["entry_time_utc"]),
-                        "entry_price": entry_p,
-                        "exit_time": bj_time,
-                        "exit_price": exit_p,
-                        "direction": position["direction"],
-                        "pnl_pts": pnl_pts,
-                        "reason": reason,
-                        "minutes": elapsed,
-                        "entry_score": position.get("entry_score", 0),
-                        "entry_v_score": position.get("entry_v_score", 0),
-                        "entry_daily_mult": position.get("entry_daily_mult", 1.0),
-                        "entry_raw_total": position.get("entry_raw_total", 0),
-                        "entry_gap_pct": position.get("entry_gap_pct", 0.0),
-                        "entry_gap_aligned": position.get("entry_gap_aligned", False),
-                        "entry_rebound_pct": position.get("entry_rebound_pct", 0.0),
-                        "entry_total_drop": position.get("entry_total_drop", 0.0),
-                        "entry_intraday_drop": position.get("entry_intraday_drop", 0.0),
-                        "entry_filter_mult": position.get("entry_filter_mult", 1.0),
-                        "entry_zscore": position.get("entry_zscore"),
-                    })
-                    last_exit_utc = utc_hm
-                    last_exit_dir = position["direction"]
-                    position = None
+                reason = "STOP_LOSS"
+                action_str = (f"EXIT {reason} "
+                              f"{'+'if pnl_pts>=0 else ''}{pnl_pts:.0f}pt "
+                              f"{elapsed}min")
+                completed_trades.append({
+                    "entry_time": _utc_to_bj(position["entry_time_utc"]),
+                    "entry_price": entry_p,
+                    "exit_time": bj_time,
+                    "exit_price": exit_p,
+                    "direction": position["direction"],
+                    "pnl_pts": pnl_pts,
+                    "reason": reason,
+                    "minutes": elapsed,
+                    "entry_score": position.get("entry_score", 0),
+                    "entry_v_score": position.get("entry_v_score", 0),
+                    "entry_daily_mult": position.get("entry_daily_mult", 1.0),
+                    "entry_raw_total": position.get("entry_raw_total", 0),
+                    "entry_gap_pct": position.get("entry_gap_pct", 0.0),
+                    "entry_gap_aligned": position.get("entry_gap_aligned", False),
+                    "entry_rebound_pct": position.get("entry_rebound_pct", 0.0),
+                    "entry_total_drop": position.get("entry_total_drop", 0.0),
+                    "entry_intraday_drop": position.get("entry_intraday_drop", 0.0),
+                    "entry_filter_mult": position.get("entry_filter_mult", 1.0),
+                    "entry_zscore": position.get("entry_zscore"),
+                })
+                last_exit_utc = utc_hm
+                last_exit_dir = position["direction"]
+                position = None
+            else:
+                # 未触发止损 → 正常流程：更新极值 → check_exit
+                # Update extremes
+                if position["direction"] == "LONG":
+                    position["highest_since"] = max(position["highest_since"], high)
                 else:
-                    # Partial close
-                    action_str = (f"PARTIAL {reason} "
-                                  f"{exit_vol}手 {'+'if pnl_pts>=0 else ''}{pnl_pts:.0f}pt")
-                    position["volume"] -= exit_vol
-                    position["half_closed"] = True
-                    completed_trades.append({
-                        "entry_time": _utc_to_bj(position["entry_time_utc"]),
-                        "entry_price": entry_p,
-                        "exit_time": bj_time,
-                        "exit_price": exit_p,
-                        "direction": position["direction"],
-                        "pnl_pts": pnl_pts,
-                        "reason": reason + "(半仓)",
-                        "minutes": elapsed,
-                        "partial": True,
-                        "entry_score": position.get("entry_score", 0),
-                        "entry_v_score": position.get("entry_v_score", 0),
-                        "entry_daily_mult": position.get("entry_daily_mult", 1.0),
-                        "entry_raw_total": position.get("entry_raw_total", 0),
-                        "entry_gap_pct": position.get("entry_gap_pct", 0.0),
-                        "entry_gap_aligned": position.get("entry_gap_aligned", False),
-                        "entry_rebound_pct": position.get("entry_rebound_pct", 0.0),
-                        "entry_total_drop": position.get("entry_total_drop", 0.0),
-                        "entry_intraday_drop": position.get("entry_intraday_drop", 0.0),
-                        "entry_filter_mult": position.get("entry_filter_mult", 1.0),
-                        "entry_zscore": position.get("entry_zscore"),
-                    })
+                    position["lowest_since"] = min(position["lowest_since"], low)
+
+                # Check reverse signal
+                reverse_score = 0
+                if result and direction and direction != position["direction"]:
+                    reverse_score = score
+
+                exit_info = check_exit(
+                    position, price, bar_5m_signal,
+                    bar_15m if not bar_15m.empty else None,
+                    utc_hm, reverse_score, is_high_vol=is_high_vol,
+                )
+
+                if exit_info["should_exit"]:
+                    exit_vol = exit_info["exit_volume"]
+                    reason = exit_info["exit_reason"]
+                    entry_p = position["entry_price"]
+                    # Apply slippage adversely on exit
+                    exit_p = price - slippage if position["direction"] == "LONG" else price + slippage
+                    if position["direction"] == "LONG":
+                        pnl_pts = exit_p - entry_p
+                    else:
+                        pnl_pts = entry_p - exit_p
+
+                    elapsed = _calc_minutes(position["entry_time_utc"], utc_hm)
+
+                    if exit_vol >= position["volume"]:
+                        # Full close
+                        action_str = (f"EXIT {reason} "
+                                      f"{'+'if pnl_pts>=0 else ''}{pnl_pts:.0f}pt "
+                                      f"{elapsed}min")
+                        completed_trades.append({
+                            "entry_time": _utc_to_bj(position["entry_time_utc"]),
+                            "entry_price": entry_p,
+                            "exit_time": bj_time,
+                            "exit_price": exit_p,
+                            "direction": position["direction"],
+                            "pnl_pts": pnl_pts,
+                            "reason": reason,
+                            "minutes": elapsed,
+                            "entry_score": position.get("entry_score", 0),
+                            "entry_v_score": position.get("entry_v_score", 0),
+                            "entry_daily_mult": position.get("entry_daily_mult", 1.0),
+                            "entry_raw_total": position.get("entry_raw_total", 0),
+                            "entry_gap_pct": position.get("entry_gap_pct", 0.0),
+                            "entry_gap_aligned": position.get("entry_gap_aligned", False),
+                            "entry_rebound_pct": position.get("entry_rebound_pct", 0.0),
+                            "entry_total_drop": position.get("entry_total_drop", 0.0),
+                            "entry_intraday_drop": position.get("entry_intraday_drop", 0.0),
+                            "entry_filter_mult": position.get("entry_filter_mult", 1.0),
+                            "entry_zscore": position.get("entry_zscore"),
+                        })
+                        last_exit_utc = utc_hm
+                        last_exit_dir = position["direction"]
+                        position = None
+                    else:
+                        # Partial close
+                        action_str = (f"PARTIAL {reason} "
+                                      f"{exit_vol}手 {'+'if pnl_pts>=0 else ''}{pnl_pts:.0f}pt")
+                        position["volume"] -= exit_vol
+                        position["half_closed"] = True
+                        completed_trades.append({
+                            "entry_time": _utc_to_bj(position["entry_time_utc"]),
+                            "entry_price": entry_p,
+                            "exit_time": bj_time,
+                            "exit_price": exit_p,
+                            "direction": position["direction"],
+                            "pnl_pts": pnl_pts,
+                            "reason": reason + "(半仓)",
+                            "minutes": elapsed,
+                            "partial": True,
+                            "entry_score": position.get("entry_score", 0),
+                            "entry_v_score": position.get("entry_v_score", 0),
+                            "entry_daily_mult": position.get("entry_daily_mult", 1.0),
+                            "entry_raw_total": position.get("entry_raw_total", 0),
+                            "entry_gap_pct": position.get("entry_gap_pct", 0.0),
+                            "entry_gap_aligned": position.get("entry_gap_aligned", False),
+                            "entry_rebound_pct": position.get("entry_rebound_pct", 0.0),
+                            "entry_total_drop": position.get("entry_total_drop", 0.0),
+                            "entry_intraday_drop": position.get("entry_intraday_drop", 0.0),
+                            "entry_filter_mult": position.get("entry_filter_mult", 1.0),
+                            "entry_zscore": position.get("entry_zscore"),
+                        })
 
         # Check entry (no position, score >= threshold, time allowed, cooldown passed)
         in_cooldown = False
@@ -367,12 +416,14 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
             # Gap alignment: 低开+做空=True, 高开+做多=True
             _gap_aligned = ((_gap_pct < 0 and direction == "SHORT") or
                             (_gap_pct > 0 and direction == "LONG"))
+            stop = entry_p * (1 - STOP_LOSS_PCT) if direction == "LONG" else entry_p * (1 + STOP_LOSS_PCT)
             position = {
                 "entry_price": entry_p,
                 "direction": direction,
                 "entry_time_utc": utc_hm,
                 "highest_since": high,
                 "lowest_since": low,
+                "stop_loss": stop,
                 "volume": 1,
                 "half_closed": False,
                 "bars_below_mid": 0,
@@ -390,7 +441,6 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                 "entry_filter_mult": result.get("intraday_filter", 1.0),
                 "entry_zscore": z_val,
             }
-            stop = entry_p * (1 - STOP_LOSS_PCT) if direction == "LONG" else entry_p * (1 + STOP_LOSS_PCT)
             slip_tag = f" slip={slippage:.0f}" if slippage > 0 else ""
             action_str = f"OPEN {direction} @{entry_p:.0f} stop={stop:.0f}{slip_tag}"
 
