@@ -558,8 +558,15 @@ class IntradayMonitor:
             active_months = active_im_months(today_str)
 
             positions = {}
+            # 先订阅所有候选合约的 quote（TQ 要求先订阅才能读到 position）
             for sym in ["IM", "IF", "IH", "IC"]:
-                # 查所有活跃月份，不只主力（持仓可能在非主力合约上）
+                for month in active_months:
+                    try:
+                        api.get_quote(f"CFFEX.{sym}{month}")
+                    except Exception:
+                        pass
+
+            for sym in ["IM", "IF", "IH", "IC"]:
                 total_long = 0
                 total_short = 0
                 total_long_today = 0
