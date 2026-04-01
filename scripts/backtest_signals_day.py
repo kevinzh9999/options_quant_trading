@@ -221,21 +221,28 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
         if len(bar_5m) < 15:
             continue
 
-        price = float(bar_5m.iloc[-1]["close"])
+        # Lookahead fix: 信号评分用上一根完成bar的数据（和实盘monitor一致）
+        # 当前bar的close/high/low只用于执行价格和极值追踪
+        bar_5m_signal = bar_5m.iloc[:-1]  # 排除当前bar（实盘中此时还在forming）
+        if len(bar_5m_signal) < 15:
+            continue
+
+        price = float(bar_5m.iloc[-1]["close"])      # 执行价格（当前bar收盘）
         high = float(bar_5m.iloc[-1]["high"])
         low = float(bar_5m.iloc[-1]["low"])
+        signal_price = float(bar_5m_signal.iloc[-1]["close"])  # 信号价格（上一根完成bar）
         dt_str = str(all_bars.loc[idx, "datetime"])
         utc_hm = dt_str[11:16]
         bj_time = _utc_to_bj(utc_hm)
 
-        z_val = (price - ema20) / std20 if std20 > 0 else None
+        z_val = (signal_price - ema20) / std20 if std20 > 0 else None
 
-        # Build 15m bars from 5m
-        bar_15m = _build_15m_from_5m(bar_5m)
+        # Build 15m bars from signal data (not current bar)
+        bar_15m = _build_15m_from_5m(bar_5m_signal)
 
-        # Score (daily_df already truncated to replay date)
+        # Score using signal bars (excludes current forming bar)
         result = gen.score_all(
-            sym, bar_5m, bar_15m, daily_df, None, sentiment,
+            sym, bar_5m_signal, bar_15m, daily_df, None, sentiment,
             zscore=z_val, is_high_vol=is_high_vol, d_override=d_override,
         )
 
@@ -260,7 +267,8 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                 reverse_score = score
 
             exit_info = check_exit(
-                position, price, bar_5m, bar_15m if not bar_15m.empty else None,
+                position, price, bar_5m_signal,
+                bar_15m if not bar_15m.empty else None,
                 utc_hm, reverse_score, is_high_vol=is_high_vol,
             )
 
@@ -346,14 +354,14 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                 and score >= _SIGNAL_THRESHOLD and direction and is_open_allowed(utc_hm)):
             # Apply slippage adversely on entry
             entry_p = price + slippage if direction == "LONG" else price - slippage
-            # Compute rebound/pullback from recent 20-bar extreme
-            recent_20 = bar_5m.tail(20)
+            # Compute rebound/pullback from recent 20-bar extreme (use signal bars)
+            recent_20 = bar_5m_signal.tail(20)
             min_20 = float(recent_20["low"].min())
             max_20 = float(recent_20["high"].max())
             if direction == "SHORT" and min_20 > 0:
-                _rebound_pct = (price - min_20) / min_20
+                _rebound_pct = (signal_price - min_20) / min_20
             elif direction == "LONG" and max_20 > 0:
-                _rebound_pct = (max_20 - price) / max_20
+                _rebound_pct = (max_20 - signal_price) / max_20
             else:
                 _rebound_pct = 0.0
             # Gap alignment: 低开+做空=True, 高开+做多=True
@@ -377,8 +385,8 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                 "entry_gap_pct": _gap_pct,
                 "entry_gap_aligned": _gap_aligned,
                 "entry_rebound_pct": _rebound_pct,
-                "entry_total_drop": (price - prev_c) / prev_c if prev_c > 0 else 0.0,
-                "entry_intraday_drop": (price - _today_open) / _today_open if _today_open > 0 else 0.0,
+                "entry_total_drop": (signal_price - prev_c) / prev_c if prev_c > 0 else 0.0,
+                "entry_intraday_drop": (signal_price - _today_open) / _today_open if _today_open > 0 else 0.0,
                 "entry_filter_mult": result.get("intraday_filter", 1.0),
                 "entry_zscore": z_val,
             }
@@ -394,12 +402,12 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
             raw = result.get("raw_total", 0)
             tw = result.get("time_weight", 1.0)
             sm = result.get("sentiment_mult", 1.0)
-            change_pct = (price - prev_c) / prev_c if prev_c > 0 else 0.0
+            change_pct = (signal_price - prev_c) / prev_c if prev_c > 0 else 0.0
             # What would score be with daily_mult=1.0?
             hyp_no_dm = int(round(max(0, min(100, raw * 1.0 * idf * tw * sm))))
             if dm < 0.8 and hyp_no_dm >= _SIGNAL_THRESHOLD:
                 suppressed_signals.append({
-                    "time": bj_time, "price": price, "direction": direction,
+                    "time": bj_time, "price": signal_price, "direction": direction,
                     "raw_total": raw, "daily_mult": dm, "intraday_filter": idf,
                     "score_actual": score, "score_hypothetical": hyp_no_dm,
                     "entry_total_drop": change_pct, "suppressor": "daily_mult",
@@ -408,7 +416,7 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
             hyp_no_idf = int(round(max(0, min(100, raw * dm * 1.0 * tw * sm))))
             if idf < 1.0 and hyp_no_idf >= _SIGNAL_THRESHOLD and score < _SIGNAL_THRESHOLD:
                 suppressed_signals.append({
-                    "time": bj_time, "price": price, "direction": direction,
+                    "time": bj_time, "price": signal_price, "direction": direction,
                     "raw_total": raw, "daily_mult": dm, "intraday_filter": idf,
                     "score_actual": score, "score_hypothetical": hyp_no_idf,
                     "entry_total_drop": change_pct, "suppressor": "intraday_filter",
@@ -450,7 +458,7 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                 marker = " ✅"
 
             brk_s = f" B{s_b:d}" if s_b > 0 else ""
-            print(f" {bj_time}  | {price:7.0f} | {z_s:>5} | {rsi:3.0f}"
+            print(f" {bj_time}  | {signal_price:7.0f} | {z_s:>5} | {rsi:3.0f}"
                   f" |   {d_ch} | {s_m:2d} {s_v:2d} {s_q:2d}"
                   f" | {dm:4.2f} | {d_f:4.2f} | {tw:.1f} | {sm:.2f}"
                   f" | {pre_z:3d}>{score:<3d} | {action_str}{brk_s}{marker}")
