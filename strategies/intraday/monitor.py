@@ -551,24 +551,48 @@ class IntradayMonitor:
             print(f"  [警告] 情绪数据加载失败: {e}")
 
     def _update_futures_positions(self, api) -> None:
-        """从 TQ 读取期货实盘持仓，写入共享文件供 executor 对账。"""
+        """从 TQ 读取期货实盘持仓（所有活跃合约），写入共享文件供 executor 对账。"""
         try:
+            from utils.cffex_calendar import active_im_months
+            today_str = datetime.now().strftime("%Y%m%d")
+            active_months = active_im_months(today_str)
+
             positions = {}
             for sym in ["IM", "IF", "IH", "IC"]:
-                fut_sym = self._tq_symbols.get(sym)
-                if not fut_sym:
-                    continue
-                pos = api.get_position(fut_sym)
-                if pos.pos_long > 0 or pos.pos_short > 0:
+                # 查所有活跃月份，不只主力（持仓可能在非主力合约上）
+                total_long = 0
+                total_short = 0
+                total_long_today = 0
+                total_short_today = 0
+                last_price = 0.0
+                float_pnl_long = 0.0
+                float_pnl_short = 0.0
+                held_contract = ""
+                for month in active_months:
+                    contract = f"CFFEX.{sym}{month}"
+                    try:
+                        pos = api.get_position(contract)
+                        if pos.pos_long > 0 or pos.pos_short > 0:
+                            total_long += pos.pos_long
+                            total_short += pos.pos_short
+                            total_long_today += pos.pos_long_today
+                            total_short_today += pos.pos_short_today
+                            float_pnl_long += float(pos.float_profit_long or 0)
+                            float_pnl_short += float(pos.float_profit_short or 0)
+                            last_price = float(pos.last_price or 0)
+                            held_contract = contract
+                    except Exception:
+                        pass
+                if total_long > 0 or total_short > 0:
                     positions[sym] = {
-                        "contract": fut_sym,
-                        "long": pos.pos_long,
-                        "short": pos.pos_short,
-                        "long_today": pos.pos_long_today,
-                        "short_today": pos.pos_short_today,
-                        "last_price": float(pos.last_price or 0),
-                        "float_profit_long": float(pos.float_profit_long or 0),
-                        "float_profit_short": float(pos.float_profit_short or 0),
+                        "contract": held_contract,
+                        "long": total_long,
+                        "short": total_short,
+                        "long_today": total_long_today,
+                        "short_today": total_short_today,
+                        "last_price": last_price,
+                        "float_profit_long": float_pnl_long,
+                        "float_profit_short": float_pnl_short,
                     }
             import json as _json
             path = os.path.join(self._tmp_dir, "futures_positions.json")

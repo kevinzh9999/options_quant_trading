@@ -704,10 +704,12 @@ def _check_denied_positions():
 # ---------------------------------------------------------------------------
 
 _POSITIONS_FILE = os.path.join(_TMP_DIR, "futures_positions.json")
+_last_reconcile_msg = ""  # 去重：上次打印的消息
 
 
 def _reconcile_positions(positions: dict):
     """读取 monitor 写出的期货持仓，与 executor 内部 positions 对账。"""
+    global _last_reconcile_msg
     if not os.path.exists(_POSITIONS_FILE):
         return
     try:
@@ -727,6 +729,9 @@ def _reconcile_positions(positions: dict):
     except Exception:
         return
 
+    # 构建本次对账摘要（用于去重打印）
+    msgs = []
+
     # 对账：TQ 有持仓的品种
     for sym, info in tq_positions.items():
         net_tq = info.get("long", 0) - info.get("short", 0)
@@ -734,25 +739,29 @@ def _reconcile_positions(positions: dict):
             d = 1 if positions[sym]["direction"] == "LONG" else -1
             net_exec = positions[sym]["lots"] * d
             if net_tq != net_exec:
-                print(f" ⚠ 持仓不一致 {sym}: TQ净={net_tq}手,"
-                      f" executor记录={net_exec}手 → 已更新为TQ实际值")
+                msgs.append(f"不一致 {sym}: TQ={net_tq} exec={net_exec}")
                 if net_tq == 0:
                     del positions[sym]
                 else:
                     positions[sym]["lots"] = abs(net_tq)
                     positions[sym]["direction"] = "LONG" if net_tq > 0 else "SHORT"
         elif net_tq != 0:
-            print(f" ⚠ TQ有持仓但executor无记录 {sym}: 净{net_tq}手"
-                  f"（可能是手动开仓）")
+            msgs.append(f"TQ有 {sym}: 净{net_tq}手 executor无记录")
 
     # 反向检查：executor 有记录但 TQ 没有
     for sym in list(positions.keys()):
         if sym not in tq_positions or (
                 tq_positions[sym].get("long", 0) == 0
                 and tq_positions[sym].get("short", 0) == 0):
-            print(f" ⚠ executor有记录但TQ无持仓 {sym}:"
-                  f" 可能已被手动平仓 → 已清除executor记录")
+            msgs.append(f"exec有 {sym} TQ无 → 清除")
             del positions[sym]
+
+    # 只在状态变化时打印
+    msg_key = "|".join(sorted(msgs))
+    if msgs and msg_key != _last_reconcile_msg:
+        for m in msgs:
+            print(f" ⚠ 持仓对账: {m}")
+    _last_reconcile_msg = msg_key
 
 
 # ---------------------------------------------------------------------------
