@@ -268,7 +268,7 @@ def _confirm(prompt: str, timeout: float = 60.0) -> str:
 def _execute_order(
     signal: dict, dry_run: bool, db_path: str,
     daily_orders: int, daily_loss: float, account: float,
-    positions: dict,
+    positions: dict, tq_api=None,
 ) -> dict:
     """处理一个信号。返回 {status, filled_lots, ...}。"""
     receive_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -467,20 +467,22 @@ def _execute_order(
     status = "ERROR"
 
     try:
+        # 使用传入的持久TQ连接，fallback到临时连接
         from data.sources.tq_client import TqClient
+        _own_client = None
+        api = tq_api
+        if api is None:
+            creds = {
+                "auth_account": os.getenv("TQ_ACCOUNT", ""),
+                "auth_password": os.getenv("TQ_PASSWORD", ""),
+                "broker_id": os.getenv("TQ_BROKER", ""),
+                "account_id": os.getenv("TQ_ACCOUNT_ID", ""),
+                "broker_password": os.getenv("TQ_BROKER_PASSWORD", ""),
+            }
+            _own_client = TqClient(**creds)
+            _own_client.connect()
+            api = _own_client._api
 
-        creds = {
-            "auth_account": os.getenv("TQ_ACCOUNT", ""),
-            "auth_password": os.getenv("TQ_PASSWORD", ""),
-            "broker_id": os.getenv("TQ_BROKER", ""),
-            "account_id": os.getenv("TQ_ACCOUNT_ID", ""),
-            "broker_password": os.getenv("TQ_BROKER_PASSWORD", ""),
-        }
-        client = TqClient(**creds)
-        client.connect()
-        api = client._api
-
-        # 用 TQ 按持仓量选主力合约（与 monitor 一致）
         from utils.cffex_calendar import get_main_contract
         contract = get_main_contract(sym, api=api)
 
@@ -578,7 +580,8 @@ def _execute_order(
                 print(f"  部分成交 {filled}/{lots}手 @ {trade_price:.1f}")
 
         finally:
-            client.disconnect()
+            if _own_client is not None:
+                _own_client.disconnect()
 
     except Exception as e:
         status = "ERROR"
@@ -900,6 +903,28 @@ def main():
     # 启动时用 TQ 实盘持仓对账（覆盖 order_log 推断的结果）
     _reconcile_positions(positions)
 
+    # 建立持久TQ连接（非dry-run模式）
+    tq_client = None
+    tq_api = None
+    if not args.dry_run:
+        try:
+            from data.sources.tq_client import TqClient
+            creds = {
+                "auth_account": os.getenv("TQ_ACCOUNT", ""),
+                "auth_password": os.getenv("TQ_PASSWORD", ""),
+                "broker_id": os.getenv("TQ_BROKER", ""),
+                "account_id": os.getenv("TQ_ACCOUNT_ID", ""),
+                "broker_password": os.getenv("TQ_BROKER_PASSWORD", ""),
+            }
+            tq_client = TqClient(**creds)
+            tq_client.connect()
+            tq_api = tq_client._api
+            print(f" TQ连接已建立（持久模式）")
+        except Exception as e:
+            print(f" [WARN] TQ持久连接失败: {e}，将按需连接")
+            tq_client = None
+            tq_api = None
+
     daily_orders = 0
     daily_loss = 0.0
     signals_received = 0
@@ -922,7 +947,7 @@ def main():
                 result = _execute_order(
                     signal, args.dry_run, db_path,
                     daily_orders, daily_loss, account,
-                    positions,
+                    positions, tq_api=tq_api,
                 )
                 if result.get("status") in ("FILLED", "PARTIAL"):
                     daily_orders += 1
@@ -955,6 +980,13 @@ def main():
 
     except KeyboardInterrupt:
         print(f"\n  退出")
+    finally:
+        if tq_client is not None:
+            try:
+                tq_client.disconnect()
+                print(f"  TQ连接已断开")
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
