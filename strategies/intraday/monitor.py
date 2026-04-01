@@ -884,16 +884,20 @@ class IntradayMonitor:
 
         for sym in self.symbols:
             k5 = spot_klines_5m.get(sym)
-            if k5 is not None and len(k5) > 0:
-                df = k5[["open", "high", "low", "close", "volume"]].copy()
-                df.index = pd.to_datetime(k5["datetime"], unit="ns")
+            if k5 is not None and len(k5) > 1:
+                # TQ的最后一根bar是当前正在形成的（未完成），排除它
+                # 只用已完成的bar，和backtest行为一致
+                completed = k5.iloc[:-1]
+                df = completed[["open", "high", "low", "close", "volume"]].copy()
+                df.index = pd.to_datetime(completed["datetime"], unit="ns")
                 if len(df) > 0:
                     bar_data[sym] = df
 
             k15 = spot_klines_15m.get(sym)
-            if k15 is not None and len(k15) > 0:
-                df = k15[["open", "high", "low", "close", "volume"]].copy()
-                df.index = pd.to_datetime(k15["datetime"], unit="ns")
+            if k15 is not None and len(k15) > 1:
+                completed = k15.iloc[:-1]
+                df = completed[["open", "high", "low", "close", "volume"]].copy()
+                df.index = pd.to_datetime(completed["datetime"], unit="ns")
                 if len(df) > 0:
                     bar_15m_data[sym] = df
 
