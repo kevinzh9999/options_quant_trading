@@ -1,6 +1,6 @@
 # 开发进度追踪
 
-> 最后更新：2026-03-29（Morning Briefing P1+P2 + 象限监控 + 半自动下单 + Dashboard增强 + 一键启动）
+> 最后更新：2026-04-01（Executor持久连接 + Monitor重启状态恢复 + Shadow浮盈修复）
 
 ## 总体状态
 
@@ -13,9 +13,9 @@
 | Step 3: 模型层实现 | ✅ 完成 | 638 测试全绿（含 smoke test） |
 | Step 4: 策略层实现 | 🔄 部分完成 | discount_capture + vol_arb + trend_following + intraday（v2/v3信号+平仓+回测） |
 | Step 5: 风控层实现 | ⏳ 待开发 | |
-| Step 6: 执行层实现 | ⏳ 待开发 | |
+| Step 6: 执行层实现 | 🔄 部分完成 | order_executor半自动下单+持仓恢复+对账+锁仓 |
 | Step 7: 分析层实现 | ⏳ 待开发 | |
-| Step 8: Dashboard 实现 | ✅ 完成 | 7页面（新增贴水监控）|
+| Step 8: Dashboard 实现 | ✅ 完成 | 14页面（含Briefing/象限/信号分析）|
 | Step 9: 回测框架实现 | ✅ 完成 | DataFeed + SimBroker + BacktestEngine + BacktestReport，52测试全绿 |
 | Step 10: 实盘部署 | ⏳ 待开发 | |
 
@@ -294,7 +294,7 @@ tests/
 - 三维度：动量(50) + 波动率(30) + 成交量(20) = raw_total
 - 乘数链：raw × daily_mult(d) × intraday_filter × time_weight(t) × sentiment_mult(s)
 - 后处理：Z-Score硬过滤 → RSI回归bonus → clamp(0,100)
-- 信号阈值：score ≥ 55 触发
+- 信号阈值：score ≥ 60 触发
 
 ### strategies/spread_trading/
 - [ ] `pairs.py` - PairsManager.update / _test_cointegration
@@ -600,6 +600,29 @@ Breakeven滑点：~2.5pt → ~4.0pt
 - [x] **SQLite WAL统一**：所有脚本sqlite3.connect加timeout=30+WAL+busy_timeout
 - [x] **开仓截止推迟到14:30**（NO_OPEN_EOD从14:15改为14:30，尾盘信号WR=67-80%）
 - [x] **DB损坏修复**：dump+reimport修复Google Drive同步导致的corruption
+
+---
+
+## 2026-04-01：Executor持久连接 + Monitor重启恢复 + Bug修复
+
+### Executor 持久TQ连接
+- [x] 启动时建立TQ连接并保持，下单时直接使用（零延迟，之前每次下单临时连接需2-3秒）
+- [x] 主力合约OI查询改为批量订阅+5秒deadline防阻塞（之前逐个wait_update可能卡住）
+- [x] 持仓扫描前先订阅所有候选合约quote，保证OI数据到达
+- [x] 对账不误删刚成交的持仓（快照比成交旧时保留）
+
+### Monitor 盘中重启状态恢复
+- [x] **问题**：重启后position_mgr.positions清空，`_total_net_lots()=0`，4个品种同时突破max_total_lots=2发信号
+- [x] **shadow持仓持久化**：`_save_shadow_state()` → `tmp/shadow_state.json`，每次shadow变更自动写
+- [x] **启动恢复三层**：① shadow_state.json→_shadow_positions ② inject_position→position_mgr占位 ③ shadow_trades→daily_trades+risk_mgr
+- [x] **退出清理**：shadow exit时`remove_by_symbol()`释放position_mgr占位
+- [x] position.py新增`inject_position()`（极端止损不触发）和`remove_by_symbol()`
+
+### Bug修复
+- [x] **SHADOW浮盈基准错误**：面板用现货close计算浮盈，但entry_price是期货bid/ask，导致浮盈虚高~200pt（等于贴水）。改用期货last_price，fallback现货close
+- [x] **跨市场数据**：Morning Briefing增加DJI+实时更新+过期标注+权重调整
+- [x] **主力合约选择统一**：所有合约选择统一到`cffex_calendar.py`，按持仓量(OI)而非到期日
+- [x] **signal_pending.json竞态**：改为列表模式（追加写入），平仓确认分级（紧急opt-out/非紧急opt-in）
 
 ---
 

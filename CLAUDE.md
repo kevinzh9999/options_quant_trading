@@ -103,11 +103,21 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - **Monitor只负责信号生成**：评分→写`tmp/signal_pending.json`→注册shadow持仓→面板显示。不prompt，不阻塞
 - **Monitor额外职责**：每5分钟bar更新时写出期货持仓到`tmp/futures_positions.json`供executor对账
 - **Executor负责交易执行**：轮询JSON(1秒)→展示→确认→TQ限价单→撤单→记录
+- **Executor持久TQ连接**：启动时建立TQ连接并保持，下单时零延迟（不用每次临时连接）
 - **平仓信号opt-out**：60s无响应自动执行（开仓仍为opt-in：超时自动放弃）
 - **激进价自动追单**：平仓限价未成交→自动以±2点激进价重新下单，不再手工确认
 - **平仓否决记录**：操作者按n否决平仓→记录CLOSE_DENIED→写`tmp/denied_positions.json`→次日启动提醒
 - Monitor exit触发时写CLOSE JSON供executor平仓
 - shadow trades用期货价格记录entry/exit/PnL（不是现货）
+- **SHADOW面板浮盈基准**：用期货last_price（与entry_price一致），fallback现货close
+
+### Monitor 盘中重启状态恢复（2026-04-01修复）
+- **问题**：重启后position_mgr.positions清空，`_total_net_lots()=0`，突破max_total_lots=2限制
+- **解决**：shadow持仓持久化到`tmp/shadow_state.json`，启动时恢复三层状态：
+  1. `_shadow_positions`（活跃shadow持仓）← shadow_state.json（当天）
+  2. `position_mgr`占位（inject_position）← 使can_open/total_net_lots正确拦截
+  3. `daily_trades` + `risk_mgr`计数 ← shadow_trades表（当天已平仓记录）
+- shadow持仓变更时自动写JSON，exit时同步调用`remove_by_symbol()`释放占位
 
 ### 仓位管理（2026-03-28决定）
 - **Fixed Risk 0.5%**：每笔最大亏损 = 账户权益 × 0.5%

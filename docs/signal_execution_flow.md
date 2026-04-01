@@ -98,6 +98,7 @@ suggested_lots = risk_per_trade / stop_loss_amount
 **写入文件后**：
 - 写入 `tmp/signal_pending.json`
 - 注册 shadow 持仓（`_shadow_positions[sym]`），记录入场价、时间、维度明细
+- 持久化 shadow 状态到 `tmp/shadow_state.json`（供重启恢复）
 - 记录到 `signal_log` 表
 
 ### 1.2 Executor 端：接收与处理
@@ -242,7 +243,8 @@ shadow_positions[sym] ─▶ check_exit()
 
 **写入文件后**：
 - 写入 `tmp/signal_pending.json`
-- **立即删除 shadow 持仓**（`del _shadow_positions[sym]`）
+- **立即删除 shadow 持仓**（`del _shadow_positions[sym]`）+ 清理 position_mgr 占位（`remove_by_symbol`）
+- 持久化更新后的 shadow 状态到 `tmp/shadow_state.json`
 - 记录到 `shadow_trades` 表
 
 ### 2.2 Executor 端：平仓处理
@@ -355,9 +357,45 @@ shadow_positions[sym] ─▶ check_exit()
 
 ---
 
-## 三、Executor 启动与持仓恢复
+## 三、Monitor 重启与状态恢复
 
-### 3.1 启动流程
+### 3.0 问题
+
+Monitor 的 `position_mgr.positions` 和 `_shadow_positions` 存在内存中。盘中重启后清空，导致 `_total_net_lots() = 0`，突破 `max_total_lots=2` 限制，所有品种同时发信号。
+
+### 3.0.1 恢复流程
+
+```
+_restore_daily_state() 在 run() 进入主循环前调用
+  │
+  ▼
+① 读取 tmp/shadow_state.json
+  ├── trade_date 匹配当天 → 恢复 _shadow_positions
+  ├── 对每个活跃shadow → inject_position 到 position_mgr（占位）
+  └── trade_date 不匹配 → 忽略（非当天数据）
+  │
+  ▼
+② 查询 shadow_trades WHERE trade_date = 今天
+  ├── 每条记录 → position_mgr.daily_trades += 1
+  └── 每条记录 → risk_mgr.on_trade_complete(pnl, symbol)
+  │
+  ▼
+打印: "恢复shadow持仓: IM LONG@7503, IC LONG@7553"
+打印: "恢复当日交易: 4笔已平仓"
+```
+
+### 3.0.2 持久化时机
+
+| 事件 | 动作 |
+|------|------|
+| 新 shadow 持仓注册 | `_save_shadow_state()` 写 JSON |
+| shadow 持仓退出 | `remove_by_symbol()` + `_save_shadow_state()` |
+
+---
+
+## 四、Executor 启动与持仓恢复
+
+### 4.1 启动流程
 
 Executor 启动时按顺序执行以下检查：
 
@@ -380,7 +418,7 @@ main() 启动
   进入主循环（每1秒轮询信号）
 ```
 
-### 3.2 持仓恢复（重启场景）
+### 4.2 持仓恢复（重启场景）
 
 **问题**：Executor 的 `positions` 字典存在内存中。盘中崩溃重启后字典清空，后续平仓信号会被 REJECTED（NO_POSITION）。
 
@@ -403,7 +441,7 @@ net_long - net_short ≠ 0 → 写入 positions 字典
 
 **恢复后**由 `_reconcile_positions()` 用 TQ 实盘数据二次校正——如果 order_log 和 TQ 实际不一致（如手动操作），以 TQ 为准。
 
-### 3.3 持仓对账（盘中持续）
+### 4.3 持仓对账（盘中持续）
 
 **数据流**：
 ```
@@ -428,7 +466,7 @@ Monitor (每5分钟) ─▶ tmp/futures_positions.json ─▶ Executor (每60秒
 - Executor 只使用 10 分钟内的数据（Monitor 可能已停止）
 - 超过 10 分钟的数据静默忽略
 
-### 3.4 恢复优先级
+### 4.4 恢复优先级
 
 ```
 order_log 推断  →  TQ 实盘校正  →  最终 positions
@@ -441,7 +479,7 @@ order_log 推断  →  TQ 实盘校正  →  最终 positions
 
 ---
 
-## 四、锁仓次日处理
+## 五、锁仓次日处理
 
 股指期货日内平仓用锁仓代替（避免平今手续费 10 倍）。
 
@@ -452,7 +490,7 @@ order_log 推断  →  TQ 实盘校正  →  最终 positions
 
 ---
 
-## 五、关键配置常量
+## 六、关键配置常量
 
 | 常量 | 值 | 说明 |
 |------|-----|------|
@@ -466,18 +504,19 @@ order_log 推断  →  TQ 实盘校正  →  最终 positions
 
 ---
 
-## 六、文件路径汇总
+## 七、文件路径汇总
 
 | 文件 | 写入方 | 读取方 | 说明 |
 |------|--------|--------|------|
 | `tmp/signal_pending.json` | Monitor | Executor | 信号列表（JSON数组，追加写入，executor读后即删） |
 | `tmp/futures_positions.json` | Monitor | Executor | 期货实盘持仓（每5分钟更新） |
 | `tmp/denied_positions.json` | Executor | Executor | 被否决的平仓记录（次日提醒后清除） |
+| `tmp/shadow_state.json` | Monitor | Monitor | 活跃shadow持仓状态（重启恢复用） |
 | `tmp/morning_briefing.json` | morning_briefing.py | Monitor | 盘前方向 Guidance |
 
 ---
 
-## 七、数据库表
+## 八、数据库表
 
 | 表 | 写入方 | 说明 |
 |----|--------|------|
