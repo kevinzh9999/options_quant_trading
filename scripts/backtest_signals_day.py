@@ -160,6 +160,11 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
 
     gen = SignalGeneratorV2({"min_signal_score": 60})
 
+    # Per-symbol threshold（IC=65等，从SYMBOL_PROFILES读取）
+    from strategies.intraday.A_share_momentum_signal_v2 import SYMBOL_PROFILES, _DEFAULT_PROFILE
+    _sym_prof = SYMBOL_PROFILES.get(sym, _DEFAULT_PROFILE)
+    effective_threshold = _sym_prof.get("signal_threshold", _SIGNAL_THRESHOLD)
+
     # Morning Briefing d_override（和monitor一致）
     d_override = None
     try:
@@ -319,6 +324,7 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                     position, price, bar_5m_signal,
                     bar_15m if not bar_15m.empty else None,
                     utc_hm, reverse_score, is_high_vol=is_high_vol,
+                    symbol=sym,
                 )
 
                 if exit_info["should_exit"]:
@@ -400,7 +406,7 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                 in_cooldown = True
 
         if (position is None and not action_str and result and not in_cooldown
-                and score >= _SIGNAL_THRESHOLD and direction and is_open_allowed(utc_hm)):
+                and score >= effective_threshold and direction and is_open_allowed(utc_hm)):
             # Apply slippage adversely on entry
             entry_p = price + slippage if direction == "LONG" else price - slippage
             # Compute rebound/pullback from recent 20-bar extreme (use signal bars)
@@ -446,7 +452,7 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
 
         # Track signals suppressed by daily_mult or intraday_filter
         if (result and direction and position is None and not action_str
-                and score < _SIGNAL_THRESHOLD and is_open_allowed(utc_hm)):
+                and score < effective_threshold and is_open_allowed(utc_hm)):
             dm = result.get("daily_mult", 1.0)
             idf = result.get("intraday_filter", 1.0)
             raw = result.get("raw_total", 0)
@@ -455,7 +461,7 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
             change_pct = (signal_price - prev_c) / prev_c if prev_c > 0 else 0.0
             # What would score be with daily_mult=1.0?
             hyp_no_dm = int(round(max(0, min(100, raw * 1.0 * idf * tw * sm))))
-            if dm < 0.8 and hyp_no_dm >= _SIGNAL_THRESHOLD:
+            if dm < 0.8 and hyp_no_dm >= effective_threshold:
                 suppressed_signals.append({
                     "time": bj_time, "price": signal_price, "direction": direction,
                     "raw_total": raw, "daily_mult": dm, "intraday_filter": idf,
@@ -464,7 +470,7 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                 })
             # What would score be with intraday_filter=1.0?
             hyp_no_idf = int(round(max(0, min(100, raw * dm * 1.0 * tw * sm))))
-            if idf < 1.0 and hyp_no_idf >= _SIGNAL_THRESHOLD and score < _SIGNAL_THRESHOLD:
+            if idf < 1.0 and hyp_no_idf >= effective_threshold and score < effective_threshold:
                 suppressed_signals.append({
                     "time": bj_time, "price": signal_price, "direction": direction,
                     "raw_total": raw, "daily_mult": dm, "intraday_filter": idf,

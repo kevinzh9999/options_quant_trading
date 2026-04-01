@@ -1042,6 +1042,7 @@ class IntradayMonitor:
             exit_info = check_exit(
                 sp, cur_price, b5, b15_arg,
                 utc_hm, reverse_signal_score=0, is_high_vol=self._is_high_vol,
+                symbol=sym,
             )
             if exit_info["should_exit"]:
                 reason = exit_info["exit_reason"]

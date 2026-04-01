@@ -306,6 +306,7 @@ def check_exit(
     current_time_utc: str,
     reverse_signal_score: int = 0,
     is_high_vol: bool = True,
+    symbol: str = "",
 ) -> dict:
     """
     Multi-timeframe Bollinger exit system.
@@ -377,8 +378,7 @@ def check_exit(
         if not np.isnan(b15_mid) and b15_std > 0:
             zone_15m = _boll_zone(current_price, b15_mid, b15_std)
 
-    # P3: Dynamic trailing stop (widens with hold time + 15m confirmation)
-    # Base: 0.5% → increases with hold duration and trend confirmation
+    # Hold time (used by P3 trailing stop and P5 momentum exhausted)
     hold_minutes = 0
     if entry_time and current_time_utc:
         try:
@@ -388,36 +388,39 @@ def check_exit(
         except Exception:
             pass
 
-    if hold_minutes < 15:
-        trail_pct = 0.005   # 0.5% — just opened, protect capital
-    elif hold_minutes < 30:
-        trail_pct = 0.006   # 0.6%
-    elif hold_minutes < 60:
-        trail_pct = 0.008   # 0.8%
-    else:
-        trail_pct = 0.010   # 1.0% — long trend, max room
-
-    # Bonus: if profitable >0.5% and 15m trend confirmed, widen by 0.2%
-    if zone_15m:
-        if direction == "LONG":
-            pnl_pct = (current_price - entry_price) / entry_price
-            fifteen_ok = zone_15m in ("MID_UPPER", "UPPER_ZONE", "ABOVE_UPPER")
+    # P3: Dynamic trailing stop (per-symbol: IC禁用，让利润奔跑)
+    _prof = SYMBOL_PROFILES.get(symbol, _DEFAULT_PROFILE) if symbol else _DEFAULT_PROFILE
+    if _prof.get("trailing_stop_enabled", True):
+        if hold_minutes < 15:
+            trail_pct = 0.005   # 0.5% — just opened, protect capital
+        elif hold_minutes < 30:
+            trail_pct = 0.006   # 0.6%
+        elif hold_minutes < 60:
+            trail_pct = 0.008   # 0.8%
         else:
-            pnl_pct = (entry_price - current_price) / entry_price
-            fifteen_ok = zone_15m in ("MID_LOWER", "LOWER_ZONE", "BELOW_LOWER")
-        if pnl_pct > 0.005 and fifteen_ok:
-            trail_pct += 0.002  # +0.2% bonus
+            trail_pct = 0.010   # 1.0% — long trend, max room
 
-    if direction == "LONG" and highest > entry_price:
-        dd = (highest - current_price) / highest
-        if dd > trail_pct:
-            return {"should_exit": True, "exit_volume": volume,
-                    "exit_reason": "TRAILING_STOP", "exit_urgency": "NORMAL"}
-    elif direction == "SHORT" and lowest < entry_price:
-        du = (current_price - lowest) / lowest
-        if du > trail_pct:
-            return {"should_exit": True, "exit_volume": volume,
-                    "exit_reason": "TRAILING_STOP", "exit_urgency": "NORMAL"}
+        # Bonus: if profitable >0.5% and 15m trend confirmed, widen by 0.2%
+        if zone_15m:
+            if direction == "LONG":
+                pnl_pct = (current_price - entry_price) / entry_price
+                fifteen_ok = zone_15m in ("MID_UPPER", "UPPER_ZONE", "ABOVE_UPPER")
+            else:
+                pnl_pct = (entry_price - current_price) / entry_price
+                fifteen_ok = zone_15m in ("MID_LOWER", "LOWER_ZONE", "BELOW_LOWER")
+            if pnl_pct > 0.005 and fifteen_ok:
+                trail_pct += 0.002  # +0.2% bonus
+
+        if direction == "LONG" and highest > entry_price:
+            dd = (highest - current_price) / highest
+            if dd > trail_pct:
+                return {"should_exit": True, "exit_volume": volume,
+                        "exit_reason": "TRAILING_STOP", "exit_urgency": "NORMAL"}
+        elif direction == "SHORT" and lowest < entry_price:
+            du = (current_price - lowest) / lowest
+            if du > trail_pct:
+                return {"should_exit": True, "exit_volume": volume,
+                        "exit_reason": "TRAILING_STOP", "exit_urgency": "NORMAL"}
 
     # P4: Trend complete — requires 5m ABOVE upper + 15m ABOVE upper
     # Both timeframes at the most extreme zone = trend truly exhausted
@@ -716,6 +719,7 @@ SYMBOL_PROFILES: Dict[str, Dict] = {
         "reversal_weight": 0,
         "daily_align_bonus": 1.2,
         "daily_conflict_penalty": 0.7,
+        "signal_threshold": 65,       # IC的60-64是死亡区间（38%WR, -7.1pt/笔）
         "session_multiplier": {
             "0935-1030": 1.0,
             "1030-1130": 1.1,
