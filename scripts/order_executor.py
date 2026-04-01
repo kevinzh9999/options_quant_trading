@@ -462,21 +462,12 @@ def _execute_order(
     status = "ERROR"
 
     try:
-        # 使用传入的持久TQ连接，fallback到临时连接
-        from data.sources.tq_client import TqClient
-        _own_client = None
         api = tq_api
         if api is None:
-            creds = {
-                "auth_account": os.getenv("TQ_ACCOUNT", ""),
-                "auth_password": os.getenv("TQ_PASSWORD", ""),
-                "broker_id": os.getenv("TQ_BROKER", ""),
-                "account_id": os.getenv("TQ_ACCOUNT_ID", ""),
-                "broker_password": os.getenv("TQ_BROKER_PASSWORD", ""),
-            }
-            _own_client = TqClient(**creds)
-            _own_client.connect()
-            api = _own_client._api
+            print(f"  下单失败: 无TQ连接，请重启executor")
+            _update_log(db_path, log_id, order_status="ERROR",
+                        response_reason="无TQ连接")
+            return {"status": "ERROR", "reason": "NO_TQ"}
 
         # 合约代码必须由monitor提供（已按OI选好），不自行猜测
         contract = signal.get("contract", "")
@@ -580,8 +571,7 @@ def _execute_order(
                 print(f"  部分成交 {filled}/{lots}手 @ {trade_price:.1f}")
 
         finally:
-            if _own_client is not None:
-                _own_client.disconnect()
+            pass
 
     except Exception as e:
         status = "ERROR"
@@ -903,7 +893,7 @@ def main():
     # 启动时用 TQ 实盘持仓对账（覆盖 order_log 推断的结果）
     _reconcile_positions(positions)
 
-    # 建立持久TQ连接（非dry-run模式）
+    # 建立持久TQ连接 + 预热合约信息（非dry-run模式）
     tq_client = None
     tq_api = None
     if not args.dry_run:
@@ -919,11 +909,28 @@ def main():
             tq_client = TqClient(**creds)
             tq_client.connect()
             tq_api = tq_client._api
-            print(f" TQ连接已建立（持久模式）")
+            # 预热：订阅所有品种的主力合约，使合约信息进入本地缓存
+            # 下单时 insert_order 内部 _ensure_symbol 会直接命中缓存，零延迟
+            from utils.cffex_calendar import active_im_months
+            import time as _time
+            today_str = datetime.now().strftime("%Y%m%d")
+            _active = active_im_months(today_str)
+            _warmup_contracts = []
+            for _sym in CFFEX_INDEX_FUTURES:
+                for _m in _active:
+                    _c = f"CFFEX.{_sym}{_m}"
+                    try:
+                        tq_api.get_quote(_c)
+                        _warmup_contracts.append(_c)
+                    except Exception:
+                        pass
+            if _warmup_contracts:
+                tq_api.wait_update(deadline=_time.time() + 5)
+            print(f" TQ连接已建立（持久模式，预热{len(_warmup_contracts)}个合约）")
         except Exception as e:
-            print(f" [WARN] TQ持久连接失败: {e}，将按需连接")
-            tq_client = None
-            tq_api = None
+            print(f" [ERROR] TQ连接失败: {e}")
+            print(f" 实盘模式需要TQ连接，请检查网络和账户配置")
+            return
 
     daily_orders = 0
     daily_loss = 0.0
