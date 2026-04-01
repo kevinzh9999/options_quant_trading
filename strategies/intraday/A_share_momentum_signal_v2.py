@@ -160,7 +160,7 @@ EOD_CLOSE_UTC = "06:45"         # 14:45 BJ
 LUNCH_CLOSE_UTC = "03:25"       # 11:25 BJ
 NO_OPEN_LUNCH_START = "03:20"   # 11:20 BJ
 NO_OPEN_LUNCH_END = "05:05"     # 13:05 BJ
-NO_OPEN_EOD = "06:15"           # 14:15 BJ
+NO_OPEN_EOD = "06:30"           # 14:30 BJ
 
 
 def _boll_zone(price: float, mid: float, std: float) -> str:
@@ -824,10 +824,11 @@ class SignalGeneratorV2:
         sentiment: Optional[SentimentData] = None,
         zscore: float | None = None,
         is_high_vol: bool = True,
+        d_override: Dict[str, float] | None = None,
     ) -> Optional[IntradaySignal]:
         result = self.score_all(
             symbol, bar_5m, bar_15m, daily_bar, quote_data, sentiment,
-            zscore=zscore, is_high_vol=is_high_vol,
+            zscore=zscore, is_high_vol=is_high_vol, d_override=d_override,
         )
         if result is None:
             return None
@@ -877,6 +878,7 @@ class SignalGeneratorV2:
         sentiment: Optional[SentimentData] = None,
         zscore: float | None = None,
         is_high_vol: bool = True,
+        d_override: Dict[str, float] | None = None,
     ) -> Dict | None:
         if bar_5m is None or len(bar_5m) < MOM_5M_LOOKBACK + 1:
             return None
@@ -901,6 +903,9 @@ class SignalGeneratorV2:
                 close_5m, bar_15m, mom_dir, volume_5m)
 
         daily_mult = self._daily_direction_multiplier(daily_bar, mom_dir)
+        # Morning Briefing d_override: 覆盖daily_mult（和monitor一致）
+        if d_override and mom_dir:
+            daily_mult = d_override.get(mom_dir, daily_mult)
         raw_total = s_mom + s_vol + s_qty + s_breakout
         adjusted = raw_total * daily_mult
 
@@ -1159,10 +1164,11 @@ class SignalGeneratorV3:
         sentiment: Optional[SentimentData] = None,
         zscore: float | None = None,
         is_high_vol: bool = True,
+        d_override: Dict[str, float] | None = None,
     ) -> Optional[IntradaySignal]:
         result = self.score_all(
             symbol, bar_5m, bar_15m, daily_bar, quote_data, sentiment,
-            zscore=zscore, is_high_vol=is_high_vol,
+            zscore=zscore, is_high_vol=is_high_vol, d_override=d_override,
         )
         if result is None:
             return None
@@ -1215,6 +1221,7 @@ class SignalGeneratorV3:
         sentiment: Optional[SentimentData] = None,
         zscore: float | None = None,
         is_high_vol: bool = True,
+        d_override: Dict[str, float] | None = None,
     ) -> Dict | None:
         """使用 v2 的 50/30/20 评分体系，叠加品种差异化参数。"""
         prof = self._profile(symbol)
@@ -1270,6 +1277,9 @@ class SignalGeneratorV3:
         # --- 日线方向乘数（品种专属 lookback 和 bonus）---
         daily_mult = self._daily_direction_multiplier(
             daily_bar, direction, prof)
+        # Morning Briefing d_override: 覆盖daily_mult（和monitor一致）
+        if d_override and direction:
+            daily_mult = d_override.get(direction, daily_mult)
 
         raw_total = s_mom + s_vol + s_qty + s_rev + s_breakout
         adjusted = float(raw_total) * daily_mult

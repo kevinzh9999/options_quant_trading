@@ -134,6 +134,7 @@ class IntradayStrategy(BaseStrategy):
         zscore_params: Dict | None = None,
         is_high_vol: bool = False,
         sentiment=None,
+        d_override: Dict[str, float] | None = None,
     ) -> List[Dict]:
         """
         每根5分钟K线调用一次。
@@ -192,6 +193,7 @@ class IntradayStrategy(BaseStrategy):
                 sentiment=sentiment,
                 zscore=z_val,
                 is_high_vol=is_high_vol,
+                d_override=d_override,
             )
             if sig:
                 signals.append(sig)

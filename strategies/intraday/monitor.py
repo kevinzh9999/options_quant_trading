@@ -324,6 +324,8 @@ class IntradayMonitor:
         self._is_high_vol: bool = True
         # 期权情绪数据（启动时加载，盘中定期刷新）
         self._sentiment: Optional[SentimentData] = None
+        # Morning Briefing d_override（启动时加载）
+        self._d_override: Dict[str, float] | None = None
         # 影子交易簿：记录所有信号的完整生命周期，key=symbol
         self._shadow_positions: Dict[str, Dict] = {}
         # 影子交易累计已平仓PnL（点数）和笔数，用于面板显示
@@ -427,6 +429,25 @@ class IntradayMonitor:
                         print(f"  Vol regime: GARCH={current_garch:.1f}%"
                               f" / mean={long_run_garch:.1f}%"
                               f" = {ratio:.2f}x → {regime}")
+            except Exception:
+                pass
+
+            # 5. Morning Briefing d_override
+            try:
+                from datetime import date as _date
+                today_str = _date.today().strftime("%Y%m%d")
+                br = db.query_df(
+                    "SELECT d_override_long, d_override_short FROM morning_briefing "
+                    f"WHERE trade_date = '{today_str}' LIMIT 1"
+                )
+                if br is not None and len(br) > 0:
+                    d_long = br.iloc[0].get("d_override_long")
+                    d_short = br.iloc[0].get("d_override_short")
+                    if d_long is not None and d_short is not None:
+                        self._d_override = {
+                            "LONG": float(d_long), "SHORT": float(d_short),
+                        }
+                        print(f"  Briefing d_override: LONG={d_long} SHORT={d_short}")
             except Exception:
                 pass
 
@@ -910,32 +931,34 @@ class IntradayMonitor:
             if zp and cur_price > 0 and zp["std20"] > 0:
                 z_val = (cur_price - zp["ema20"]) / zp["std20"]
 
-            # 路由版本评分（含情绪乘数 + Z-Score过滤 + 波动率区间）
+            # 路由版本评分（含情绪乘数 + Z-Score过滤 + 波动率区间 + briefing d_override）
             ver = SIGNAL_ROUTING.get(sym, "v2")
             hv = self._is_high_vol
+            d_ovr = self._d_override
             if ver == "v3":
                 sc3 = self.signal_v3.score_all(
                     sym, b5, b15, daily, qd, self._sentiment,
-                    zscore=z_val, is_high_vol=hv)
+                    zscore=z_val, is_high_vol=hv, d_override=d_ovr)
                 if sc3:
                     self._latest_scores_v3[sym] = sc3
             else:
                 sc2 = self.signal_v2.score_all(
                     sym, b5, b15, daily, qd, self._sentiment,
-                    zscore=z_val, is_high_vol=hv)
+                    zscore=z_val, is_high_vol=hv, d_override=d_ovr)
                 if sc2:
                     self._latest_scores_v2[sym] = sc2
 
             # 面板辅助显示数据（VWAP, 趋势, 开盘区间, BOLL）
             self._display_data[sym] = self._calc_display_data(b5, b15)
 
-        # 运行策略（传入zscore/is_high_vol/sentiment参数，和面板评分一致）
+        # 运行策略（传入zscore/is_high_vol/sentiment/d_override参数，和面板评分一致）
         actions = self.strategy.on_bar(
             bar_data, bar_15m_data, self._daily_data or None, current_time_utc,
             quote_data=quote_dict,
             zscore_params=self._zscore_params,
             is_high_vol=self._is_high_vol,
             sentiment=self._sentiment,
+            d_override=self._d_override,
         )
 
         # Z-Score过滤actions：策略层不知道Z-Score，这里做最终拦截

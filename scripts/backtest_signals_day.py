@@ -150,6 +150,8 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
             sentiment = SentimentData(
                 atm_iv=float(cur.get("atm_iv_market") or cur.get("atm_iv") or 0),
                 atm_iv_prev=float(prev.get("atm_iv_market") or prev.get("atm_iv") or 0),
+                rr_25d=float(cur.get("rr_25d") or 0),
+                rr_25d_prev=float(prev.get("rr_25d") or 0),
                 vrp=float(cur.get("vrp") or 0),
                 term_structure=str(cur.get("term_structure_shape") or ""),
             )
@@ -157,6 +159,23 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
         pass
 
     gen = SignalGeneratorV2({"min_signal_score": 60})
+
+    # Morning Briefing d_override（和monitor一致）
+    d_override = None
+    try:
+        briefing_row = db.query_df(
+            "SELECT d_override_long, d_override_short FROM morning_briefing "
+            f"WHERE trade_date = '{td}' LIMIT 1"
+        )
+        if briefing_row is not None and len(briefing_row) > 0:
+            d_long = briefing_row.iloc[0].get("d_override_long")
+            d_short = briefing_row.iloc[0].get("d_override_short")
+            if d_long is not None and d_short is not None:
+                d_override = {"LONG": float(d_long), "SHORT": float(d_short)}
+                if verbose:
+                    print(f"  Briefing d_override: LONG={d_long} SHORT={d_short}")
+    except Exception:
+        pass
 
     # Position tracker
     position: Optional[Dict] = None
@@ -217,7 +236,7 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
         # Score (daily_df already truncated to replay date)
         result = gen.score_all(
             sym, bar_5m, bar_15m, daily_df, None, sentiment,
-            zscore=z_val, is_high_vol=is_high_vol,
+            zscore=z_val, is_high_vol=is_high_vol, d_override=d_override,
         )
 
         score = result["total"] if result else 0
