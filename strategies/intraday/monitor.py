@@ -605,11 +605,38 @@ class IntradayMonitor:
         api = client._api
 
         try:
-            # 用 TQ 按持仓量重新选择主力合约
-            from utils.cffex_calendar import get_main_contract
+            # 用 TQ 按持仓量批量选择主力合约（一次 wait_update）
+            from utils.cffex_calendar import get_candidate_months, _near_month_by_expiry
+            candidates = get_candidate_months()
+            all_quotes = {}  # (sym, contract) -> quote
             for sym in self.symbols:
-                self._tq_symbols[sym] = get_main_contract(sym, api=api)
-            print(f"  主力合约(按OI): {list(self._tq_symbols.values())}")
+                for month in candidates:
+                    contract = f"CFFEX.{sym}{month}"
+                    try:
+                        all_quotes[(sym, contract)] = api.get_quote(contract)
+                    except Exception:
+                        pass
+            if all_quotes:
+                api.wait_update()
+            for sym in self.symbols:
+                best, max_oi = None, 0
+                for (s, contract), quote in all_quotes.items():
+                    if s != sym:
+                        continue
+                    try:
+                        oi = int(quote.open_interest or 0)
+                        if oi > max_oi:
+                            max_oi = oi
+                            best = contract
+                    except Exception:
+                        pass
+                if best:
+                    self._tq_symbols[sym] = best
+                    print(f"  {sym} → {best} (OI={max_oi:,})")
+                else:
+                    fallback = f"CFFEX.{sym}{_near_month_by_expiry()}"
+                    self._tq_symbols[sym] = fallback
+                    print(f"  {sym} → {fallback} (fallback)")
 
             # 订阅现货指数K线（信号计算用）
             spot_klines_5m: Dict[str, pd.DataFrame] = {}

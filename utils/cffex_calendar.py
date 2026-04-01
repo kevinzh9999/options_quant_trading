@@ -199,21 +199,28 @@ def get_main_contract(symbol_prefix: str, api=None) -> str:
     candidates = get_candidate_months()
 
     if api is not None:
-        best_contract = None
-        max_oi = 0
+        # 批量订阅所有候选合约，一次 wait_update 拿到数据
+        quotes = {}
         for month in candidates:
             contract = f"CFFEX.{symbol_prefix}{month}"
             try:
-                quote = api.get_quote(contract)
-                api.wait_update()
-                oi = int(quote.open_interest or 0)
-                if oi > max_oi:
-                    max_oi = oi
-                    best_contract = contract
+                quotes[contract] = api.get_quote(contract)
             except Exception:
-                continue
-        if best_contract:
-            return best_contract
+                pass
+        if quotes:
+            api.wait_update()
+            best_contract = None
+            max_oi = 0
+            for contract, quote in quotes.items():
+                try:
+                    oi = int(quote.open_interest or 0)
+                    if oi > max_oi:
+                        max_oi = oi
+                        best_contract = contract
+                except Exception:
+                    continue
+            if best_contract:
+                return best_contract
 
     # 离线 fallback：按到期日选近月
     near = _near_month_by_expiry()
