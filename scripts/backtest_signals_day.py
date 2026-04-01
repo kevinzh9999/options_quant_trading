@@ -53,11 +53,12 @@ def _build_15m_from_5m(bar_5m: pd.DataFrame) -> pd.DataFrame:
 
 
 def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
-            slippage: float = 0) -> List[Dict]:
+            slippage: float = 0, version: str = "auto") -> List[Dict]:
     """Replay one day. Returns list of completed trades.
-    
+
     Args:
         slippage: points of slippage per trade (applied adversely on entry and exit)
+        version: "v2", "v3", or "auto" (use SIGNAL_ROUTING)
     """
     date_dash = f"{td[:4]}-{td[4:6]}-{td[6:]}"
 
@@ -135,7 +136,8 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
 
     # Sentiment (use data up to replay date, not latest)
     from strategies.intraday.A_share_momentum_signal_v2 import (
-        SignalGeneratorV2, SentimentData, check_exit, is_open_allowed,
+        SignalGeneratorV2, SignalGeneratorV3, SentimentData, check_exit,
+        is_open_allowed, SIGNAL_ROUTING,
     )
     sentiment = None
     try:
@@ -158,7 +160,12 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
     except Exception:
         pass
 
-    gen = SignalGeneratorV2({"min_signal_score": 60})
+    # Select signal generator version
+    _ver = version if version != "auto" else SIGNAL_ROUTING.get(sym, "v2")
+    if _ver == "v3":
+        gen = SignalGeneratorV3({"min_signal_score": 60})
+    else:
+        gen = SignalGeneratorV2({"min_signal_score": 60})
 
     # Per-symbol threshold（IC=65等，从SYMBOL_PROFILES读取）
     from strategies.intraday.A_share_momentum_signal_v2 import SYMBOL_PROFILES, _DEFAULT_PROFILE
@@ -609,6 +616,8 @@ def main():
     parser.add_argument("--date", default="20260324", help="YYYYMMDD or comma-separated or YYYYMMDD-YYYYMMDD range")
     parser.add_argument("--slippage", type=float, default=0, help="Slippage in points per trade (e.g. 5)")
     parser.add_argument("--threshold", type=int, default=60, help="Signal threshold (default 60)")
+    parser.add_argument("--version", choices=["v2", "v3", "auto"], default="auto",
+                        help="Signal version: v2, v3, or auto (use SIGNAL_ROUTING)")
     parser.add_argument("--sensitivity", action="store_true",
                         help="Run sensitivity sweep: slippage 0/5/10 × threshold 50/55/60")
     args = parser.parse_args()
@@ -632,7 +641,7 @@ def main():
         dates = [d.strip() for d in args.date.split(",")]
 
     if args.sensitivity:
-        _run_sensitivity(args.symbol, dates, db)
+        _run_sensitivity(args.symbol, dates, db, version=args.version)
         return
 
     # Override threshold in signal generator
@@ -641,7 +650,7 @@ def main():
     all_trades = []
     for td in dates:
         trades = run_day(args.symbol, td, db, verbose=(len(dates) <= 3),
-                         slippage=args.slippage)
+                         slippage=args.slippage, version=args.version)
         all_trades.extend([(td, t) for t in trades])
 
     if len(dates) > 1:
@@ -659,14 +668,15 @@ def _patch_threshold(threshold: int):
 _SIGNAL_THRESHOLD = 60
 
 
-def _run_sensitivity(sym: str, dates: List[str], db: DBManager):
+def _run_sensitivity(sym: str, dates: List[str], db: DBManager,
+                     version: str = "auto"):
     """Run sensitivity sweep across slippage × threshold combinations."""
     slippages = [0, 1, 2, 3, 5]
     thresholds = [55, 60, 65]
 
     print(f"\n{'='*80}")
     print(f" SENSITIVITY ANALYSIS | {sym} | {len(dates)} days "
-          f"({dates[0]}~{dates[-1]})")
+          f"({dates[0]}~{dates[-1]}) | version={version}")
     print(f"{'='*80}")
 
     results = {}
@@ -675,7 +685,8 @@ def _run_sensitivity(sym: str, dates: List[str], db: DBManager):
         for slip in slippages:
             all_trades = []
             for td in dates:
-                trades = run_day(sym, td, db, verbose=False, slippage=slip)
+                trades = run_day(sym, td, db, verbose=False, slippage=slip,
+                                 version=version)
                 all_trades.extend(trades)
             full_trades = [t for t in all_trades if not t.get("partial")]
             total_pnl = sum(t["pnl_pts"] for t in full_trades)
