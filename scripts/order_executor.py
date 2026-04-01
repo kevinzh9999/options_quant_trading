@@ -178,12 +178,6 @@ def _update_log(db_path: str, log_id: int, **fields):
 # 合约解析
 # ---------------------------------------------------------------------------
 
-def _get_main_contract(symbol: str) -> str:
-    """获取主力合约（离线模式，按到期日选近月）。"""
-    from utils.cffex_calendar import get_main_contract
-    return get_main_contract(symbol)
-
-
 # ---------------------------------------------------------------------------
 # 平仓否决记录
 # ---------------------------------------------------------------------------
@@ -426,7 +420,7 @@ def _execute_order(
                 "reason": reason,
             })
             _record_denied_position(
-                sym, signal.get("contract", "") or _get_main_contract(sym),
+                sym, signal.get("contract", sym),
                 direction, lots,
                 reason, positions.get(sym, {}).get("entry_price", 0))
             return {"status": "CLOSE_DENIED"}
@@ -484,11 +478,13 @@ def _execute_order(
             _own_client.connect()
             api = _own_client._api
 
-        # 优先用信号JSON中的合约代码（monitor已按OI选好），避免重复查询
+        # 合约代码必须由monitor提供（已按OI选好），不自行猜测
         contract = signal.get("contract", "")
         if not contract:
-            from utils.cffex_calendar import get_main_contract
-            contract = get_main_contract(sym, api=api)
+            print(f"  下单失败: 信号缺少contract字段，请重启monitor")
+            _update_log(db_path, log_id, order_status="ERROR",
+                        response_reason="信号缺少contract字段")
+            return {"status": "ERROR", "reason": "NO_CONTRACT"}
 
         try:
             # TQ 方向和开平
