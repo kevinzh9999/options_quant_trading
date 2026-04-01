@@ -753,6 +753,22 @@ def _reconcile_positions(positions: dict):
         if sym not in tq_positions or (
                 tq_positions[sym].get("long", 0) == 0
                 and tq_positions[sym].get("short", 0) == 0):
+            # 安全检查：如果持仓是本次会话成交的，且快照比成交更旧，不删
+            # （monitor 快照可能还没更新到 executor 刚开的仓）
+            entry_t = positions[sym].get("entry_time", "")
+            if entry_t and entry_t != "restored" and ts:
+                try:
+                    snap_dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                    # entry_time 格式是 "HH:MM"
+                    now = datetime.now()
+                    entry_dt = now.replace(
+                        hour=int(entry_t[:2]), minute=int(entry_t[3:5]),
+                        second=0, microsecond=0)
+                    if snap_dt < entry_dt:
+                        msgs.append(f"exec有 {sym} TQ快照较旧，保留")
+                        continue
+                except Exception:
+                    pass
             msgs.append(f"exec有 {sym} TQ无 → 清除")
             del positions[sym]
 
