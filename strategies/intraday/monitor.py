@@ -498,6 +498,79 @@ class IntradayMonitor:
         except Exception as e:
             print(f"  [警告] 账户权益加载失败: {e}")
 
+    # ------------------------------------------------------------------
+    # 盘中重启：状态持久化 & 恢复
+    # ------------------------------------------------------------------
+
+    def _save_shadow_state(self) -> None:
+        """将活跃shadow持仓持久化到JSON文件，供重启恢复。"""
+        import json as _json
+        state = {
+            "trade_date": datetime.now().strftime("%Y%m%d"),
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "positions": self._shadow_positions,
+        }
+        path = os.path.join(self._tmp_dir, "shadow_state.json")
+        try:
+            with open(path, "w") as f:
+                _json.dump(state, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"  [WARN] shadow_state write failed: {e}")
+
+    def _restore_daily_state(self) -> None:
+        """从持久化文件+数据库恢复当天状态，防止重启后突破持仓限制。
+
+        恢复三个层面:
+          1. _shadow_positions（活跃shadow持仓）→ 从 shadow_state.json
+          2. position_mgr（占位，使 can_open/total_net_lots 正确拦截）
+          3. risk_mgr + daily_trades（当天已完成交易的计数/PnL）→ 从 shadow_trades 表
+        """
+        import json as _json
+        trade_date = datetime.now().strftime("%Y%m%d")
+
+        # --- 1. 从 shadow_state.json 恢复活跃的 shadow 持仓 ---
+        state_path = os.path.join(self._tmp_dir, "shadow_state.json")
+        if os.path.exists(state_path):
+            try:
+                with open(state_path) as f:
+                    state = _json.load(f)
+                if state.get("trade_date") == trade_date:
+                    restored = state.get("positions", {})
+                    self._shadow_positions = restored
+                    # 注入 position_mgr 占位
+                    for sym, sp in restored.items():
+                        self.strategy.position_mgr.inject_position(
+                            sym, sp["direction"], sp["entry_price"],
+                            sp.get("entry_time_bj", ""),
+                            sp.get("entry_score", 0),
+                        )
+                    if restored:
+                        parts = [f"{s} {sp['direction']}@{sp['entry_price']:.0f}"
+                                 for s, sp in restored.items()]
+                        print(f"  恢复shadow持仓: {', '.join(parts)}")
+                else:
+                    # 非当天的状态文件，忽略
+                    pass
+            except Exception as e:
+                print(f"  [WARN] shadow_state恢复失败: {e}")
+
+        # --- 2. 从 shadow_trades 恢复当天已平仓交易计数 ---
+        try:
+            conn = sqlite3.connect(self.recorder.db_path)
+            rows = conn.execute(
+                "SELECT symbol, pnl_pts FROM shadow_trades WHERE trade_date = ?",
+                (trade_date,),
+            ).fetchall()
+            conn.close()
+            if rows:
+                for symbol, pnl_pts in rows:
+                    self.strategy.position_mgr.daily_trades += 1
+                    pnl_money = (pnl_pts or 0) * self._CONTRACT_MULT.get(symbol, 200)
+                    self.strategy.risk_mgr.on_trade_complete(pnl_money, symbol)
+                print(f"  恢复当日交易: {len(rows)}笔已平仓")
+        except Exception as e:
+            print(f"  [WARN] shadow_trades恢复失败: {e}")
+
     def _load_sentiment(self) -> None:
         """从 vol_monitor_snapshots 或 daily_model_output 加载情绪数据。"""
         try:
@@ -626,10 +699,11 @@ class IntradayMonitor:
             print("请在 .env 中设置 TQ_ACCOUNT 和 TQ_PASSWORD")
             return
 
-        # 加载日线数据 + 情绪数据 + 账户权益
+        # 加载日线数据 + 情绪数据 + 账户权益 + 恢复盘中状态
         self._load_daily_data()
         self._load_sentiment()
         self._load_account_equity()
+        self._restore_daily_state()
 
         client = TqClient(**creds)
         client.connect()
@@ -1008,6 +1082,8 @@ class IntradayMonitor:
                 print(f"     → 已写入signal_pending.json(CLOSE)，等待executor确认")
 
                 del self._shadow_positions[sym]
+                self.strategy.position_mgr.remove_by_symbol(sym)
+                self._save_shadow_state()
 
         # 打印状态面板（传入现货bar和期货行情）
         self._print_status(bar_data, fut_quotes, actions)
@@ -1073,6 +1149,7 @@ class IntradayMonitor:
                     "is_executed": 0,
                     "fut_symbol": self._tq_symbols.get(sym, ""),
                 }
+                self._save_shadow_state()
 
     def _get_latest_signal(
         self,

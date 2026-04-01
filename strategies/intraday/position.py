@@ -352,6 +352,31 @@ class IntradayPositionManager:
         nets = self.get_net_positions()
         return sum(abs(v) for v in nets.values())
 
+    def inject_position(
+        self, symbol: str, direction: str, entry_price: float,
+        entry_time: str = "", score: int = 0,
+    ) -> str:
+        """重启恢复：注入已知的活跃持仓占位（不增加daily_trades）。
+
+        止损设为极端值，不会被 check_stop_loss 触发。
+        返回 position_id 供后续 remove 使用。
+        """
+        stop = 1.0 if direction == "LONG" else entry_price * 10
+        pos = FuturesPosition(
+            symbol=symbol, direction=direction, volume=1,
+            entry_price=entry_price, entry_time=entry_time,
+            stop_loss=stop, hold_type="INTRADAY", signal_score=score,
+        )
+        self.positions[pos.position_id] = pos
+        return pos.position_id
+
+    def remove_by_symbol(self, symbol: str) -> None:
+        """移除指定品种的所有非锁仓持仓（shadow exit 时调用）。"""
+        to_del = [pid for pid, p in self.positions.items()
+                  if p.symbol == symbol and not p.is_lock]
+        for pid in to_del:
+            del self.positions[pid]
+
     def reset_daily(self) -> None:
         self.daily_pnl = 0.0
         self.daily_trades = 0
