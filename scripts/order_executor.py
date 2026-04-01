@@ -426,7 +426,8 @@ def _execute_order(
                 "reason": reason,
             })
             _record_denied_position(
-                sym, _get_main_contract(sym), direction, lots,
+                sym, signal.get("contract", "") or _get_main_contract(sym),
+                direction, lots,
                 reason, positions.get(sym, {}).get("entry_price", 0))
             return {"status": "CLOSE_DENIED"}
         else:
@@ -483,8 +484,11 @@ def _execute_order(
             _own_client.connect()
             api = _own_client._api
 
-        from utils.cffex_calendar import get_main_contract
-        contract = get_main_contract(sym, api=api)
+        # 优先用信号JSON中的合约代码（monitor已按OI选好），避免重复查询
+        contract = signal.get("contract", "")
+        if not contract:
+            from utils.cffex_calendar import get_main_contract
+            contract = get_main_contract(sym, api=api)
 
         try:
             # TQ 方向和开平

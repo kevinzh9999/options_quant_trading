@@ -454,16 +454,18 @@ class IntradayMonitor:
         bid1 = action.get("bid1", 0)
         ask1 = action.get("ask1", 0)
         last = action.get("last", 0)
+        sym = action.get("symbol", "")
         signal = {
             "timestamp": dt_str,
-            "symbol": action.get("symbol", ""),
+            "symbol": sym,
+            "contract": self._tq_symbols.get(sym, ""),
             "direction": direction,
             "action": action.get("action", "OPEN"),
             "score": action.get("score", 0),
             "bid1": bid1,
             "ask1": ask1,
             "last": last,
-            "suggested_lots": self._calc_suggested_lots(last, action.get("symbol", "IM")),
+            "suggested_lots": self._calc_suggested_lots(last, sym),
             "limit_price": bid1 if direction == "SHORT" else ask1,
             "reason": action.get("reason", ""),
         }
@@ -1068,6 +1070,7 @@ class IntradayMonitor:
                 close_signal = {
                     "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                     "symbol": sym,
+                    "contract": self._tq_symbols.get(sym, ""),
                     "direction": d_s,
                     "action": "CLOSE",
                     "reason": reason,
