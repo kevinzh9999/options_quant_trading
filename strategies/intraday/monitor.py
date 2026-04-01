@@ -326,6 +326,9 @@ class IntradayMonitor:
         self._sentiment: Optional[SentimentData] = None
         # 影子交易簿：记录所有信号的完整生命周期，key=symbol
         self._shadow_positions: Dict[str, Dict] = {}
+        # 影子交易累计已平仓PnL（点数）和笔数，用于面板显示
+        self._shadow_closed_pnl: float = 0.0
+        self._shadow_closed_count: int = 0
         # 项目 tmp 目录（信号文件、持仓文件等）
         from config.config_loader import ConfigLoader
         self._tmp_dir: str = ConfigLoader().get_tmp_dir()
@@ -567,9 +570,13 @@ class IntradayMonitor:
             if rows:
                 for symbol, pnl_pts in rows:
                     self.strategy.position_mgr.daily_trades += 1
-                    pnl_money = (pnl_pts or 0) * self._CONTRACT_MULT.get(symbol, 200)
+                    pts = pnl_pts or 0
+                    pnl_money = pts * self._CONTRACT_MULT.get(symbol, 200)
                     self.strategy.risk_mgr.on_trade_complete(pnl_money, symbol)
-                print(f"  恢复当日交易: {len(rows)}笔已平仓")
+                    self._shadow_closed_pnl += pts
+                    self._shadow_closed_count += 1
+                print(f"  恢复当日交易: {len(rows)}笔已平仓, "
+                      f"累计{self._shadow_closed_pnl:+.0f}pt")
         except Exception as e:
             print(f"  [WARN] shadow_trades恢复失败: {e}")
 
@@ -1084,6 +1091,8 @@ class IntradayMonitor:
                 self._append_signal(close_signal)
                 print(f"     → 已写入signal_pending.json(CLOSE)，等待executor确认")
 
+                self._shadow_closed_pnl += pnl_pts
+                self._shadow_closed_count += 1
                 del self._shadow_positions[sym]
                 self.strategy.position_mgr.remove_by_symbol(sym)
                 self._save_shadow_state()
@@ -1387,34 +1396,36 @@ class IntradayMonitor:
         else:
             print(f" POS: none")
 
-        summary = self.strategy.position_mgr.get_exposure_summary()
-        print(f" P&L: {summary['daily_pnl']:+,.0f}  Trades: {summary['daily_trades']}")
-
-        # 影子持仓状态
-        if self._shadow_positions:
-            shadow_parts = []
-            for s_sym, sp in self._shadow_positions.items():
-                b5 = bar_data.get(s_sym)
-                if b5 is not None and len(b5) > 0:
-                    # 用期货last_price（与entry_price基准一致），fallback现货close
-                    cur = 0.0
-                    fq = quotes.get(s_sym)
-                    if fq is not None:
-                        try:
-                            cur = float(fq.last_price)
-                        except Exception:
-                            pass
-                    if cur <= 0:
-                        cur = float(b5.iloc[-1]["close"])
-                    pnl = (cur - sp["entry_price"]) if sp["direction"] == "LONG" \
-                        else (sp["entry_price"] - cur)
-                    d = "L" if sp["direction"] == "LONG" else "S"
-                    exec_flag = "*" if sp.get("is_executed") else ""
-                    shadow_parts.append(
-                        f"{s_sym}{exec_flag} {d}@{sp['entry_price']:.0f}"
-                        f" {'+' if pnl >= 0 else ''}{pnl:.0f}pt")
-            if shadow_parts:
-                print(f" SHADOW: {' | '.join(shadow_parts)}")
+        # Shadow P&L: 已平仓累计 + 活跃持仓浮盈（全部用期货价，点数）
+        floating_pts = 0.0
+        shadow_parts = []
+        for s_sym, sp in self._shadow_positions.items():
+            b5 = bar_data.get(s_sym)
+            if b5 is not None and len(b5) > 0:
+                cur = 0.0
+                fq = quotes.get(s_sym)
+                if fq is not None:
+                    try:
+                        cur = float(fq.last_price)
+                    except Exception:
+                        pass
+                if cur <= 0:
+                    cur = float(b5.iloc[-1]["close"])
+                pnl = (cur - sp["entry_price"]) if sp["direction"] == "LONG" \
+                    else (sp["entry_price"] - cur)
+                floating_pts += pnl
+                d = "L" if sp["direction"] == "LONG" else "S"
+                exec_flag = "*" if sp.get("is_executed") else ""
+                shadow_parts.append(
+                    f"{s_sym}{exec_flag} {d}@{sp['entry_price']:.0f}"
+                    f" {'+' if pnl >= 0 else ''}{pnl:.0f}pt")
+        total_pts = self._shadow_closed_pnl + floating_pts
+        total_trades = self._shadow_closed_count + len(self._shadow_positions)
+        print(f" P&L: {total_pts:+.0f}pt"
+              f" (已平{self._shadow_closed_pnl:+.0f} 浮盈{floating_pts:+.0f})"
+              f"  Trades: {total_trades}")
+        if shadow_parts:
+            print(f" SHADOW: {' | '.join(shadow_parts)}")
 
         print(f"{'=' * W}")
 
