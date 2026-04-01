@@ -1316,7 +1316,16 @@ class IntradayMonitor:
             for s_sym, sp in self._shadow_positions.items():
                 b5 = bar_data.get(s_sym)
                 if b5 is not None and len(b5) > 0:
-                    cur = float(b5.iloc[-1]["close"])
+                    # 用期货last_price（与entry_price基准一致），fallback现货close
+                    cur = 0.0
+                    fq = quotes.get(s_sym)
+                    if fq is not None:
+                        try:
+                            cur = float(fq.last_price)
+                        except Exception:
+                            pass
+                    if cur <= 0:
+                        cur = float(b5.iloc[-1]["close"])
                     pnl = (cur - sp["entry_price"]) if sp["direction"] == "LONG" \
                         else (sp["entry_price"] - cur)
                     d = "L" if sp["direction"] == "LONG" else "S"
