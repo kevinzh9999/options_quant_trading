@@ -636,10 +636,10 @@ _SESSION_UTC = {
 # 品种 → 信号版本路由（每个品种用回测表现最佳的版本）
 # ---------------------------------------------------------------------------
 SIGNAL_ROUTING: Dict[str, str] = {
-    "IF": "v2",   # 5m回测 +19.8K
-    "IH": "v3",   # 5m回测 +21.8K（均值回归策略）
-    "IM": "v2",   # 5m回测 +370K
-    "IC": "v2",   # 中证500，动量特征类似IM
+    "IF": "v2",   # 均值回归型，v2逆势+120pt > v3无逆势+102pt
+    "IH": "v2",   # 均值回归型，v2逆势+99pt > v3无逆势+60pt（干净数据验证）
+    "IM": "v2",   # 动量型，波动大利润厚
+    "IC": "v2",   # 动量型，thr=65优化
 }
 
 SYMBOL_PROFILES: Dict[str, Dict] = {
@@ -677,6 +677,8 @@ SYMBOL_PROFILES: Dict[str, Dict] = {
         "reversal_weight": 0,
         "daily_align_bonus": 1.2,
         "daily_conflict_penalty": 0.7,
+        "dm_trend": 1.0,             # IF均值回归型：中性dm（逆势59%WR，不惩罚）
+        "dm_contrarian": 1.0,        # 34天验证：中性+255pt vs 当前+146pt（+75%）
         "session_multiplier": {
             "0935-1030": 1.2,         # 开盘动量最强
             "1030-1130": 1.1,
@@ -906,7 +908,7 @@ class SignalGeneratorV2:
             s_breakout, breakout_note = _score_boll_breakout(
                 close_5m, bar_15m, mom_dir, volume_5m)
 
-        daily_mult = self._daily_direction_multiplier(daily_bar, mom_dir)
+        daily_mult = self._daily_direction_multiplier(daily_bar, mom_dir, symbol)
         # Morning Briefing d_override: 覆盖daily_mult（和monitor一致）
         if d_override and mom_dir:
             daily_mult = d_override.get(mom_dir, daily_mult)
@@ -1042,18 +1044,23 @@ class SignalGeneratorV2:
             return 10
         return 0
 
-    def _daily_direction_multiplier(self, daily_bar, signal_dir) -> float:
+    def _daily_direction_multiplier(self, daily_bar, signal_dir,
+                                    symbol: str = "") -> float:
         if daily_bar is None or len(daily_bar) < MOM_DAILY_LOOKBACK + 1:
             return 1.0
         closes = daily_bar["close"].values
         daily_mom = (closes[-1] - closes[-MOM_DAILY_LOOKBACK - 1]) / closes[-MOM_DAILY_LOOKBACK - 1]
         if abs(daily_mom) < 0.002:
             return 1.0
+        # Per-symbol dm from SYMBOL_PROFILES（IF中性1.0/1.0, IM/IC动量1.2/0.8）
+        prof = SYMBOL_PROFILES.get(symbol, _DEFAULT_PROFILE) if symbol else _DEFAULT_PROFILE
+        dm_trend = prof.get("dm_trend", 1.2)
+        dm_contra = prof.get("dm_contrarian", 0.8)
         daily_dir = "LONG" if daily_mom > 0 else "SHORT"
         if daily_dir == signal_dir:
-            return 1.2   # 顺势加成
+            return dm_trend
         elif signal_dir and daily_dir != signal_dir:
-            return 0.8   # 逆势统一0.8（做多做空对称，干净数据验证）
+            return dm_contra
         return 1.0
 
     @staticmethod
