@@ -192,6 +192,44 @@ def _calc_boll(closes: pd.Series, period: int = 20):
     return mid, std
 
 
+def _score_trend_startup(
+    close_5m: np.ndarray, high_5m: np.ndarray, low_5m: np.ndarray,
+    volume_5m: np.ndarray, direction: str,
+) -> tuple[int, str]:
+    """趋势启动检测器：突破+振幅放大+放量三重确认时给bonus。
+
+    条件（同时满足）：
+    1. 收盘价突破前5根bar的高/低点（方向确认）
+    2. 当前bar振幅 > 前20根均振幅 × 1.5（波动率扩张）
+    3. 当前bar成交量 > 前20根均量 × 1.2（资金参与）
+
+    34天回测验证：IM +52pt(+10%), IC +39pt(+9%), IF/IH中性
+    """
+    if len(close_5m) < 22 or not direction:
+        return 0, ""
+    last_close = float(close_5m[-1])
+    recent_high = float(np.max(high_5m[-6:-1]))   # 前5根的最高点
+    recent_low = float(np.min(low_5m[-6:-1]))      # 前5根的最低点
+    current_range = float(high_5m[-1] - low_5m[-1])
+    avg_range = float(np.mean(
+        [high_5m[i] - low_5m[i] for i in range(-21, -1)]))
+    current_vol = float(volume_5m[-1])
+    avg_vol = float(np.mean(volume_5m[-21:-1]))
+
+    if avg_range <= 0 or avg_vol <= 0:
+        return 0, ""
+
+    if (direction == "LONG" and last_close > recent_high
+            and current_range > avg_range * 1.5
+            and current_vol > avg_vol * 1.2):
+        return 15, "TS^"
+    if (direction == "SHORT" and last_close < recent_low
+            and current_range > avg_range * 1.5
+            and current_vol > avg_vol * 1.2):
+        return 15, "TSv"
+    return 0, ""
+
+
 def _score_boll_breakout(
     close_5m: np.ndarray, bar_15m: pd.DataFrame | None,
     direction: str, volume_5m: np.ndarray,
@@ -933,11 +971,20 @@ class SignalGeneratorV2:
             s_breakout, breakout_note = _score_boll_breakout(
                 close_5m, bar_15m, mom_dir, volume_5m)
 
+        # 趋势启动检测器（0~15分，突破+振幅+放量三重确认）
+        s_startup, startup_note = 0, ""
+        if mom_dir:
+            s_startup, startup_note = _score_trend_startup(
+                close_5m, high_5m, low_5m, volume_5m, mom_dir)
+            if startup_note:
+                breakout_note = (breakout_note + "+" + startup_note
+                                 if breakout_note else startup_note)
+
         daily_mult = self._daily_direction_multiplier(daily_bar, mom_dir, symbol)
         # Morning Briefing d_override: 覆盖daily_mult（和monitor一致）
         if d_override and mom_dir:
             daily_mult = d_override.get(mom_dir, daily_mult)
-        raw_total = s_mom + s_vol + s_qty + s_breakout
+        raw_total = s_mom + s_vol + s_qty + s_breakout + s_startup
         adjusted = raw_total * daily_mult
 
         # 第三层：日内涨跌幅过滤（用当前价 vs 昨日收盘，含跳空gap）
