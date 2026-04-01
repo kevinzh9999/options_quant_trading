@@ -160,18 +160,24 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 ### Morning Briefing（2026-03-29新增）
 - 盘前运行 `python scripts/morning_briefing.py`，综合5维度评分输出方向Guidance
 - 数据源：Tushare（A50/美股/恒生/涨跌家数/成交额）+ 本地DB（IV/VRP/价格位置）
-- 输出 JSON 到 `tmp/morning_briefing.json`，Monitor 启动时读取覆盖 daily_mult
+- 输出 JSON 到 `tmp/morning_briefing.json`
+- **d_override**：Monitor启动时从 `morning_briefing` 表读取 `d_override_long/short`，覆盖 `daily_mult`；Backtest同样加载
 - 结果写入 `morning_briefing` 表 + `logs/briefing/YYYYMMDD.md`
 - **本地DB优先**：`download_briefing_history.py` 预下载历史数据到7个表，briefing优先读本地（快速），Tushare作fallback
 - 增量更新：`python scripts/download_briefing_history.py --update`
 
-### 回测注意事项（重要！）
-- `backtest_signals_day.py` 的 `daily_df` 必须按回测日期截断（防止未来数据泄漏）
-- Z-Score 也必须按日期截断计算
-- sentiment / GARCH regime 也必须按回测日期加载（`AND trade_date <= '{td}'`）
+### 回测注意事项（重要！2026-04-01全面审计）
+- **Lookahead fix**：`bar_5m_signal = bar_5m.iloc[:-1]`，信号评分用上一根完成bar，执行价用当前bar close（详见 `docs/lookahead_audit.md`）
+- **止损精确化**：check_exit前先用bar high/low检查止损位，触发时exit_price=stop_price（不是close）
+- `daily_df` 必须按回测日期截断（`trade_date < td`）
+- Z-Score 也必须按日期截断计算（`trade_date < td`）
+- sentiment / GARCH regime 也必须按回测日期加载（`trade_date < '{td}'`）
 - **prevClose** 用 `trade_date < replay_date` 过滤，不是 `iloc[-2]`
-- **bar_15m** 必须传入 `score_all`（传 None 会导致 M 维度缺 15 分一致性 bonus）
-- `is_open_allowed` 检查在 `update()` 中拦截，不在 `score_all` 中（否则面板重启后无法显示评分）
+- **bar_15m** 从 `bar_5m_signal` 构建（也排除当前bar）
+- `is_open_allowed` 检查在 `update()` 中拦截，不在 `score_all` 中
+- **跨日GAP不修复**：M/V/Q中的隔夜gap"失真"是有益的开盘过滤器（验证修复后IM -53%）
+- **per-symbol阈值**：`effective_threshold` 从 SYMBOL_PROFILES.signal_threshold 读取（IC=65）
+- **--version v2/v3/auto**：支持切换信号版本回测
 
 ---
 
