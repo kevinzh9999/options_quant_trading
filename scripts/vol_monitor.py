@@ -98,23 +98,23 @@ def _open_db():
         return None
 
 
-def _calc_discount_percentile(db, annual_rate: float, contract_idx: int = 0) -> float | None:
-    """计算贴水年化率在历史中的百分位。contract_idx: 0=iml1, 1=iml2, 2=iml3。"""
-    col = ["discount_rate_iml1", "discount_rate_iml2", "discount_rate_iml3"][contract_idx]
-    hist = db.query_df(
-        f"SELECT {col} FROM daily_model_output "
-        f"WHERE {col} IS NOT NULL ORDER BY trade_date"
-    )
-    if hist is None or len(hist) < 5:
+def _calc_discount_percentile(db, daily_rate: float, contract_idx: int = 0) -> float | None:
+    """计算日贴水率在 futures_daily 完整历史中的百分位。
+
+    daily_rate: 日贴水率小数（如 -0.016 = -1.6%），(futures-spot)/spot
+    contract_idx: 0=IML1(次月), 1=IML2(当季), 2=IML3(隔季)
+    返回 0-100，越高表示当前贴水越深。
+    """
+    try:
+        from strategies.discount_capture.signal import DiscountSignal
+        ds = DiscountSignal(db)
+        contract_type = ["IML1", "IML2", "IML3"][contract_idx]
+        # get_discount_percentile 接受贴水幅度绝对值
+        pct = ds.get_discount_percentile(
+            abs(daily_rate), contract_type=contract_type)
+        return pct
+    except Exception:
         return None
-    vals = hist[col].astype(float).dropna().values
-    if len(vals) < 5:
-        return None
-    # annual_rate 单位：百分比如 -19.9 → 需和历史比较
-    # daily_model_output 的 discount_rate 是小数（如 -0.199）
-    rate_decimal = annual_rate / 100 if abs(annual_rate) > 1 else annual_rate
-    pct = float(np.mean(vals <= rate_decimal) * 100)
-    return pct
 
 
 def _discount_pct_label(pct: float | None) -> str:
@@ -613,7 +613,8 @@ def print_panel(
     print(f"\n{'【贴水监控】'}")
     print(f"  现货(000852.SH)  :  {spot_price:.2f}")
     for i, (label, price, abs_d, ann) in enumerate(discounts):
-        pct = _calc_discount_percentile(db, ann, i) if db else None
+        daily_rate = abs_d / spot_price if spot_price > 0 else 0
+        pct = _calc_discount_percentile(db, daily_rate, i) if db else None
         pct_s = f"  分位: {_discount_pct_label(pct)}" if pct is not None else ""
         print(f"  {label:<16} :  {price:.2f}"
               f"  贴水: {abs_d:+.0f}点  年化: {ann:+.2f}%{pct_s}")
