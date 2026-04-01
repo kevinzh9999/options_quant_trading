@@ -80,33 +80,53 @@ def _get_recent_trade_dates(db: DBManager, target_date: str, n: int = 2) -> list
 
 
 def _get_global_indices(pro, target_date: str, db: DBManager = None) -> dict:
-    result = {"a50_pct": None, "spx_pct": None, "ixic_pct": None, "hsi_pct": None}
-    # 优先从本地DB读取
-    if db is not None:
-        for ts_code, key in [("XIN9", "a50_pct"), ("SPX", "spx_pct"),
-                              ("IXIC", "ixic_pct"), ("HSI", "hsi_pct")]:
-            df = db.query_df(
-                "SELECT pct_chg FROM global_index_daily "
-                "WHERE ts_code=? AND trade_date<=? ORDER BY trade_date DESC LIMIT 1",
-                (ts_code, target_date))
-            if df is not None and not df.empty:
-                result[key] = float(df.iloc[0]["pct_chg"])
-        if all(v is not None for v in result.values()):
-            return result
+    """获取全球指数涨跌幅。先实时拉Tushare拿最新，再用DB补缺。返回值含数据日期。"""
+    _INDICES = [("XIN9", "a50_pct"), ("SPX", "spx_pct"),
+                ("IXIC", "ixic_pct"), ("DJI", "dji_pct"), ("HSI", "hsi_pct")]
+    result = {key: None for _, key in _INDICES}
+    data_dates = {}  # key -> "YYYYMMDD"
 
-    # Fallback: Tushare实时
     dt = datetime.strptime(target_date, "%Y%m%d")
     start = (dt - timedelta(days=10)).strftime("%Y%m%d")
-    for ts_code, key in [("XIN9", "a50_pct"), ("SPX", "spx_pct"),
-                          ("IXIC", "ixic_pct"), ("HSI", "hsi_pct")]:
-        if result[key] is not None:
-            continue
+
+    # 第一步：先从 Tushare 实时拉取（可能比DB更新）
+    for ts_code, key in _INDICES:
         df = _safe_call(pro.index_global, ts_code=ts_code,
                         start_date=start, end_date=target_date,
                         fields="trade_date,close,pct_chg")
         if not df.empty:
             df = df.sort_values("trade_date", ascending=False)
             result[key] = float(df.iloc[0]["pct_chg"])
+            data_dates[key] = str(df.iloc[0]["trade_date"])
+            # 写入DB（增量更新）
+            if db is not None:
+                try:
+                    conn = sqlite3.connect(db._db_path, timeout=30)
+                    for _, row in df.iterrows():
+                        conn.execute(
+                            "INSERT OR REPLACE INTO global_index_daily "
+                            "(trade_date, ts_code, close, pct_chg) VALUES (?,?,?,?)",
+                            (str(row["trade_date"]), ts_code,
+                             float(row["close"]), float(row["pct_chg"])))
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+
+    # 第二步：Tushare 拉取失败的，从本地 DB 补缺
+    if db is not None:
+        for ts_code, key in _INDICES:
+            if result[key] is not None:
+                continue
+            df = db.query_df(
+                "SELECT trade_date, pct_chg FROM global_index_daily "
+                "WHERE ts_code=? AND trade_date<=? ORDER BY trade_date DESC LIMIT 1",
+                (ts_code, target_date))
+            if df is not None and not df.empty:
+                result[key] = float(df.iloc[0]["pct_chg"])
+                data_dates[key] = str(df.iloc[0]["trade_date"])
+
+    result["_data_dates"] = data_dates
     return result
 
 
@@ -451,7 +471,9 @@ def _get_etf_share(pro, trade_date: str) -> dict:
 
 def _calc_score(global_idx, breadth, volume, vol_env, price_pos,
                 north=None, margin=None, pcr_data=None, etf=None,
-                fut_hold=None):
+                fut_hold=None, target_date=None):
+    if target_date is None:
+        target_date = datetime.now().strftime("%Y%m%d")
     score = 0
     reasons = []
 
@@ -463,14 +485,37 @@ def _calc_score(global_idx, breadth, volume, vol_env, price_pos,
         elif a50 < -1.0: score -= 15; reasons.append(f"A50跌{a50:+.1f}%")
         elif a50 < -0.3: score -= 8
 
+    # 美股评分：过期数据降权，IXIC过期时用DJI替代
+    dates = global_idx.get("_data_dates", {})
     spx = global_idx.get("spx_pct")
     ixic = global_idx.get("ixic_pct")
-    if spx is not None and ixic is not None:
-        us = (spx + ixic) / 2
+    dji = global_idx.get("dji_pct")
+    spx_stale = dates.get("spx_pct", target_date) < target_date
+    ixic_stale = dates.get("ixic_pct", target_date) < target_date
+    dji_stale = dates.get("dji_pct", target_date) < target_date
+
+    # 选择美股第二指标：IXIC新鲜优先，否则用DJI
+    us2 = ixic if (ixic is not None and not ixic_stale) else (
+        dji if (dji is not None and not dji_stale) else ixic)
+    us2_stale = ixic_stale if us2 == ixic else dji_stale
+
+    if spx is not None and us2 is not None:
+        us = (spx + us2) / 2
+        # 过期数据降权：两个都过期→0.5x，一个过期→0.75x
+        if spx_stale and us2_stale:
+            us *= 0.5
+        elif spx_stale or us2_stale:
+            us *= 0.75
         if us > 1.0:   score += 10
         elif us > 0.3:  score += 5
         elif us < -1.0: score -= 10; reasons.append(f"美股跌{us:+.1f}%")
         elif us < -0.3: score -= 5
+    elif spx is not None:
+        us = spx * (0.5 if spx_stale else 1.0)
+        if us > 1.0:   score += 8
+        elif us > 0.3:  score += 4
+        elif us < -1.0: score -= 8
+        elif us < -0.3: score -= 4
 
     hsi = global_idx.get("hsi_pct")
     if hsi is not None:
@@ -622,12 +667,43 @@ def print_briefing(trade_date, direction, confidence, score,
     print(f"【方向判断】{direction} | 置信度: {_stars(confidence)} ({confidence}/5) | 评分: {score:+d}")
 
     print(f"\n【跨市场】")
+    dates = global_idx.get("_data_dates", {})
+
+    def _date_tag(key, expected_date):
+        """生成数据日期标注，延迟时加⚠"""
+        d = dates.get(key, "")
+        if not d:
+            return ""
+        d_fmt = f"{d[:4]}/{d[4:6]}/{d[6:]}" if len(d) == 8 else d
+        if d < expected_date:
+            return f" (⚠数据日: {d_fmt})"
+        return f" (数据日: {d_fmt})"
+
     a50 = global_idx.get("a50_pct")
-    print(f"  A50夜盘: {a50:+.2f}%" if a50 is not None else "  A50夜盘: N/A")
-    spx, ixic = global_idx.get("spx_pct"), global_idx.get("ixic_pct")
-    print(f"  美股: SPX {spx:+.1f}%  纳斯达克 {ixic:+.1f}%" if spx and ixic else "  美股: N/A")
+    print(f"  A50夜盘: {a50:+.2f}%{_date_tag('a50_pct', trade_date)}"
+          if a50 is not None else "  A50夜盘: N/A")
+    spx = global_idx.get("spx_pct")
+    ixic = global_idx.get("ixic_pct")
+    dji = global_idx.get("dji_pct")
+    if spx is not None:
+        spx_s = f"SPX {spx:+.1f}%"
+        ixic_s = f"纳斯达克 {ixic:+.1f}%{_date_tag('ixic_pct', trade_date)}" if ixic is not None else "纳斯达克 N/A"
+        print(f"  美股: {spx_s}  {ixic_s}{_date_tag('spx_pct', trade_date)}")
+    else:
+        print(f"  美股: N/A")
+    if dji is not None:
+        print(f"        道琼斯 {dji:+.1f}%{_date_tag('dji_pct', trade_date)}")
     hsi = global_idx.get("hsi_pct")
-    print(f"  恒生: {hsi:+.2f}%" if hsi is not None else "  恒生: N/A")
+    print(f"  恒生: {hsi:+.2f}%{_date_tag('hsi_pct', trade_date)}"
+          if hsi is not None else "  恒生: N/A")
+
+    # 美股数据延迟警告
+    spx_date = dates.get("spx_pct", "")
+    if spx_date and spx_date < trade_date:
+        days_late = (datetime.strptime(trade_date, "%Y%m%d")
+                     - datetime.strptime(spx_date, "%Y%m%d")).days
+        print(f"  ⚠ 美股数据延迟{days_late}天，当前显示为"
+              f"{spx_date[4:6]}/{spx_date[6:]}数据")
 
     print(f"\n【市场宽度】(昨日 {trade_date[:4]}/{trade_date[4:6]}/{trade_date[6:]})")
     print(f"  涨跌家数: {breadth['advance']}涨 / {breadth['decline']}跌 = {breadth['ad_ratio']:.1f}")
@@ -864,7 +940,7 @@ def run_briefing(target_date=None):
     score, reasons = _calc_score(
         global_idx, breadth, volume, vol_env, price_pos,
         north=north, margin=margin_data, pcr_data=pcr_data, etf=etf,
-        fut_hold=fut_hold)
+        fut_hold=fut_hold, target_date=prev_trade_date)
     direction, confidence = _score_to_direction(score)
     d_override = _calc_d_override(direction, confidence)
 

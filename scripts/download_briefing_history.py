@@ -83,7 +83,7 @@ def _next_date(date_str: str) -> str:
 def download_global_indices(pro, db: DBManager, start: str, end: str):
     """全球指数日线。"""
     print(f"\n=== 全球指数 ({start}~{end}) ===")
-    indices = ["XIN9", "SPX", "IXIC", "HSI"]
+    indices = ["XIN9", "SPX", "IXIC", "DJI", "HSI"]
     total = 0
     for ts_code in indices:
         # 按年下载
