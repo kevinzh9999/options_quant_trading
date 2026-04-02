@@ -713,7 +713,7 @@ SYMBOL_PROFILES: Dict[str, Dict] = {
     },
     "IF": {
         "style": "HYBRID",
-        "momentum_lookback_5m": 18,   # 90分钟（日内动量一致性79.4%最高）
+        "momentum_lookback_5m": 12,   # 60分钟（grid search验证12最优，之前配18但硬编码没生效）
         "momentum_lookback_15m": 6,   # 90分钟
         "momentum_lookback_daily": 20, # 20天实证最优
         "reversal_filter": True,
@@ -736,7 +736,7 @@ SYMBOL_PROFILES: Dict[str, Dict] = {
     },
     "IH": {
         "style": "MEAN_REVERSION",
-        "momentum_lookback_5m": 18,   # 90分钟
+        "momentum_lookback_5m": 12,   # 60分钟（grid search验证12最优）
         "momentum_lookback_15m": 6,
         "momentum_lookback_daily": 20,
         "reversal_filter": True,
@@ -958,7 +958,9 @@ class SignalGeneratorV2:
         is_high_vol: bool = True,
         d_override: Dict[str, float] | None = None,
     ) -> Dict | None:
-        if bar_5m is None or len(bar_5m) < MOM_5M_LOOKBACK + 1:
+        prof = SYMBOL_PROFILES.get(symbol, _DEFAULT_PROFILE)
+        lb_5m = prof.get("momentum_lookback_5m", MOM_5M_LOOKBACK)
+        if bar_5m is None or len(bar_5m) < lb_5m + 1:
             return None
         utc_time = _get_utc_time(bar_5m)
         if utc_time and (utc_time < NO_TRADE_BEFORE or utc_time > NO_TRADE_AFTER):
@@ -970,7 +972,7 @@ class SignalGeneratorV2:
         volume_5m = bar_5m["volume"].values
         current_close = float(close_5m[-1])
 
-        s_mom, mom_dir = self._score_momentum(close_5m, bar_15m, daily_bar)
+        s_mom, mom_dir = self._score_momentum(close_5m, bar_15m, daily_bar, lb_5m)
         s_vol, atr_short = self._score_volatility(high_5m, low_5m, close_5m)
         s_qty = self._score_volume(volume_5m, mom_dir)
 
@@ -1031,8 +1033,7 @@ class SignalGeneratorV2:
                 intraday_filter = self._intraday_filter_mild(intraday_return, mom_dir)
             adjusted *= intraday_filter
 
-        # 时段权重：用per-symbol session_multiplier（和v3一致）
-        prof = SYMBOL_PROFILES.get(symbol, _DEFAULT_PROFILE)
+        # 时段权重：用per-symbol session_multiplier（prof已在函数开头加载）
         tw = _get_session_weight(utc_time, prof["session_multiplier"]) if utc_time else 1.0
         adjusted *= tw
 
@@ -1068,10 +1069,11 @@ class SignalGeneratorV2:
             "is_high_vol": is_high_vol,
         }
 
-    def _score_momentum(self, close_5m, bar_15m, daily_bar) -> Tuple[int, str]:
-        if len(close_5m) < MOM_5M_LOOKBACK + 1:
+    def _score_momentum(self, close_5m, bar_15m, daily_bar,
+                         lookback_5m: int = MOM_5M_LOOKBACK) -> Tuple[int, str]:
+        if len(close_5m) < lookback_5m + 1:
             return 0, ""
-        mom_5m = (close_5m[-1] - close_5m[-MOM_5M_LOOKBACK - 1]) / close_5m[-MOM_5M_LOOKBACK - 1]
+        mom_5m = (close_5m[-1] - close_5m[-lookback_5m - 1]) / close_5m[-lookback_5m - 1]
         dir_5m = "LONG" if mom_5m > 0 else "SHORT" if mom_5m < 0 else ""
         mom_15m = 0.0
         dir_15m = ""
