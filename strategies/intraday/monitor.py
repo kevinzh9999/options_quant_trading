@@ -1172,6 +1172,9 @@ class IntradayMonitor:
 
             if act.get("action") == "OPEN":
                 if key in self._prompted_bars:
+                    # 撤销strategy.on_bar已创建的position_mgr占位
+                    # 否则孤儿占位永远不会清除，阻止后续所有同品种信号
+                    self.strategy.position_mgr.remove_by_symbol(sym)
                     continue
                 self._prompted_bars.add(key)
 
