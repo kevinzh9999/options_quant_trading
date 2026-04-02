@@ -1115,7 +1115,8 @@ class IntradayMonitor:
             filtered_actions.append(act)
         actions = filtered_actions
 
-        # 记录信号日志（每个品种都记，无信号也记 score=0，含维度明细）
+        # 暂存信号日志所需数据（延迟到信号发出之后再写DB，避免阻塞信号流程）
+        _signal_log_data = []
         action_syms = {a["symbol"] for a in actions if a.get("action") == "OPEN"}
         for sym in self.symbols:
             sig = self._get_latest_signal(sym, bar_data, bar_15m_data, quote_dict)
@@ -1123,9 +1124,7 @@ class IntradayMonitor:
             sc2 = self._latest_scores_v2.get(sym, {})
             sc3 = self._latest_scores_v3.get(sym, {})
             ver = SIGNAL_ROUTING.get(sym, "v2")
-            # 构建维度明细（从路由版本的score_all结果）
             routed_sc = sc3 if ver == "v3" else sc2
-            # 补充zscore（score_all的返回值中没有存zscore的值，从zscore_params算）
             zp = self._zscore_params.get(sym)
             cur_z = None
             if zp and sym in bar_data and len(bar_data[sym]) > 0:
@@ -1133,22 +1132,7 @@ class IntradayMonitor:
                 if cp > 0 and zp["std20"] > 0:
                     cur_z = (cp - zp["ema20"]) / zp["std20"]
             detail = {**routed_sc, "zscore": cur_z} if routed_sc else {"zscore": cur_z}
-            # 追加研究指标（fail-safe，不影响信号记录）
-            try:
-                ri = _calc_research_indicators(bar_data, sym)
-                detail.update(ri)
-            except Exception:
-                pass
-            self.recorder.record_signal(
-                current_time_utc, sym, sig, action_taken,
-                v2_score=sc2.get("total", 0),
-                v2_direction=sc2.get("direction", ""),
-                v3_score=sc3.get("total", 0),
-                v3_direction=sc3.get("direction", ""),
-                v3_style=sc3.get("style", ""),
-                signal_version=ver,
-                score_detail=detail,
-            )
+            _signal_log_data.append((sym, sig, action_taken, sc2, sc3, ver, detail))
 
         # 附加盘口数据到 action（供面板和决策确认显示）
         for act in actions:
@@ -1350,6 +1334,25 @@ class IntradayMonitor:
                     "fut_symbol": self._tq_symbols.get(sym, ""),
                 }
                 self._save_shadow_state()
+
+        # 延迟写入信号日志（信号发出之后，不阻塞信号流程）
+        # 研究指标在这里计算，即使耗时也不影响信号时效
+        for sym, sig, action_taken, sc2, sc3, ver, detail in _signal_log_data:
+            try:
+                ri = _calc_research_indicators(bar_data, sym)
+                detail.update(ri)
+            except Exception:
+                pass
+            self.recorder.record_signal(
+                current_time_utc, sym, sig, action_taken,
+                v2_score=sc2.get("total", 0),
+                v2_direction=sc2.get("direction", ""),
+                v3_score=sc3.get("total", 0),
+                v3_direction=sc3.get("direction", ""),
+                v3_style=sc3.get("style", ""),
+                signal_version=ver,
+                score_detail=detail,
+            )
 
     def _get_latest_signal(
         self,
