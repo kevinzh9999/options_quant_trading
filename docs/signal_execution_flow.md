@@ -55,7 +55,10 @@
               （09:45~11:20, 13:05~14:30）
                   │
                   ▼
-              写JSON + 注册shadow持仓
+              tradeable过滤（只有IM/IC进入position_mgr开仓）
+                  │
+                  ▼
+              prompted_bars去重 + 写JSON + 注册shadow持仓
 ```
 
 注意：daily_mult、intraday_filter、sentiment_mult 等乘数在 `score_all()` **内部**作用于分数，
@@ -215,9 +218,12 @@ shadow_positions[sym] ─▶ check_exit()
                           └── should_exit=True → 生成平仓信号
 ```
 
-**数据源区分**：
-- **退出条件判断**（布林带、ATR、中轨突破等）：使用**现货 K 线**（与回测一致）
-- **退出价格和 PnL**：使用**期货价格**（entry 和 exit 都用期货 bid/ask/last）
+**数据源区分（2026-04-02修复后的双价格层）**：
+- **止损/跟踪止盈/PnL判断**：使用**期货 last_price**（与 entry_price 同源）
+- **Bollinger zone/MID_BREAK**：使用**现货 close**（与 bar_5m 同源，通过 `spot_price` 参数传入）
+- **极值追踪**（highest_since/lowest_since）：使用**期货价格**
+- **退出价格和 PnL 记录**：使用**期货价格**（entry 和 exit 都用期货 bid/ask/last）
+- **回测**：全部使用现货（`spot_price=0` → fallback 到 `current_price`），不受影响
 
 **生成 CLOSE JSON**：
 
