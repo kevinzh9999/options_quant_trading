@@ -282,6 +282,67 @@ def _get_price_position(db: DBManager, trade_date: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Hurst 指数
+# ---------------------------------------------------------------------------
+
+def _calc_hurst(prices: np.ndarray) -> float:
+    """R/S分析法计算Hurst指数。H>0.5趋势，H<0.5均值回归，H≈0.5随机游走。"""
+    log_returns = np.diff(np.log(np.maximum(prices, 1e-10)))
+    n = len(log_returns)
+    if n < 8:
+        return 0.5
+    rs_list, sizes = [], []
+    for s in [2, 3, 4, 6, 8, 12, 16]:
+        w = int(n / s)
+        if w < 4:
+            continue
+        rs_values = []
+        for start in range(0, n - w + 1, w):
+            chunk = log_returns[start:start + w]
+            if len(chunk) < 4:
+                continue
+            m = np.mean(chunk)
+            cumdev = np.cumsum(chunk - m)
+            R = np.max(cumdev) - np.min(cumdev)
+            S = np.std(chunk, ddof=1)
+            if S > 1e-10 and R > 0:
+                rs_values.append(R / S)
+        if rs_values:
+            rs_list.append(np.mean(rs_values))
+            sizes.append(w)
+    if len(rs_list) < 2:
+        return 0.5
+    H = np.polyfit(np.log(sizes), np.log(rs_list), 1)[0]
+    return float(np.clip(H, 0.01, 0.99))
+
+
+def _get_hurst(db: DBManager, trade_date: str) -> dict:
+    """计算Hurst(60d)及历史分位。"""
+    result = {"hurst": None, "percentile": None, "regime": ""}
+    df = db.query_df(
+        "SELECT trade_date, close FROM index_daily "
+        "WHERE ts_code='000852.SH' AND trade_date<=? "
+        "ORDER BY trade_date DESC LIMIT 300",
+        (trade_date,))
+    if df is None or len(df) < 60:
+        return result
+    closes = df["close"].astype(float).values[::-1]  # 时间正序
+    h = _calc_hurst(closes[-60:])
+    result["hurst"] = h
+    # 历史分位（用全部可用数据的滚动Hurst）
+    if len(closes) >= 120:
+        hist = [_calc_hurst(closes[i-60:i]) for i in range(60, len(closes))]
+        result["percentile"] = float(sum(1 for x in hist if x <= h) / len(hist) * 100)
+    if h > 0.6:
+        result["regime"] = "趋势期"
+    elif h < 0.45:
+        result["regime"] = "震荡期"
+    else:
+        result["regime"] = "中性"
+    return result
+
+
+# ---------------------------------------------------------------------------
 # P2 指标
 # ---------------------------------------------------------------------------
 
@@ -659,7 +720,7 @@ def print_briefing(trade_date, direction, confidence, score,
                    reasons, d_override, contrarian_note="",
                    original_score=None,
                    north=None, margin=None, pcr_data=None, etf=None,
-                   fut_hold=None):
+                   fut_hold=None, hurst_info=None):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     print(f"\n{'═' * W}")
     print(f" Morning Briefing | {now_str}")
@@ -730,6 +791,23 @@ def print_briefing(trade_date, direction, confidence, score,
     print(f"  ATM IV: {iv_s} ({ip_s})  VRP: {vrp_s}")
     term = vol_env.get("term_structure", "")
     if term: print(f"  期限结构: {term}")
+
+    # Hurst
+    if hurst_info is None:
+        hurst_info = {}
+    h = hurst_info.get("hurst")
+    if h is not None:
+        hp = hurst_info.get("percentile")
+        regime = hurst_info.get("regime", "")
+        hp_s = f"P{hp:.0f}" if hp is not None else ""
+        regime_detail = ""
+        if regime == "趋势期":
+            regime_detail = "动量策略有利，卖方谨慎"
+        elif regime == "震荡期":
+            regime_detail = "均值回归有利，卖方有利"
+        else:
+            regime_detail = "中性"
+        print(f"  Hurst(60d): {h:.2f} ({hp_s} {regime}）→ {regime_detail}")
 
     print(f"\n【价格位置】")
     cur, h20, l20 = price_pos["current"], price_pos["high_20"], price_pos["low_20"]
@@ -924,6 +1002,8 @@ def run_briefing(target_date=None):
     vol_env = _get_vol_environment(db)
     print(f"  计算价格位置...")
     price_pos = _get_price_position(db, prev_trade_date)
+    print(f"  计算Hurst指数...")
+    hurst_info = _get_hurst(db, prev_trade_date)
 
     # P2 数据（优先本地DB，fallback到Tushare）
     print(f"  获取北向资金...")
@@ -961,7 +1041,7 @@ def run_briefing(target_date=None):
                    global_idx, breadth, volume, vol_env, price_pos,
                    reasons, d_override, contrarian_note, original_score,
                    north=north, margin=margin_data, pcr_data=pcr_data, etf=etf,
-                   fut_hold=fut_hold)
+                   fut_hold=fut_hold, hurst_info=hurst_info)
 
     db_path = ConfigLoader().get_db_path()
     save_data = {

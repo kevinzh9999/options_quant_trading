@@ -38,6 +38,41 @@ W = 80  # 面板宽度
 
 
 # ---------------------------------------------------------------------------
+# Hurst 指数
+# ---------------------------------------------------------------------------
+
+def _calc_hurst_rs(prices: np.ndarray) -> float:
+    """R/S分析法计算Hurst指数。H>0.5趋势，H<0.5均值回归。"""
+    log_returns = np.diff(np.log(np.maximum(prices, 1e-10)))
+    n = len(log_returns)
+    if n < 8:
+        return 0.5
+    rs_list, sizes = [], []
+    for s in [2, 3, 4, 6, 8, 12, 16]:
+        w = int(n / s)
+        if w < 4:
+            continue
+        rs_values = []
+        for start in range(0, n - w + 1, w):
+            chunk = log_returns[start:start + w]
+            if len(chunk) < 4:
+                continue
+            m = np.mean(chunk)
+            cumdev = np.cumsum(chunk - m)
+            R = np.max(cumdev) - np.min(cumdev)
+            S = np.std(chunk, ddof=1)
+            if S > 1e-10 and R > 0:
+                rs_values.append(R / S)
+        if rs_values:
+            rs_list.append(np.mean(rs_values))
+            sizes.append(w)
+    if len(rs_list) < 2:
+        return 0.5
+    H = np.polyfit(np.log(sizes), np.log(rs_list), 1)[0]
+    return float(np.clip(H, 0.01, 0.99))
+
+
+# ---------------------------------------------------------------------------
 # 数据加载
 # ---------------------------------------------------------------------------
 
@@ -262,8 +297,16 @@ def _calc_direction_score(daily: pd.DataFrame) -> tuple[int, dict]:
 def determine_quadrant(
     iv_pctile: float, direction_score: int, vrp: float,
     term_structure: str = "", iv_change_pp: float = 0,
+    hurst: float = 0.5,
 ) -> tuple[str, str]:
-    """返回 (象限名, 子状态描述)。综合IV/VRP/期限结构/IV变动判定。"""
+    """返回 (象限名, 子状态描述)。综合IV/VRP/Hurst/期限结构/IV变动判定。
+
+    高IV象限按Hurst细分：
+      A1: 高IV+VRP>0+震荡 — 卖方最佳甜点区
+      A2: 高IV+VRP>0+趋势 — 顺势卖方可以，逆势危险
+      B1: 高IV+VRP<0+震荡 — 等待VRP转正，可小仓卖方
+      B2: 高IV+VRP<0+趋势 — 最危险，禁止卖方
+    """
     iv_high = iv_pctile >= 70
     iv_low = iv_pctile <= 30
     bullish = direction_score >= 2
@@ -271,35 +314,29 @@ def determine_quadrant(
     is_inverted = "倒挂" in term_structure
     vrp_negative = vrp < 0
     iv_surging = iv_change_pp > 3
+    trending = hurst > 0.55
 
     if iv_high:
-        # 检查B象限特征：VRP<0 或 期限倒挂 或 IV急升
+        # B象限特征：VRP<0 或 期限倒挂 或 IV急升
         b_signal = vrp_negative or is_inverted or iv_surging
 
-        if b_signal:
-            if vrp_negative:
-                if bearish:
-                    return "B1", "高IV+偏空+RV>IV（恐慌进行中，禁止卖方）"
-                elif bullish:
-                    return "A(VRP警告)", "高IV+偏多但VRP<0（卖方需保护，不加仓）"
-                else:
-                    return "B1", "高IV+VRP<0（RV>IV，禁止卖方）"
+        if b_signal and vrp_negative:
+            if trending:
+                return "B2", "高IV+VRP<0+趋势（最危险，禁止卖方，纯买方或对冲）"
             else:
-                # 期限倒挂或IV急升但VRP>0
-                if bearish:
-                    return "B2", "高IV+偏空+IV>RV（恐慌见顶，可卖Vega）"
-                elif bullish:
-                    return "A", "高IV+偏多（卖Strangle，注意期限结构）"
-                else:
-                    return "B2", "高IV+方向中性+倒挂/IV急升（谨慎卖方）"
+                return "B1", "高IV+VRP<0+震荡（等VRP转正，可小仓卖方）"
+        elif b_signal:
+            # 期限倒挂或IV急升但VRP>0
+            if trending:
+                return "A2", "高IV+VRP>0+趋势+倒挂/IV急升（顺势卖方可以，注意方向）"
+            else:
+                return "A1", "高IV+VRP>0+震荡+倒挂/IV急升（卖方可以但谨慎）"
         else:
             # 纯A象限：IV高+VRP>0+正常期限结构
-            if bullish:
-                return "A", "高IV+偏多（卖Strangle最佳窗口）"
-            elif bearish:
-                return "B2", "高IV+偏空+IV>RV（恐慌见顶，可卖Vega）"
+            if trending:
+                return "A2", "高IV+VRP>0+趋势（顺势卖方可以，逆势危险）"
             else:
-                return "A/B边界", "高IV+方向不明确（观望或小仓位卖方）"
+                return "A1", "高IV+VRP>0+震荡（卖方最佳甜点区）"
     elif iv_low:
         if bullish:
             return "C", "低IV+偏多（买Call / IM+Put吃贴水）"
@@ -393,31 +430,45 @@ def evaluate_position_match(quadrant: str, pos_info: dict, vrp: float = 0) -> tu
 
     q = quadrant.split("/")[0].split("→")[0].strip()  # 提取主象限
 
-    if q == "A" or q == "A(VRP警告)":
+    if q == "A1":
+        # 震荡+VRP>0 — 卖方最佳
+        if is_str:
+            return "✅", "最佳匹配（震荡市卖方Strangle赚Theta）"
+        if is_sv:
+            return "✅", "匹配（震荡市卖方有利）"
+        if not is_sv:
+            return "⚠️", "不匹配（A1是卖方甜点区，应该做卖方）"
+
+    elif q == "A2":
+        # 趋势+VRP>0 — 顺势卖方可以
+        if is_sv:
+            return "🟡", "注意：趋势市卖方需确保持仓方向和趋势一致，逆势端加保护"
+        if not is_sv:
+            return "🟡", "中性（趋势市可顺势卖方，但不如A1安全）"
+
+    elif q == "A" or q == "A(VRP警告)":
         if vrp < 0 and is_sv:
             return "⚠️", "注意: 卖方持仓但VRP<0，卖的是便宜保险，不要加仓"
         if is_str:
-            return "✅", "匹配（卖方Strangle在高IV+偏多中赚钱）"
-        if has_sp and not has_sc:
-            return "🟡", "部分匹配（可考虑加Call端构成Strangle）"
-        if has_sc and not has_sp:
-            return "🟡", "部分匹配（可考虑加Put端构成Strangle）"
+            return "✅", "匹配（卖方Strangle在高IV中赚钱）"
         if not is_sv:
             return "⚠️", "不匹配（应该做卖方）"
 
     elif q == "B1":
+        # 震荡+VRP<0 — 等待
         if is_sv:
-            return "🔴", "危险！B1禁止卖方，VRP<0意味着RV>IV，卖方在亏钱"
+            return "🔴", "危险！B1 VRP<0卖方在亏钱，但震荡期风险可控，减仓观望"
         if has_lp:
-            return "✅", "匹配（买方在恐慌中赚Gamma）"
-        return "🟡", "中性（考虑买Put对冲）"
+            return "✅", "匹配（买方对冲）"
+        return "🟡", "中性（等VRP转正再开卖方）"
 
     elif q == "B2":
-        if is_str:
-            return "✅", "匹配（恐慌见顶卖Vega）"
+        # 趋势+VRP<0 — 最危险
         if is_sv:
-            return "🟡", "部分匹配（检查VRP是否已转正）"
-        return "⚠️", "偏空（可开始建立卖方仓位）"
+            return "🔴", "极度危险！B2趋势市+VRP<0，禁止卖方，建议立即减仓或买保护"
+        if has_lp:
+            return "✅", "匹配（买方在单边市赚Gamma）"
+        return "⚠️", "B2最危险象限（考虑买Put对冲或离场）"
 
     elif q == "C":
         if is_sv:
@@ -500,6 +551,8 @@ def print_panel(
     term_structure: str = "",
     iv_change_pp: float = 0,
     db: DBManager = None,
+    hurst: float = 0.5,
+    hurst_pctile: float = None,
 ):
     """输出完整面板。"""
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -529,6 +582,10 @@ def print_panel(
     if term_structure:
         ts_warn = " ⚠" if "倒挂" in term_structure else ""
         print(f"  期限结构      : {term_structure}{ts_warn}")
+    h_tag = "强趋势期" if hurst > 0.6 else ("趋势期" if hurst > 0.55
+             else "震荡期" if hurst < 0.45 else "中性")
+    hp_s = f"P{hurst_pctile:.0f}, " if hurst_pctile is not None else ""
+    print(f"  Hurst(60d)    : {hurst:.2f} ({hp_s}{h_tag})")
 
     # 方向状态
     mom = dir_detail.get("mom_5d", 0)
@@ -641,10 +698,30 @@ def run_once(db: DBManager, prev_quadrant: str = "",
     # 方向
     direction_score, dir_detail = _calc_direction_score(daily)
 
-    # 象限（综合VRP+期限结构+IV变动）
+    # Hurst指数（60天窗口，日频更新）
+    hurst_val = 0.5
+    hurst_pctile = None
+    try:
+        hdf = db.query_df(
+            "SELECT close FROM index_daily WHERE ts_code='000852.SH' "
+            "ORDER BY trade_date DESC LIMIT 300")
+        if hdf is not None and len(hdf) >= 60:
+            _closes = hdf["close"].astype(float).values[::-1]
+            hurst_val = _calc_hurst_rs(_closes[-60:])
+            if len(_closes) >= 120:
+                _hist = [_calc_hurst_rs(_closes[i-60:i])
+                         for i in range(60, len(_closes))]
+                hurst_pctile = float(
+                    sum(1 for x in _hist if x <= hurst_val)
+                    / len(_hist) * 100)
+    except Exception:
+        pass
+
+    # 象限（综合VRP+期限结构+IV变动+Hurst）
     quadrant, quad_desc = determine_quadrant(
         iv_pctile, direction_score, vrp,
-        term_structure=term_structure, iv_change_pp=iv_change_pp)
+        term_structure=term_structure, iv_change_pp=iv_change_pp,
+        hurst=hurst_val)
 
     # 持仓
     pos_info = _parse_positions(positions)
@@ -683,7 +760,7 @@ def run_once(db: DBManager, prev_quadrant: str = "",
         pos_icon, pos_desc, pos_info,
         discount, account, switch_alert,
         term_structure=term_structure, iv_change_pp=iv_change_pp,
-        db=db,
+        db=db, hurst=hurst_val, hurst_pctile=hurst_pctile,
     )
 
     return quadrant

@@ -92,6 +92,17 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - GARCH 模型参数本身不改，只改下游使用方式
 - `garch_reliable` 字段写入 `daily_model_output`
 
+### Hurst指数 Regime Detection（2026-04-02新增）
+- **R/S分析法计算Hurst(60d)**，用日线close滚动60天窗口
+- H>0.55 趋势期，H<0.45 震荡期，0.45-0.55 中性
+- 当前仅用于象限判断和面板显示，**不参与信号评分**（待数据积累后验证）
+- 象限体系升级：高IV象限按Hurst细分为A1/A2/B1/B2
+  - A1: 高IV+VRP>0+震荡 → 卖方最佳甜点区
+  - A2: 高IV+VRP>0+趋势 → 顺势卖方可以，逆势危险
+  - B1: 高IV+VRP<0+震荡 → 等VRP转正，可小仓卖方
+  - B2: 高IV+VRP<0+趋势 → 最危险，禁止卖方
+- Morning Briefing 和 quadrant_monitor 均输出 Hurst 值和历史分位
+
 ### 情绪乘数 sentiment_mult（2026-03-26修正）
 - VRP 不参与日内信号的情绪打折（VRP是波动率交易指标，与日内方向无关）
 - 保留的调节因子：IV变动、Skew变化、PCR逆向、期限结构倒挂
