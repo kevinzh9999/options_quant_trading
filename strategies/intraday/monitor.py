@@ -1036,6 +1036,8 @@ class IntradayMonitor:
                 act["last"] = qd.get("last_price", 0)
 
         # 更新影子持仓（每根K线用与回测相同的exit逻辑检查）
+        # 注意：shadow entry_price是期货价格，所以check_exit也必须用期货价格
+        # 否则贴水导致现货-期货价差 > 0.5%，SHORT持仓一开仓就假触发STOP_LOSS
         utc_hm = datetime.utcnow().strftime("%H:%M")
         trade_date = datetime.now().strftime("%Y%m%d")
         for sym in list(self._shadow_positions.keys()):
@@ -1043,20 +1045,30 @@ class IntradayMonitor:
             b5 = bar_data.get(sym)
             if b5 is None or len(b5) < 2:
                 continue
-            cur_price = float(b5.iloc[-1]["close"])
-            high = float(b5.iloc[-1]["high"])
-            low = float(b5.iloc[-1]["low"])
+            # 价格分两层：期货价用于止损/PnL，现货价用于Bollinger zone
+            spot_price = float(b5.iloc[-1]["close"])
+            fq = fut_quotes.get(sym)
+            fut_price = 0.0
+            if fq is not None:
+                try:
+                    fp = float(fq.last_price)
+                    if fp > 0:
+                        fut_price = fp
+                except Exception:
+                    pass
+            cur_price = fut_price if fut_price > 0 else spot_price
+
             b15 = bar_15m_data.get(sym)
             b15_arg = b15 if (b15 is not None and len(b15) > 0) else None
-            # Update extremes
+            # Update extremes — 用期货价格（与entry_price同源）
             if sp["direction"] == "LONG":
-                sp["highest_since"] = max(sp.get("highest_since", sp["entry_price"]), high)
+                sp["highest_since"] = max(sp.get("highest_since", sp["entry_price"]), cur_price)
             else:
-                sp["lowest_since"] = min(sp.get("lowest_since", sp["entry_price"]), low)
+                sp["lowest_since"] = min(sp.get("lowest_since", sp["entry_price"]), cur_price)
             exit_info = check_exit(
                 sp, cur_price, b5, b15_arg,
                 utc_hm, reverse_signal_score=0, is_high_vol=self._is_high_vol,
-                symbol=sym,
+                symbol=sym, spot_price=spot_price,
             )
             if exit_info["should_exit"]:
                 reason = exit_info["exit_reason"]
@@ -1117,7 +1129,7 @@ class IntradayMonitor:
                     except Exception:
                         pass
                 close_signal = {
-                    "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "symbol": sym,
                     "contract": self._tq_symbols.get(sym, ""),
                     "direction": d_s,
@@ -1165,8 +1177,7 @@ class IntradayMonitor:
                 sugg_lots = self._calc_suggested_lots(last, sym)
 
                 # 写信号JSON供executor（只有实盘品种）
-                _TRADEABLE = {"IM", "IC"}  # IF观察中，IH放弃日内
-                if sym in _TRADEABLE:
+                if sym in self.strategy.tradeable:
                     self._write_signal_file(act, current_time_utc)
 
                 # 面板打印信号（不等确认）

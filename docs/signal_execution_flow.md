@@ -428,9 +428,9 @@ main() 启动
 查询当天 order_log WHERE status='FILLED'
   │
   ▼
-按品种汇总：
-  action=OPEN  → 对应方向加仓
-  action=CLOSE/LOCK → 对应方向减仓
+两遍扫描（2026-04-02修复，不依赖timestamp排序）：
+  第1遍：只处理 action=OPEN → 对应方向加仓
+  第2遍：只处理 action=CLOSE/LOCK → 对应方向减仓
   │
   ▼
 net_long - net_short ≠ 0 → 写入 positions 字典
@@ -438,6 +438,10 @@ net_long - net_short ≠ 0 → 写入 positions 字典
   ▼
 打印: "从order_log恢复持仓: IM 多1手@7648"
 ```
+
+**为什么两遍扫描**：CLOSE信号的timestamp曾用UTC（01:50），OPEN用北京时间（09:50），
+导致LOCK排在OPEN前面，先减后加算出错误净持仓。两遍扫描彻底避免排序依赖。
+（CLOSE信号timestamp已统一为北京时间，但两遍扫描作为防御保留。）
 
 **恢复后**由 `_reconcile_positions()` 用 TQ 实盘数据二次校正——如果 order_log 和 TQ 实际不一致（如手动操作），以 TQ 为准。
 
@@ -483,10 +487,15 @@ order_log 推断  →  TQ 实盘校正  →  最终 positions
 
 股指期货日内平仓用锁仓代替（避免平今手续费 10 倍）。
 
-**次日流程**：
-1. Executor 启动时 `_check_locked_positions()` 查询 `order_log` 表中 `action='LOCK'` 的记录
-2. 打印提醒：哪些品种需要双向平仓
-3. 操作者在盘中**手动**平仓（双向都用 CLOSE，平昨仓手续费低）
+**次日流程**（2026-04-02改进，TQ对账+resolved标记）：
+1. Executor 启动时 `_check_locked_positions()` 查询 `order_log` 表中 `action='LOCK' AND lock_resolved IS NULL` 的记录
+2. **TQ实盘验证**：查TQ持仓，检查品种是否同时有long>0和short>0（锁仓特征）
+3. TQ无锁仓 → 自动标记 `lock_resolved='TQ无锁仓持仓'`，不再提示
+4. TQ确认有锁仓 → 打印提醒（含"TQ确认"标注）
+5. 操作者按y → 标记 `lock_resolved='操作者确认平仓'`，盘中手动双向平仓（CLOSE，平昨仓手续费低）
+6. 操作者按n → 稍后处理，下次启动仍提示
+
+**注意**：`_check_locked_positions` 在TQ连接建立之后调用（不在之前），确保能查实盘持仓。
 
 ---
 

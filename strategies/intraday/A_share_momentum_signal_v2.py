@@ -345,12 +345,18 @@ def check_exit(
     reverse_signal_score: int = 0,
     is_high_vol: bool = True,
     symbol: str = "",
+    spot_price: float = 0.0,
 ) -> dict:
     """
     Multi-timeframe Bollinger exit system.
 
     Priority: EOD > StopLoss > Lunch > TrailingStop > TrendComplete >
               MomentumExhausted > MidBreak > TimeStop
+
+    Price convention (live monitor):
+      - current_price / highest / lowest / entry_price: 期货价格（止损/跟踪止盈/PnL）
+      - spot_price: 现货价格（Bollinger zone判断，与bar_5m/bar_15m同源）
+      - 回测时 spot_price=0 → fallback 到 current_price（回测全用现货）
     """
     entry_price = position["entry_price"]
     direction = position["direction"]
@@ -359,6 +365,9 @@ def check_exit(
     lowest = position.get("lowest_since", entry_price)
     volume = position.get("volume", 1)
     bars_below_mid = position.get("bars_below_mid", 0)
+
+    # Bollinger zone判断用现货价格（与bar_5m同源），回测时fallback到current_price
+    boll_price = spot_price if spot_price > 0 else current_price
 
     NO_EXIT = {"should_exit": False, "exit_volume": 0,
                "exit_reason": "", "exit_urgency": "NORMAL"}
@@ -408,13 +417,13 @@ def check_exit(
         c5 = bar_5m["close"].astype(float)
         b5_mid, b5_std = _calc_boll(c5)
         if not np.isnan(b5_mid) and b5_std > 0:
-            zone_5m = _boll_zone(current_price, b5_mid, b5_std)
+            zone_5m = _boll_zone(boll_price, b5_mid, b5_std)
 
     if bar_15m is not None and len(bar_15m) >= 20:
         c15 = bar_15m["close"].astype(float)
         b15_mid, b15_std = _calc_boll(c15)
         if not np.isnan(b15_mid) and b15_std > 0:
-            zone_15m = _boll_zone(current_price, b15_mid, b15_std)
+            zone_15m = _boll_zone(boll_price, b15_mid, b15_std)
 
     # Hold time (used by P3 trailing stop and P5 momentum exhausted)
     hold_minutes = 0
@@ -503,10 +512,10 @@ def check_exit(
     # 5m breaks mid but 15m still above → just a pullback, hold
     if zone_5m and not np.isnan(b5_mid):
         if direction == "LONG":
-            five_below = current_price < b5_mid
+            five_below = boll_price < b5_mid
             fifteen_below = zone_15m in ("MID_LOWER", "LOWER_ZONE", "BELOW_LOWER") if zone_15m else False
         else:
-            five_below = current_price > b5_mid
+            five_below = boll_price > b5_mid
             fifteen_below = zone_15m in ("MID_UPPER", "UPPER_ZONE", "ABOVE_UPPER") if zone_15m else False
 
         if five_below:

@@ -164,24 +164,26 @@ score_all 接收 `bar_5m_signal`（已排除当前bar），内部所有计算基
 - 当前行为：`k5.iloc[:-1]` 和 `k15.iloc[:-1]` 排除TQ的forming bar
 - 与backtest的 `bar_5m.iloc[:-1]` 一致 ✅
 
-### [F19] monitor shadow exit的cur_price — ⚠ 存在差异
-- 代码位置：monitor.py 第1032行
-- 当前行为：`cur_price = float(b5.iloc[-1]["close"])`（最后一根完成bar的close）
-- 但exit_price用期货 `fq.last_price`（实时tick价格，第1054行）
-- 差异分析：
-  - **exit判断**（stop loss/trailing stop等）用现货完成bar close → 与backtest一致
-  - **exit执行价格**用期货实时tick价格 → 与backtest不同（backtest用现货bar_T close）
-  - 这导致shadow的P&L基于期货价格，backtest的P&L基于现货价格
-- 严重程度：**中等**。这是价格来源差异（期货vs现货），非数据泄漏
+### [F19] monitor shadow exit的cur_price — ✅ 2026-04-02修复
+- **修复前问题**：`cur_price = float(b5.iloc[-1]["close"])`（现货close），但entry_price是期货bid1/ask1
+  - IM贴水3-4%，SHORT持仓一开仓就"亏损3.5%"，瞬间假触发STOP_LOSS
+  - 同理 Bollinger zone 判断用期货价对比现货布林带，zone分类完全错误
+- **修复后**：`check_exit` 新增 `spot_price` 参数，实现双价格层：
+  - 止损/跟踪止盈/PnL → 用 `current_price`（期货last_price，与entry_price同源）
+  - Bollinger zone/MID_BREAK → 用 `boll_price`（现货close，与bar_5m同源）
+  - `highest_since`/`lowest_since` 极值追踪 → 用期货价格
+  - 回测不传 `spot_price`（默认0 → fallback到current_price），回测全用现货不受影响
+- **exit_price**用期货 `fq.last_price`（与entry同源）
+- 严重程度：**已修复**。修复前是critical bug（实盘假止损），不是差异
 
-### [F20] monitor entry价格 — ⚠ 存在差异
-- 代码位置：monitor.py 第1167-1168行
+### [F20] monitor entry价格 — ⚠ 存在差异（设计选择）
+- 代码位置：monitor.py shadow注册处
 - 当前行为：shadow entry_price = 期货盘口 ask1（LONG）或 bid1（SHORT）
 - 与backtest差异：backtest entry_price = 现货bar_T的close + slippage
 - 差异分析：
   - Monitor用实时期货盘口价（更贴近实盘执行）
   - Backtest用现货close（更稳定但与实际交易标的不同）
-  - 两者相差约 spot-futures basis（今天约270点）
+  - 两者相差约 spot-futures basis（IM约270点，3-4%）
 - 严重程度：**低**。这是设计选择而非数据泄漏。P&L点数差异主要来自basis
 
 ---
@@ -193,14 +195,14 @@ score_all 接收 `bar_5m_signal`（已排除当前bar），内部所有计算基
 | # | 问题 | 严重程度 | 状态 |
 |---|------|---------|------|
 | D13 | 止损用bar close判断而非high/low | 中等 | ✅ 已修复（commit 4b64bce） |
+| F19 | check_exit现货/期货价格混用导致假止损 | **严重** | ✅ 已修复（2026-04-02，双价格层） |
 
 ### ⚠ 差异（非泄漏但影响可比性）
 
 | # | 问题 | 严重程度 | 影响 |
 |---|------|---------|------|
 | D13-NOTE | 同bar极值更新+trailing stop矛盾 | 低 | 偶尔出现不可能的同bar新高+止盈 |
-| F19 | shadow exit用期货tick价，backtest用现货close | 中等 | P&L不可直接比较 |
-| F20 | shadow entry用期货盘口价，backtest用现货close | 低 | 同上 |
+| F20 | shadow entry用期货盘口价，backtest用现货close | 低 | P&L不可直接比较（设计选择） |
 | A3-NOTE | session_weight时间偏移5分钟 | 极低 | 与monitor一致 |
 | B7-NOTE | GARCH/sentiment硬编码IM | 功能问题 | 非IM品种波动率判断不精确 |
 | E17 | MID_BREAK用execution price对比signal bars Bollinger | 极低 | 合理的时序行为 |
@@ -211,8 +213,9 @@ A1, A2, A3, B4, B5, B6, B7, C8, C9, C10, D11, D12, E14, E15, E16, F18
 
 ---
 
-## 修复状态（2026-04-01更新）
+## 修复状态（2026-04-02更新）
 
 1. **D13（止损）**：✅ 已修复（commit 4b64bce）。check_exit前用bar high/low检查止损位，exit_price=stop_price。修复后PnL+72pt。
-2. **F19/F20（价格来源）**：待定。需要积累期货分钟K线后改backtest P&L计算。
-3. **D13-NOTE（同bar极值矛盾）**：已通过止损优先级修复缓解（止损在极值更新前检查）。
+2. **F19（现货/期货混用）**：✅ 已修复（2026-04-02）。check_exit双价格层：止损用期货，Bollinger用现货。修复前IM/IC做空一开仓就假止损。
+3. **F20（entry价格差异）**：设计选择，不修。Monitor用期货盘口价更贴近实盘。
+4. **D13-NOTE（同bar极值矛盾）**：已通过止损优先级修复缓解（止损在极值更新前检查）。

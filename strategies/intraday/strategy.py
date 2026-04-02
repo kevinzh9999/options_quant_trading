@@ -52,6 +52,10 @@ class IntradayConfig(StrategyConfig):
     stop_loss_bps: int = 100
     use_lock: bool = True
 
+    # 可交易品种（只有这些品种会开仓占用position_mgr槽位）
+    # 非交易品种仍然生成评分供面板显示，但不开仓
+    tradeable: set = field(default_factory=lambda: {"IM", "IC"})
+
     # 移动止盈
     trailing_stop_levels: list = field(default_factory=lambda: [
         {"profit_bps": 50, "lock_bps": 0},
@@ -106,6 +110,7 @@ class IntradayStrategy(BaseStrategy):
         self.risk_mgr = IntradayRiskManager(risk_cfg)
 
         self.symbols = list(config.universe)
+        self.tradeable = set(config.tradeable)
 
     # ------------------------------------------------------------------
     # BaseStrategy 接口（日线级别 — 日内策略主要用 on_bar）
@@ -155,7 +160,9 @@ class IntradayStrategy(BaseStrategy):
         actions: List[Dict] = []
         time_str = current_time.split(" ")[-1][:5]
 
-        # 当前价格
+        # 当前价格（用现货close，与entry_price/stop_loss同源）
+        # strategy层的position_mgr在monitor中只做占位管理，
+        # 实际止损/PnL由monitor的shadow系统用期货价格处理
         prices: Dict[str, float] = {}
         for sym in self.symbols:
             if sym in bar_data and len(bar_data[sym]) > 0:
@@ -201,12 +208,15 @@ class IntradayStrategy(BaseStrategy):
         # 3. 按强度排序
         signals.sort(key=lambda s: s.score, reverse=True)
 
-        # 4. 逐信号处理
+        # 4. 逐信号处理（只有tradeable品种进入position_mgr开仓）
         for sig in signals:
+            if sig.symbol not in self.tradeable:
+                continue
             allowed, reason = self.risk_mgr.check_pre_trade(
                 sig, self.position_mgr
             )
             if not allowed:
+                logger.debug(f"[STRATEGY] {sig.symbol} BLOCKED by risk_mgr: {reason}")
                 continue
 
             # 矛盾持仓处理

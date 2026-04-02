@@ -49,6 +49,16 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - 期货只用于：面板显示价格、计算贴水、归档、实际下单
 - 数据表：`index_min`（现货5分钟K线）、`index_daily`（现货日线）
 
+### 现货/期货价格分层（2026-04-02修复，重要！）
+- **IM贴水3-4%，IC贴水2-3%，同一计算中混用现货和期货价格会导致严重错误**
+- **信号评分**（score_all）：全部用现货（布林带/RSI/动量/成交量）
+- **持仓管理**（check_exit止损/跟踪止盈/PnL）：全部用期货（与entry_price同源）
+- **Bollinger平仓zone**：用现货价格（与bar_5m同源），通过 `spot_price` 参数传入check_exit
+- check_exit 的 `spot_price` 参数：实盘传现货close，回测传0（fallback到current_price，回测全用现货）
+- **历史教训**：shadow entry_price=期货bid1，check_exit用现货close做止损判断，贴水3.5%直接假触发STOP_LOSS
+- `highest_since`/`lowest_since` 极值追踪也必须用期货价格（与entry_price同源）
+- strategy.py 的 position_mgr 用现货价格（与信号entry_price/stop_loss同源，只做占位不做实际止损）
+
 ### 信号架构统一（2026-03-25修复）
 - `strategy.py` 必须使用 `A_share_momentum_signal_v2.py` 的 `SignalGeneratorV2`
 - 不能用旧版 `signal.py` 的 `IntradaySignalGenerator`
@@ -103,8 +113,8 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 | IF | 均值回归 | 观察 | 60 | 1.0/1.0 | v2 | +255 | +2.5 | 1.2 |
 | IH | — | 放弃 | 60 | 1.2/0.8 | v2 | +106 | +1.1 | 0.6 |
 
-- **实盘品种**：IM+IC，executor只对这两个品种写信号文件
-- **IF观察**：monitor全品种监控+shadow记录，但不写信号给executor。IF的BE=1.2pt余量小，等shadow验证2-4周后决定
+- **实盘品种**：IM+IC，`IntradayConfig.tradeable = {"IM", "IC"}`，只有这两个品种通过strategy开仓占position_mgr槽位、写信号给executor、注册shadow持仓
+- **IF观察**：monitor全品种监控面板显示评分，但不占position_mgr槽位、不触发开仓。IF的BE=1.2pt余量小，等shadow验证2-4周后决定
 - **IH放弃日内**：BE=0.6pt无法覆盖滑点+手续费
 - IC的thr=65：60-64分是"死亡区间"（26笔38%WR -7.1pt/笔），thr=65砍掉后+125%
 - IF的dm=1.0/1.0：IF逆势59%WR是利润主力，中性dm比惩罚逆势(0.8)+75%
@@ -114,7 +124,7 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - **默认阈值 60**（从55上调），IC例外用65（SYMBOL_PROFILES.signal_threshold）
 - 可通过 `--threshold` 参数覆盖回测阈值
 
-### Monitor/Executor 职责分离（2026-03-31重构）
+### Monitor/Executor 职责分离（2026-03-31重构，04-02补充）
 - **Monitor只负责信号生成**：评分→写`tmp/signal_pending.json`→注册shadow持仓→面板显示。不prompt，不阻塞
 - **Monitor额外职责**：每5分钟bar更新时写出期货持仓到`tmp/futures_positions.json`供executor对账
 - **Executor负责交易执行**：轮询JSON(1秒)→展示→确认→TQ限价单→撤单→记录
@@ -125,6 +135,9 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - Monitor exit触发时写CLOSE JSON供executor平仓
 - shadow trades用期货价格记录entry/exit/PnL（不是现货）
 - **SHADOW面板浮盈基准**：用期货last_price（与entry_price一致），fallback现货close
+- **CLOSE信号timestamp**：用`datetime.now()`（北京时间），与OPEN信号一致（不用utcnow）
+- **两进程完全独立**：Monitor不知道executor做了什么，executor不读position_mgr。通过JSON文件单向通信。executor自己跟TQ对账，自己判断是否执行信号
+- **position_mgr角色**：纯占位计数器（控制can_open/max_total_lots），不做实际止损/PnL。实际持仓管理由shadow系统（monitor端）和positions字典（executor端）分别负责
 
 ### Monitor 盘中重启状态恢复（2026-04-01修复）
 - **问题**：重启后position_mgr.positions清空，`_total_net_lots()=0`，突破max_total_lots=2限制
@@ -146,8 +159,10 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - signal_json保留原始JSON留底
 - 撤单机制：开仓60秒/平仓30秒未成交自动撤单，平仓未成交自动以激进价追单
 - 持仓追踪：executor内部`_positions`字典，无持仓忽略CLOSE、重复开仓跳过
-- 持仓恢复：启动时从`order_log`推断当天净持仓（OPEN-CLOSE/LOCK），再用TQ实盘对账校正。解决盘中重启后positions丢失的问题
+- 持仓恢复：启动时从`order_log`推断当天净持仓（两遍扫描：先OPEN再CLOSE/LOCK，不依赖timestamp排序），再用TQ实盘对账校正
 - 持仓对账：每60秒读取`tmp/futures_positions.json`（monitor写出），与内部positions对账；TQ无持仓但executor有记录→自动清除
+- **锁仓检查TQ对账**（2026-04-02修复）：启动时查`order_log`中未resolved的LOCK记录→TQ查实际持仓验证→TQ无锁仓自动标记`lock_resolved`→有锁仓才提示。`order_log`新增`lock_resolved`列
+- **历史教训**：LOCK记录的timestamp是UTC，OPEN是北京时间，导致restore两遍扫描前先减后加算出错误净持仓。已改为两遍扫描（先OPEN再LOCK）彻底避免排序依赖
 
 ### 股指期货平今手续费（2026-03-28决定）
 - 中金所股指期货（IM/IF/IH/IC）平今手续费万分之2.3，是开仓/平昨的10倍

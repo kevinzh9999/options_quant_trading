@@ -113,6 +113,11 @@ def _ensure_tables(db_path: str):
             signal_json       TEXT
         )
     """)
+    # 新增列（已有表兼容）
+    try:
+        conn.execute("ALTER TABLE order_log ADD COLUMN lock_resolved TEXT")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
     conn.commit()
     conn.close()
 
@@ -617,40 +622,96 @@ def _execute_order(
 # 锁仓检查
 # ---------------------------------------------------------------------------
 
-def _check_locked_positions(db_path: str, dry_run: bool):
-    """启动时检查是否有前日锁仓持仓需要平仓。"""
+def _check_locked_positions(db_path: str, dry_run: bool, tq_api=None):
+    """启动时检查是否有前日锁仓持仓需要平仓。跟TQ实盘对账验证。"""
     try:
         db = DBManager(db_path)
         locks = db.query_df(
             "SELECT * FROM order_log WHERE action='LOCK' AND status='FILLED' "
-            "AND datetime >= date('now', '-1 day') "
+            "AND lock_resolved IS NULL "
+            "AND datetime >= date('now', '-2 day') "
             "ORDER BY datetime"
         )
-        if locks is not None and not locks.empty:
-            print(f"\n ⚠ 发现锁仓持仓，需要平仓（平昨仓，手续费低）：")
-            for _, row in locks.iterrows():
-                sym = row.get("symbol", "")
-                direction = row.get("direction", "")
-                lots_val = int(row.get("filled_lots", 0))
-                price = float(row.get("filled_price", 0))
-                orig_dir = "多头" if direction == "SHORT" else "空头"
-                lock_dir = "空头" if direction == "SHORT" else "多头"
-                print(f"   {sym}: 原{orig_dir}{lots_val}手 + 锁{lock_dir}{lots_val}手"
-                      f" @ {price:.1f} → 建议双向平仓")
+        if locks is None or locks.empty:
+            return
 
-            if not dry_run:
-                resp = _confirm(
-                    f" 需要现在平仓吗？（开盘后执行）[y/n]", 30.0)
-                if resp == "y":
-                    print(f"  → 请在盘中手动平仓（双向都用CLOSE，平昨仓手续费低）")
-                else:
-                    print(f"  → 稍后处理")
-            print()
+        # 用TQ实盘持仓验证锁仓是否还存在
+        tq_positions = {}
+        if tq_api is not None:
+            try:
+                import time as _time
+                all_pos = tq_api.get_position()
+                tq_api.wait_update(deadline=_time.time() + 3)
+                for symbol, pos in all_pos.items():
+                    vol_long = int(getattr(pos, "volume_long", 0) or 0)
+                    vol_short = int(getattr(pos, "volume_short", 0) or 0)
+                    if vol_long > 0 or vol_short > 0:
+                        tq_positions[symbol] = {"long": vol_long, "short": vol_short}
+            except Exception as e:
+                print(f"  [WARN] TQ持仓查询失败，仅用DB记录判断: {e}")
+
+        confirmed_locks = []
+        for _, row in locks.iterrows():
+            sym = row.get("symbol", "")
+            dt = row.get("datetime", "")
+
+            # 在TQ持仓中查找对应品种（order_log存的是 "IC"，TQ是 "CFFEX.IC2604"）
+            if tq_positions:
+                has_lock = False
+                for tq_sym, vol in tq_positions.items():
+                    if sym in tq_sym and vol["long"] > 0 and vol["short"] > 0:
+                        has_lock = True
+                        break
+                if not has_lock:
+                    # TQ没有锁仓 → 已处理，标记resolved
+                    _mark_lock_resolved(db_path, dt, sym, "TQ无锁仓持仓")
+                    continue
+
+            confirmed_locks.append(row)
+
+        if not confirmed_locks:
+            return
+
+        print(f"\n ⚠ 发现锁仓持仓，需要平仓（平昨仓，手续费低）：")
+        for row in confirmed_locks:
+            sym = row.get("symbol", "")
+            direction = row.get("direction", "")
+            lots_val = int(row.get("filled_lots", 0))
+            price = float(row.get("filled_price", 0))
+            orig_dir = "多头" if direction == "SHORT" else "空头"
+            lock_dir = "空头" if direction == "SHORT" else "多头"
+            src = "TQ确认" if tq_positions else "DB记录"
+            print(f"   {sym}: 原{orig_dir}{lots_val}手 + 锁{lock_dir}{lots_val}手"
+                  f" @ {price:.1f} → 建议双向平仓 ({src})")
+
+        if not dry_run:
+            resp = _confirm(
+                f" 需要现在平仓吗？（开盘后执行）[y/n]", 30.0)
+            if resp == "y":
+                print(f"  → 请在盘中手动平仓（双向都用CLOSE，平昨仓手续费低）")
+                for row in confirmed_locks:
+                    _mark_lock_resolved(db_path, row.get("datetime", ""),
+                                        row.get("symbol", ""), "操作者确认平仓")
+            else:
+                print(f"  → 稍后处理")
+        print()
     except Exception as e:
         print(f"  [WARN] 锁仓检查失败: {e}")
 
-    # 检查前日被否决的平仓持仓
-    _check_denied_positions()
+
+def _mark_lock_resolved(db_path: str, dt: str, symbol: str, reason: str):
+    """标记LOCK记录为已处理，下次启动不再提示。"""
+    try:
+        conn = _open_db_conn(db_path)
+        conn.execute(
+            "UPDATE order_log SET lock_resolved = ? "
+            "WHERE datetime = ? AND symbol = ? AND action = 'LOCK'",
+            (reason, dt, symbol),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 def _check_denied_positions():
@@ -799,32 +860,41 @@ def _restore_positions_from_log(db_path: str, positions: dict):
     if rows is None or rows.empty:
         return
 
-    # 按品种汇总：OPEN 加仓，CLOSE/LOCK 减仓
+    # 按品种汇总：先累计所有OPEN，再减去所有CLOSE/LOCK
+    # 两遍扫描，避免因timestamp时区不一致导致先减后加的错误
     net: dict = {}  # sym -> {"long": lots, "short": lots, "last_price": float}
+
+    # 第1遍：只处理OPEN
     for _, r in rows.iterrows():
         sym = str(r["symbol"])
         d = str(r["direction"])
         act = str(r["action"])
         lots = int(r.get("filled_lots", 0) or 0)
         price = float(r.get("filled_price", 0) or 0)
-        if lots <= 0:
+        if lots <= 0 or act != "OPEN":
             continue
-
         if sym not in net:
             net[sym] = {"long": 0, "short": 0, "last_price": 0}
+        if d == "LONG":
+            net[sym]["long"] += lots
+        else:
+            net[sym]["short"] += lots
+        net[sym]["last_price"] = price
 
-        if act == "OPEN":
-            if d == "LONG":
-                net[sym]["long"] += lots
-            else:
-                net[sym]["short"] += lots
-            net[sym]["last_price"] = price
-        elif act in ("CLOSE", "LOCK", "CLOSE_DENIED"):
-            # CLOSE/LOCK 减去对应方向
-            if d == "LONG":
-                net[sym]["long"] = max(0, net[sym]["long"] - lots)
-            else:
-                net[sym]["short"] = max(0, net[sym]["short"] - lots)
+    # 第2遍：处理CLOSE/LOCK（减去对应方向）
+    for _, r in rows.iterrows():
+        sym = str(r["symbol"])
+        d = str(r["direction"])
+        act = str(r["action"])
+        lots = int(r.get("filled_lots", 0) or 0)
+        if lots <= 0 or act not in ("CLOSE", "LOCK", "CLOSE_DENIED"):
+            continue
+        if sym not in net:
+            continue
+        if d == "LONG":
+            net[sym]["long"] = max(0, net[sym]["long"] - lots)
+        else:
+            net[sym]["short"] = max(0, net[sym]["short"] - lots)
 
     # 写入 positions
     restored = []
@@ -884,9 +954,6 @@ def main():
           f"  亏损上限{MAX_DAILY_LOSS_PCT*100:.0f}%")
     print(f"{'═' * W}")
 
-    # 检查昨日锁仓持仓 + 否决平仓提醒
-    _check_locked_positions(db_path, args.dry_run)
-
     # 从 order_log 恢复当天持仓（重启后内存清空的恢复手段）
     _restore_positions_from_log(db_path, positions)
 
@@ -931,6 +998,10 @@ def main():
             print(f" [ERROR] TQ连接失败: {e}")
             print(f" 实盘模式需要TQ连接，请检查网络和账户配置")
             return
+
+    # 检查昨日锁仓持仓 + 否决平仓提醒（TQ连接后，可跟实盘对账）
+    _check_locked_positions(db_path, args.dry_run, tq_api=tq_api)
+    _check_denied_positions()
 
     daily_orders = 0
     daily_loss = 0.0
