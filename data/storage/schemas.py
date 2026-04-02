@@ -463,6 +463,7 @@ DAILY_MODEL_OUTPUT_ALTER_SQLS = [
     "ALTER TABLE daily_model_output ADD COLUMN iv_percentile_hist      REAL",
     "ALTER TABLE daily_model_output ADD COLUMN signal_primary          TEXT",
     "ALTER TABLE daily_model_output ADD COLUMN garch_reliable          INTEGER",
+    "ALTER TABLE daily_model_output ADD COLUMN hurst_60d               REAL",
 ]
 
 INDEX_DAILY_SQL = """

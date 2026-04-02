@@ -923,6 +923,28 @@ def _eod_model_output(trade_date: str, db) -> dict | None:
         "signal_primary":         signal,        # 基于IV分位的主信号
         "garch_reliable":         1 if _garch_reliable else 0,
     }
+    # 追加研究指标（fail-safe，不影响核心模型写入）
+    try:
+        from scripts.vol_monitor import calc_skew_table, calc_rr_bf
+        if near_month and not chain_df.empty and expire_map:
+            _skew_fwd = spot or 0  # fallback到现货
+            _skew_ed = expire_map.get(near_month, "")
+            _skew_df = calc_skew_table(chain_df, near_month, _skew_fwd, _skew_ed, trade_date)
+            _rr, _ = calc_rr_bf(_skew_df)
+            if _rr != 0:
+                row["rr_25d"] = round(_rr, 6)
+    except Exception as e:
+        logger.debug("RR计算跳过: %s", e)
+    try:
+        from scripts.morning_briefing import _calc_hurst
+        _hdf = db.query_df(
+            "SELECT close FROM index_daily WHERE ts_code='000852.SH' "
+            "AND trade_date<=? ORDER BY trade_date DESC LIMIT 60",
+            (trade_date,))
+        if _hdf is not None and len(_hdf) >= 60:
+            row["hurst_60d"] = round(_calc_hurst(_hdf["close"].astype(float).values[::-1]), 4)
+    except Exception as e:
+        logger.debug("Hurst计算跳过: %s", e)
     try:
         db.upsert_dataframe("daily_model_output", pd.DataFrame([row]))
         logger.info(

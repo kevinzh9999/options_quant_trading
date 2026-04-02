@@ -130,6 +130,12 @@ class IntradayRecorder:
             ("direction_v3", "TEXT"),
             ("style_v3", "TEXT"),
             ("signal_version", "TEXT"),
+            # 研究指标（不参与评分，供未来迭代分析）
+            ("adx_14", "REAL"),
+            ("body_ratio", "REAL"),
+            ("vwap_offset", "REAL"),
+            ("style_spread", "REAL"),
+            ("cross_rank", "INT"),
         ]:
             try:
                 conn.execute(
@@ -240,6 +246,16 @@ class IntradayRecorder:
                    sd.get("pre_z_total"), sd.get("total"),
                    sd.get("z_filter", ""))
 
+        # 追加研究指标列（不影响核心信号记录）
+        extra = (
+            sd.get("adx_14"),
+            sd.get("body_ratio"),
+            sd.get("vwap_offset"),
+            sd.get("style_spread"),
+            sd.get("cross_rank"),
+        )
+        full_row = row + extra
+
         conn = sqlite3.connect(self.db_path)
         conn.execute(
             "INSERT OR REPLACE INTO signal_log "
@@ -249,9 +265,10 @@ class IntradayRecorder:
             "score_v3, direction_v3, style_v3, signal_version, "
             "s_momentum, s_volatility, s_quality, intraday_filter, "
             "time_mult, sentiment_mult, z_score, rsi, "
-            "raw_score, filtered_score, filter_reason) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            row,
+            "raw_score, filtered_score, filter_reason, "
+            "adx_14, body_ratio, vwap_offset, style_spread, cross_rank) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            full_row,
         )
         conn.commit()
         conn.close()
@@ -275,6 +292,104 @@ class IntradayRecorder:
         )
         conn.commit()
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 研究指标计算（不参与评分，只记录到signal_log供未来分析）
+# 所有函数fail-safe：任何异常返回None，绝不影响信号流程
+# ---------------------------------------------------------------------------
+
+def _calc_research_indicators(
+    bar_data: Dict[str, pd.DataFrame],
+    sym: str,
+    spot_map: Dict[str, str] = None,
+) -> Dict[str, Any]:
+    """计算研究指标，返回dict供signal_log记录。全部try/except包裹。"""
+    result: Dict[str, Any] = {}
+    b5 = bar_data.get(sym)
+    if b5 is None or len(b5) < 20:
+        return result
+
+    close = b5["close"].astype(float)
+    high = b5["high"].astype(float)
+    low = b5["low"].astype(float)
+    opn = b5["open"].astype(float)
+    vol = b5["volume"].astype(float) if "volume" in b5.columns else None
+
+    # --- ADX(14) ---
+    try:
+        period = 14
+        if len(close) >= period * 2:
+            plus_dm = high.diff().clip(lower=0)
+            minus_dm = (-low.diff()).clip(lower=0)
+            # 只保留较大的那个
+            plus_dm[plus_dm < minus_dm] = 0
+            minus_dm[minus_dm < plus_dm] = 0
+            tr = pd.concat([high - low, (high - close.shift()).abs(),
+                            (low - close.shift()).abs()], axis=1).max(axis=1)
+            atr = tr.ewm(span=period, adjust=False).mean()
+            plus_di = 100 * plus_dm.ewm(span=period, adjust=False).mean() / atr
+            minus_di = 100 * minus_dm.ewm(span=period, adjust=False).mean() / atr
+            denom = plus_di + minus_di
+            dx = 100 * (plus_di - minus_di).abs() / denom.replace(0, float("nan"))
+            adx = dx.ewm(span=period, adjust=False).mean()
+            result["adx_14"] = round(float(adx.iloc[-1]), 2) if not pd.isna(adx.iloc[-1]) else None
+    except Exception:
+        pass
+
+    # --- Body Ratio（最后一根completed bar）---
+    try:
+        hl = float(high.iloc[-1]) - float(low.iloc[-1])
+        if hl > 1e-5:
+            result["body_ratio"] = round(
+                (float(close.iloc[-1]) - float(opn.iloc[-1])) / hl, 3)
+    except Exception:
+        pass
+
+    # --- VWAP Offset（日内累计VWAP偏离度）---
+    try:
+        if vol is not None and len(vol) > 5:
+            tp = (high + low + close) / 3
+            cum_tpv = (tp * vol).cumsum()
+            cum_vol = vol.cumsum().replace(0, float("nan"))
+            vwap = cum_tpv / cum_vol
+            cur_vwap = float(vwap.iloc[-1])
+            cur_close = float(close.iloc[-1])
+            if cur_vwap > 0:
+                result["vwap_offset"] = round(
+                    (cur_close - cur_vwap) / cur_vwap * 100, 4)
+    except Exception:
+        pass
+
+    # --- Style Spread（IM-IH return差，衡量风格分化）---
+    try:
+        _sym_to_spot = spot_map or {
+            "IM": "000852.SH", "IC": "000905.SH",
+            "IF": "000300.SH", "IH": "000016.SH"}
+        im_bars = bar_data.get("IM")
+        ih_bars = bar_data.get("IH")
+        if im_bars is not None and ih_bars is not None and len(im_bars) >= 2 and len(ih_bars) >= 2:
+            im_ret = (float(im_bars["close"].iloc[-1]) - float(im_bars["close"].iloc[-2])) / float(im_bars["close"].iloc[-2])
+            ih_ret = (float(ih_bars["close"].iloc[-1]) - float(ih_bars["close"].iloc[-2])) / float(ih_bars["close"].iloc[-2])
+            result["style_spread"] = round((im_ret - ih_ret) * 100, 4)
+    except Exception:
+        pass
+
+    # --- Cross Rank（4品种return排名，1=最强）---
+    try:
+        returns = {}
+        for s in ["IM", "IC", "IF", "IH"]:
+            b = bar_data.get(s)
+            if b is not None and len(b) >= 2:
+                c = b["close"].astype(float)
+                returns[s] = (float(c.iloc[-1]) - float(c.iloc[-2])) / float(c.iloc[-2])
+        if len(returns) >= 2 and sym in returns:
+            sorted_syms = sorted(returns, key=returns.get, reverse=True)
+            result["cross_rank"] = sorted_syms.index(sym) + 1
+    except Exception:
+        pass
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1018,6 +1133,12 @@ class IntradayMonitor:
                 if cp > 0 and zp["std20"] > 0:
                     cur_z = (cp - zp["ema20"]) / zp["std20"]
             detail = {**routed_sc, "zscore": cur_z} if routed_sc else {"zscore": cur_z}
+            # 追加研究指标（fail-safe，不影响信号记录）
+            try:
+                ri = _calc_research_indicators(bar_data, sym)
+                detail.update(ri)
+            except Exception:
+                pass
             self.recorder.record_signal(
                 current_time_utc, sym, sig, action_taken,
                 v2_score=sc2.get("total", 0),
