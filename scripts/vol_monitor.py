@@ -379,33 +379,61 @@ def calc_skew_table(
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
+def _interp_iv_at_delta(options: pd.DataFrame, target_delta: float) -> float:
+    """在delta两侧的行权价之间线性插值IV，避免行权价跳变导致的假信号。
+
+    options: 同类型（C或P）的行权价DataFrame，含delta和iv列
+    target_delta: 目标delta值（如+0.25或-0.25）
+    返回: 插值后的IV（小数），失败返回0.0
+    """
+    if options.empty or len(options) < 2:
+        if not options.empty:
+            return float(options.iloc[0]["iv"])
+        return 0.0
+
+    df = options.sort_values("delta").reset_index(drop=True)
+    deltas = df["delta"].values
+    ivs = df["iv"].values
+
+    # 找到target_delta两侧的行权价
+    # delta单调递减（Put: 深OTM→ATM = -0.01→-0.50）或递增（Call: OTM→ATM = 0.01→0.50）
+    for i in range(len(deltas) - 1):
+        d_lo, d_hi = deltas[i], deltas[i + 1]
+        if (d_lo <= target_delta <= d_hi) or (d_hi <= target_delta <= d_lo):
+            # 线性插值
+            span = d_hi - d_lo
+            if abs(span) < 1e-10:
+                return float(ivs[i])
+            w = (target_delta - d_lo) / span
+            return float(ivs[i] * (1 - w) + ivs[i + 1] * w)
+
+    # target_delta在范围外，用最近的
+    idx = (df["delta"] - target_delta).abs().idxmin()
+    return float(df.loc[idx, "iv"])
+
+
 def calc_rr_bf(skew: pd.DataFrame) -> Tuple[float, float]:
-    """25D Risk Reversal 和 Butterfly。"""
+    """25D Risk Reversal 和 Butterfly。
+
+    使用delta线性插值（非最近邻），避免MO行权价间距大（200点）
+    导致的行权价跳变假信号。
+    """
     if skew.empty:
         return 0.0, 0.0
 
     puts = skew[skew["cp"] == "P"].copy()
     calls = skew[skew["cp"] == "C"].copy()
 
-    # 25D Put: delta closest to -0.25
-    put_25d_iv = 0.0
-    if not puts.empty:
-        puts["dist"] = (puts["delta"] - (-0.25)).abs()
-        put_25d_iv = float(puts.loc[puts["dist"].idxmin(), "iv"])
+    # 25D Put: delta插值到-0.25
+    put_25d_iv = _interp_iv_at_delta(puts, -0.25)
 
-    # 25D Call: delta closest to +0.25
-    call_25d_iv = 0.0
-    if not calls.empty:
-        calls["dist"] = (calls["delta"] - 0.25).abs()
-        call_25d_iv = float(calls.loc[calls["dist"].idxmin(), "iv"])
+    # 25D Call: delta插值到+0.25
+    call_25d_iv = _interp_iv_at_delta(calls, 0.25)
 
-    # ATM IV: delta closest to 0.5 (call) or -0.5 (put)
-    atm_iv = 0.0
-    if not calls.empty:
-        calls["atm_dist"] = (calls["delta"] - 0.5).abs()
-        atm_iv = float(calls.loc[calls["atm_dist"].idxmin(), "iv"])
+    # ATM IV: delta插值到+0.50 (call)
+    atm_iv = _interp_iv_at_delta(calls, 0.50)
 
-    rr = put_25d_iv - call_25d_iv  # 负值 = 看跌偏向
+    rr = put_25d_iv - call_25d_iv  # 正值 = Put skew（看跌偏向）
     bf = (put_25d_iv + call_25d_iv) / 2 - atm_iv if atm_iv > 0 else 0.0
     return rr, bf
 
@@ -997,9 +1025,22 @@ def run_snapshot(db):
     skew_df = calc_skew_table(chain, skew_month, skew_fwd, skew_ed, data_date)
     rr, bf = calc_rr_bf(skew_df)
 
-    # vs 昨日 RR/BF
-    prev_rr = float(yesterday.get("rr_25d", 0) or 0)
-    prev_bf = float(yesterday.get("bf_25d", 0) or 0)
+    # vs 前一个快照的 RR/BF（优先盘中快照，fallback到daily_model_output）
+    prev_rr = 0.0
+    prev_bf = 0.0
+    try:
+        prev_snap = db.query_df(
+            "SELECT rr_25d, bf_25d FROM vol_monitor_snapshots "
+            "ORDER BY datetime DESC LIMIT 1")
+        if prev_snap is not None and not prev_snap.empty:
+            prev_rr = float(prev_snap.iloc[0].get("rr_25d", 0) or 0)
+            prev_bf = float(prev_snap.iloc[0].get("bf_25d", 0) or 0)
+    except Exception:
+        pass
+    if prev_rr == 0:
+        prev_rr = float(yesterday.get("rr_25d", 0) or 0)
+    if prev_bf == 0:
+        prev_bf = float(yesterday.get("bf_25d", 0) or 0)
     rr_chg = rr - prev_rr if prev_rr != 0 else 0
     bf_chg = bf - prev_bf if prev_bf != 0 else 0
 
@@ -1617,8 +1658,22 @@ def _refresh_live_panel(
     skew_df = calc_skew_table(chain, skew_month, skew_fwd, skew_ed, today)
     rr, bf = calc_rr_bf(skew_df)
 
-    prev_rr = float(yesterday.get("rr_25d", 0) or 0)
-    prev_bf = float(yesterday.get("bf_25d", 0) or 0)
+    # vs 前一个快照的 RR/BF
+    prev_rr = 0.0
+    prev_bf = 0.0
+    try:
+        prev_snap = db.query_df(
+            "SELECT rr_25d, bf_25d FROM vol_monitor_snapshots "
+            "ORDER BY datetime DESC LIMIT 1")
+        if prev_snap is not None and not prev_snap.empty:
+            prev_rr = float(prev_snap.iloc[0].get("rr_25d", 0) or 0)
+            prev_bf = float(prev_snap.iloc[0].get("bf_25d", 0) or 0)
+    except Exception:
+        pass
+    if prev_rr == 0:
+        prev_rr = float(yesterday.get("rr_25d", 0) or 0)
+    if prev_bf == 0:
+        prev_bf = float(yesterday.get("bf_25d", 0) or 0)
     rr_chg = rr - prev_rr if prev_rr != 0 else 0
     bf_chg = bf - prev_bf if prev_bf != 0 else 0
 
