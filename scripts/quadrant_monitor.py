@@ -662,10 +662,15 @@ def run_once(db: DBManager, prev_quadrant: str = "",
         if val is not None and val != "" and not (isinstance(val, float) and np.isnan(val)):
             discount[label] = float(val)
         else:
-            # fallback: daily_model_output 存的是日贴水率小数
+            # fallback: daily_model_output 存的是价格偏离率小数（非年化）
+            # 需要除以DTE再乘365转年化
             val2 = model.get(model_col)
             if val2 is not None and val2 != "":
-                discount[label] = float(val2) * 100
+                _dte_map = {"discount_rate_iml1": 45,
+                            "discount_rate_iml2": 90,
+                            "discount_rate_iml3": 180}
+                dte = _dte_map.get(model_col, 90)
+                discount[label] = float(val2) / dte * 365 * 100
 
     # 象限切换
     switch_alert = None

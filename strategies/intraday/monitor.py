@@ -581,13 +581,18 @@ class IntradayMonitor:
                         parts = [f"{s} {sp['direction']}@{sp['entry_price']:.0f}"
                                  for s, sp in restored.items()]
                         print(f"  恢复shadow持仓: {', '.join(parts)}")
-                    # 恢复信号去重集合（防止重启后重复发送同bar信号）
+                    # 不恢复prompted_bars：重启后应该允许对当前bar重新评估
+                    # 之前恢复全部prompted_bars会导致高分信号被静默丢弃
+                    # 最多恢复当前活跃shadow持仓的品种，防止对已有持仓重复发开仓信号
+                    pb_syms = set(restored.keys())  # 已有shadow持仓的品种
                     pb = state.get("prompted_bars", [])
+                    pb_kept = 0
                     for item in pb:
-                        if isinstance(item, list) and len(item) == 2:
+                        if isinstance(item, list) and len(item) == 2 and item[0] in pb_syms:
                             self._prompted_bars.add(tuple(item))
-                    if pb:
-                        print(f"  恢复信号去重: {len(pb)}个bar已标记")
+                            pb_kept += 1
+                    if pb_kept:
+                        print(f"  恢复信号去重: {pb_kept}/{len(pb)}个(仅活跃持仓品种)")
                 else:
                     # 非当天的状态文件，忽略
                     pass
