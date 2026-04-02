@@ -1,6 +1,6 @@
 # SignalGeneratorV2 信号系统完整文档
 
-> 最后更新：2026-04-01 | 代码位置：`strategies/intraday/A_share_momentum_signal_v2.py`
+> 最后更新：2026-04-02 | 代码位置：`strategies/intraday/A_share_momentum_signal_v2.py`
 
 ---
 
@@ -255,20 +255,31 @@ Z > +2 + SHORT + RSI从高位回落 → +10分
 
 ## 6. 平仓系统
 
+### 价格双层约定（2026-04-02修复，重要！）
+
+check_exit 在实盘（monitor）中使用双价格层：
+- **`current_price`（期货last_price）**：用于止损/跟踪止盈/PnL/盈亏判断（P1b/P2/P3/P7）
+- **`spot_price`（现货close）→ `boll_price`**：用于Bollinger zone判断（P4/P5/P6）
+- **`highest_since`/`lowest_since`**：用期货价格追踪（与entry_price同源）
+
+回测中 `spot_price=0`（默认），fallback到 `current_price`，全用现货，不受影响。
+
+**历史教训**：混用现货和期货价格导致IM贴水3.5%被误判为亏损→假STOP_LOSS。
+
 ### 平仓优先级（P1-P7）
 
-| 优先级 | 条件 | 触发 | 退出价格 |
+| 优先级 | 条件 | 触发 | 价格层 |
 |--------|------|------|---------|
-| **P0** | bar的high/low穿过止损位 | `STOP_LOSS` | stop_price（精确止损） |
-| **P1** | 14:45 BJ | `EOD_CLOSE` | bar close |
-| **P1b** | 亏损 > 0.5% | `STOP_LOSS` | bar close |
-| **P2** | 11:25前 + 亏损 | `LUNCH_CLOSE` | bar close |
-| **P2b** | 11:25前 + 盈利 + trailing 0.3% | `LUNCH_TRAIL` | bar close |
-| **P3** | 动态trailing stop | `TRAILING_STOP` | bar close |
-| **P4** | 5m+15m都在布林带极端 | `TREND_COMPLETE` | bar close |
-| **P5** | 持仓>=20min + 3根窄幅 + 15m极端 | `MOMENTUM_EXHAUSTED` | bar close |
-| **P6** | 2根破中轨 + 15m确认 | `MID_BREAK` | bar close |
-| **P7** | 60min无盈利 | `TIME_STOP` | bar close |
+| **P0** | bar的high/low穿过止损位 | `STOP_LOSS` | 期货（backtest用现货） |
+| **P1** | 14:45 BJ | `EOD_CLOSE` | — |
+| **P1b** | 亏损 > 0.5% | `STOP_LOSS` | 期货 |
+| **P2** | 11:25前 + 亏损 | `LUNCH_CLOSE` | 期货 |
+| **P2b** | 11:25前 + 盈利 + trailing 0.3% | `LUNCH_TRAIL` | 期货 |
+| **P3** | 动态trailing stop | `TRAILING_STOP` | 期货 |
+| **P4** | 5m+15m都在布林带极端 | `TREND_COMPLETE` | 现货Bollinger |
+| **P5** | 持仓>=20min + 3根窄幅 + 15m极端 | `MOMENTUM_EXHAUSTED` | 现货Bollinger |
+| **P6** | 2根破中轨 + 15m确认 | `MID_BREAK` | 现货Bollinger |
+| **P7** | 60min无盈利 | `TIME_STOP` | 期货 |
 
 ### P0 止损（backtest特有的bar内止损）
 
@@ -330,7 +341,12 @@ Per-symbol可通过`trailing_stop_enabled`控制是否启用。
 13:05 - 14:30  下午开仓窗口
 14:30 -        禁止开仓
 
-冷却期：平仓后15分钟内不允许同方向再开仓
+冷却期：平仓后15分钟内不允许同方向再开仓（统一，不分级）
+        2026-04-02验证：分级冷却（ME=20/SL=25等）全部劣于统一15min
+
+实盘品种限制：IntradayConfig.tradeable = {"IM", "IC"}
+  - 只有tradeable品种通过strategy.on_bar开仓/占position_mgr槽位
+  - IF/IH面板显示评分但不触发信号/shadow/signal_file
 ```
 
 ---
