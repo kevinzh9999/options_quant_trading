@@ -1049,8 +1049,11 @@ class IntradayMonitor:
                     "volume": int(getattr(q, "volume", 0)),
                 }
                 quote_dict[sym] = qd
-                # 记录盘口快照
-                self.recorder.record_orderbook(current_time_utc, sym, qd)
+                # 记录盘口快照（fail-safe，不阻塞信号流程）
+                try:
+                    self.recorder.record_orderbook(current_time_utc, sym, qd)
+                except Exception:
+                    pass
 
         # 计算各品种的路由版本评分（含Z-Score过滤 + 波动率区间）
         # 必须在策略on_bar之前计算，以便过滤actions
@@ -1303,10 +1306,13 @@ class IntradayMonitor:
                 print(f"     盘口: {limit_s}  建议{sugg_lots}手")
                 print(f"     → 已写入signal_pending.json，等待executor确认")
 
-                # 记录信号决策
-                self.recorder.record_decision(
-                    current_time_utc, sym, act.get("score", 0),
-                    direction, "SIGNAL")
+                # 记录信号决策（fail-safe）
+                try:
+                    self.recorder.record_decision(
+                        current_time_utc, sym, act.get("score", 0),
+                        direction, "SIGNAL")
+                except Exception:
+                    pass
 
                 # 注册shadow持仓（所有信号自动进入）
                 entry_price = (ask1 or last or 0) if direction == "LONG" \
