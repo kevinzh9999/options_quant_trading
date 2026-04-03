@@ -371,11 +371,18 @@ class IntradayPositionManager:
         return pos.position_id
 
     def remove_by_symbol(self, symbol: str) -> None:
-        """移除指定品种的所有非锁仓持仓（shadow exit 时调用）。"""
+        """移除指定品种的所有持仓和锁仓对（shadow exit 时调用）。
+
+        必须同时清理lock_pairs，否则can_open()会因残留lock_pair
+        永久阻止该品种开新仓（2026-04-03发现的bug）。
+        """
         to_del = [pid for pid, p in self.positions.items()
-                  if p.symbol == symbol and not p.is_lock]
+                  if p.symbol == symbol]
         for pid in to_del:
             del self.positions[pid]
+        # 清理该品种的lock_pairs
+        self.lock_pairs = [lp for lp in self.lock_pairs
+                           if lp.long_position.symbol != symbol]
 
     def reset_daily(self) -> None:
         self.daily_pnl = 0.0
