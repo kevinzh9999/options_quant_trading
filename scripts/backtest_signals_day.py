@@ -38,14 +38,19 @@ def _utc_to_bj(utc_str: str) -> str:
 
 
 def _build_15m_from_5m(bar_5m: pd.DataFrame) -> pd.DataFrame:
-    """Resample 5min bars to 15min bars."""
+    """Resample 5min bars to 15min bars.
+
+    使用 label='left', closed='left' 和TQ的15分钟bar对齐：
+    TQ定义: 09:30 bar = 09:30~09:45数据, 09:45 bar = 09:45~10:00数据
+    之前用 label='right', closed='right' 导致聚合区间偏移一个周期。
+    """
     if len(bar_5m) < 3:
         return pd.DataFrame()
     df = bar_5m.copy()
     df["dt"] = pd.to_datetime(df["datetime"] if "datetime" in df.columns
                                else df.index)
     df = df.set_index("dt")
-    resampled = df.resample("15min", label="right", closed="right").agg({
+    resampled = df.resample("15min", label="left", closed="left").agg({
         "open": "first", "high": "max", "low": "min",
         "close": "last", "volume": "sum",
     }).dropna()
