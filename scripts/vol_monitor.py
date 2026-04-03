@@ -1278,17 +1278,17 @@ def run_live(db):
                 im_contracts.append(tq_fut)
                 print(f"  额外期货: {tq_fut} (for MO{em})")
 
-    # 行权价: ATM ± 5档（间距100），加持仓行权价
-    strikes = set(atm_base + i * 100 for i in range(-5, 7))
-    for ks in pos_strikes_extra.values():
-        strikes.update(ks)
-    strikes = sorted(strikes)
+    # 行权价: ATM ± 5档（间距100）
+    base_strikes = sorted(atm_base + i * 100 for i in range(-5, 7))
 
     opt_syms = []
     for m in opt_months_to_sub:
-        for k in strikes:
+        # 每月份用基础行权价 + 该月份的持仓行权价（不混入其他月份的）
+        month_strikes = sorted(set(base_strikes) | pos_strikes_extra.get(m, set()))
+        for k in month_strikes:
             for cp in ["C", "P"]:
                 opt_syms.append(f"CFFEX.MO{m}-{cp}-{k}")
+    strikes = base_strikes  # 面板显示用
 
     print(f"  订阅期货: {', '.join(im_contracts)}")
     print(f"  订阅期权月份: {opt_months_to_sub}  行权价: {min(strikes)}~{max(strikes)}")
@@ -1395,19 +1395,76 @@ def run_live(db):
 
         print(f"  最终订阅期权月份: {opt_months_to_sub}  合约数: {len(opt_syms)}")
 
-        # 订阅期权
+        # 订阅期权（先用ATM合约测试每月可用性，再批量订阅）
         opt_quotes = {}
         sub_ok = 0
         sub_fail = 0
+        sub_ok_by_month = {}
+        skip_months = set()
+
+        # 先测试每月ATM合约是否可订阅
+        for m in opt_months_to_sub:
+            test_sym = f"CFFEX.MO{m}-C-{atm_base}"
+            try:
+                opt_quotes[test_sym] = api.get_quote(test_sym)
+                sub_ok += 1
+                sub_ok_by_month[m] = 1
+                print(f"  ✓ MO{m} ATM可用（{test_sym}）")
+            except Exception as e:
+                skip_months.add(m)
+                print(f"  ✗ MO{m} 不可用（{test_sym} → {e}），跳过")
+
+        # 批量订阅可用月份的剩余合约
         for sym in opt_syms:
+            if sym in opt_quotes:  # ATM测试已订阅
+                continue
+            m_match = re.match(r'CFFEX\.MO(\d{4})', sym)
+            em = m_match.group(1) if m_match else ""
+            if em in skip_months:
+                sub_fail += 1
+                continue
             try:
                 opt_quotes[sym] = api.get_quote(sym)
                 sub_ok += 1
+                sub_ok_by_month[em] = sub_ok_by_month.get(em, 0) + 1
             except Exception as e:
                 sub_fail += 1
-                print(f"  ✗ 期权订阅失败: {sym} → {e}")
+                if sub_fail <= 5:
+                    print(f"  ✗ {sym} → {e}")
 
         print(f"  期权订阅: 成功 {sub_ok} / 失败 {sub_fail}")
+
+        # 如果某个月份合约全部失败，从订阅列表中移除，fallback到下个月
+        failed_months = []
+        for m in list(opt_months_to_sub):
+            if sub_ok_by_month.get(m, 0) == 0:
+                failed_months.append(m)
+        if failed_months:
+            for m in failed_months:
+                opt_months_to_sub.remove(m)
+            print(f"  ⚠ 月份 {failed_months} 订阅全部失败，已移除。剩余: {opt_months_to_sub}")
+            # 尝试补充下一个可用月份
+            for m in sorted(expire_map.keys()):
+                if m not in opt_months_to_sub and expire_map.get(m, "") and _dte(expire_map[m], today) >= 1:
+                    # 尝试订阅这个月份的ATM合约验证可用性
+                    test_sym = f"CFFEX.MO{m}-C-{atm_base}"
+                    try:
+                        opt_quotes[test_sym] = api.get_quote(test_sym)
+                        opt_months_to_sub.append(m)
+                        opt_months_to_sub.sort()
+                        # 补充这个月份的全部行权价
+                        for k in strikes:
+                            for cp in ["C", "P"]:
+                                s = f"CFFEX.MO{m}-{cp}-{k}"
+                                if s not in opt_quotes:
+                                    try:
+                                        opt_quotes[s] = api.get_quote(s)
+                                    except Exception:
+                                        pass
+                        print(f"  ✓ 补充月份 {m}，当前订阅: {opt_months_to_sub}")
+                        break
+                    except Exception:
+                        continue
         print(f"\n{'═' * W}")
         print(f"  波动率监控已启动 | 每5分钟刷新")
         print(f"{'═' * W}\n")
