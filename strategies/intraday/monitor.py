@@ -1273,9 +1273,14 @@ class IntradayMonitor:
 
         # 写入信号文件（供 order_executor 读取）+ 注册shadow持仓
         # Monitor不prompt，executor负责确认
+        # bar_dt用bar_data的实际时间戳（不用_last_bar_time，因为不同品种触发时该值不同步）
         for act in actions:
             sym = act.get("symbol", "")
-            bar_dt = self._last_bar_time.get(sym)
+            b = bar_data.get(sym)
+            if b is not None and len(b) > 0 and isinstance(b.index, pd.DatetimeIndex):
+                bar_dt = int(b.index[-1].timestamp() * 1e9)
+            else:
+                bar_dt = self._last_bar_time.get(sym)
             key = (sym, bar_dt)
 
             if act.get("action") == "OPEN":
