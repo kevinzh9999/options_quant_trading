@@ -1,7 +1,8 @@
 # SignalGenerator 升级蓝图 V2（2026-04-02更新）
 
-> 基于 101 Formulaic Alphas 论文、现代量化前沿扫描、及 V2 系统35天实盘/回测验证的综合修订版。
+> 基于 101 Formulaic Alphas 论文、现代量化前沿扫描、及 V2 系统34天实盘/回测验证的综合修订版。
 > 核心原则：**先榨干现有数据的线性逻辑 → 再引入外部数据 → 最后才上非线性模型**。
+> 最后更新：2026-04-04
 
 ---
 
@@ -21,7 +22,7 @@
 | 趋势启动检测器 | 突破+放量+振幅三重确认 | 5m OHLCV | — |
 | Hurst(60d) | 趋势/震荡regime | 日线R/S分析 | — |
 
-### 已验证不加的维度（2026-04-02完整测试）
+### 已验证不加的维度（2026-04-04完整测试）
 
 | 维度 | 测试方法 | 结果 | 原因 | 脚本 |
 |------|---------|------|------|------|
@@ -36,6 +37,8 @@
 | ~~K线实体占比~~ | 独立回测循环 ✅ | IC -252pt | IM有效但**IC灾难性**，品种差异过大 | body_ratio_research.py |
 | ~~跨品种rank~~ | 独立回测循环 ✅ | -350~-598pt | rank过滤误杀好信号 | cross_rank_research.py |
 | 午后t=0.8 | session_multiplier patch ✅ | t=1.0 +76pt | **已改为1.0（实施）** | 手动验证 |
+| ME/TC score确认退出 | 独立回测循环 ✅ | +130pt但不稳健 | 前半段-58pt，阈值敏感 | score_confirmed_exit_research.py |
+| 隔夜策略 | 纯统计（样本不足） | 数据不足 | 需要2-3年5分钟数据 | overnight_strategy_research.py |
 
 ⚠ = 事后模拟（乘在最终score上），与真实集成可能有偏差，但结论方向可靠。
 ✅ = 验证方式正确。
@@ -47,7 +50,16 @@
 - K线实体占比：品种差异过大（IM有效IC有害）
 - 跨品种rank：统计不显著（p>0.6），乘数方案-50%PnL
 
+**14个OHLCV因子全面测试完毕（2026-04-02，101 Alphas高频子集）**：
+- 所有常见技术指标（ADX/MACD/CCI/Williams%R/VWAP/K线形态/跨品种rank）全部验证无增量价值
+- 共测试20+方向，全部不实施
+
 **结论**：当前M/V/Q+乘数链的架构已接近5分钟OHLCV数据的信息提取上限。进一步改善需要引入新数据源（期权实时数据、tick数据）或更长的时间积累。
+
+**平仓系统已优化至较优参数（2026-04-04）**：
+- ME narrow_ratio=0.10, MID_BREAK bars=3, IC trailing_scale=2.0x
+- 当前baseline IM+IC +2031pt，breakeven滑点约 5-6pt
+- 进一步改善需等ME/TC score确认方案（100天数据后验证）
 
 ---
 
@@ -251,15 +263,23 @@ model = LightGBMClassifier(
 
 ---
 
-## 实施时间线（2026-04-02更新）
+## 实施时间线（2026-04-04更新）
 
 ```
-2026-04 V2.1  ✅ 已完成测试（VWAP/Body Ratio/Cross Rank全部不实施）
-              ✅ Hurst加入象限监控
+2026-04 V2.1  ✅ 已完成测试（VWAP/Body Ratio/Cross Rank/ME-Score全部不实施）
+              ✅ Hurst加入象限监控（A1/A2/B1/B2细分）
               ✅ 午后session_weight改1.0（+76pt）
+              ✅ ME narrow_range ratio 0.20→0.10（+393pt）
+              ✅ MID_BREAK bars 2→3（+76pt）
+              ✅ IC trailing_stop_scale=2.0x（+186pt）
+              ✅ 15分钟重采样修复 label='left'（关键bug修复）
+              ✅ 动量lookback硬编码修复（IF/IH 18→12）
+              ✅ 研究指标自动记录（ADX/body_ratio/VWAP/style_spread/cross_rank）
+              ✅ hurst_60d + rr_25d写入daily_model_output
+              IM+IC baseline: +2031pt（+68% vs 03-26旧baseline）
               
 2026-05 V2.5  量价correlation + 期权Skew实时化
-              ↓ 积累低Hurst数据 + style spread样本
+              ↓ 积累低Hurst数据 + style spread样本（100+笔）
 2026-06 V3.0  OFI近似（确认TQ数据后）+ Volume Profile
               ↓ 积累500+笔交易
 2026-10 V4.0  HMM辅助（需pip install hmmlearn）+ LightGBM打分
@@ -298,10 +318,13 @@ model = LightGBMClassifier(
 - 新因子优先作为乘数/过滤器（0个新参数），其次作为评分维度（1-2个新参数）
 - 所有研究脚本必须验证patch是否对目标函数生效
 
-### 关键教训（2026-04-02）
+### 关键教训（2026-04-04更新）
 
 1. 研究脚本monkey-patch了错误的变量（`_TIME_WEIGHTS` vs `session_multiplier`）→ 假阳性结论
 2. 事后模拟（乘在最终score上）≠ 真实集成（加进raw_total）→ 结论方向可能有偏差
 3. "有益偏差"不应修复（跨日GAP、forming bar Q=0）→ 修复后反而亏钱
 4. 现货/期货价格混用是致命bug → 持仓管理必须统一价格源
 5. 高相关性 ≠ 有预测力，低相关性 ≠ 无预测力 → 必须用回测数据验证
+6. **时间标签对齐影响全部时间相关逻辑**：`resample('15min', label='right')`使15m bar时间偏移15分钟，影响持仓时间/时段权重/exit判断。永远用`label='left', closed='left'`
+7. SYMBOL_PROFILES中的参数只有在代码真正读取时才生效，硬编码会静默覆盖配置 → 修复前需确认读取路径
+8. **稳健性验证三项指标**：时间分段一致性 + 阈值敏感性(±20%) + 单日贡献<30%。三项全过才实施

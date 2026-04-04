@@ -55,10 +55,10 @@
               （09:45~11:20, 13:05~14:30）
                   │
                   ▼
-              tradeable过滤（只有IM/IC进入position_mgr开仓）
+              tradeable过滤（只有IM/IC进入position_mgr开仓，2026-04-02修复：非tradeable品种不消耗槽位）
                   │
                   ▼
-              prompted_bars去重 + 写JSON + 注册shadow持仓
+              prompted_bars去重（用bar_data时间戳，2026-04-03修复）+ 写JSON + 注册shadow持仓
 ```
 
 注意：daily_mult、intraday_filter、sentiment_mult 等乘数在 `score_all()` **内部**作用于分数，
@@ -250,6 +250,7 @@ shadow_positions[sym] ─▶ check_exit()
 **写入文件后**：
 - 写入 `tmp/signal_pending.json`
 - **立即删除 shadow 持仓**（`del _shadow_positions[sym]`）+ 清理 position_mgr 占位（`remove_by_symbol`）
+  - `remove_by_symbol` 同时清理 `lock_pairs`（2026-04-03修复，否则ME退出后品种无法再开仓）
 - 持久化更新后的 shadow 状态到 `tmp/shadow_state.json`
 - 记录到 `shadow_trades` 表
 

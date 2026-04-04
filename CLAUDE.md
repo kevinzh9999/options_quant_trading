@@ -75,13 +75,16 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
   - 顺势：`daily_mult = 1.2`，中性：`daily_mult = 1.0`
   - 注：之前逆势做空曾设为0.5，基于含未来数据泄漏的回测（WR=42%,-2.5pt），修复数据泄漏后干净数据显示WR=60%,+26pt，改为0.8后+72pt增量（+13%），breakeven滑点4.2pt
 
-### 平仓信号系统（2026-03-24新增，03-26优先级调整）
+### 平仓信号系统（2026-03-24新增，03-26优先级调整，04-02~04-04参数优化）
 - 7个优先级：EOD_CLOSE > STOP_LOSS > LUNCH_CLOSE > TRAILING_STOP > TREND_COMPLETE > MOMENTUM_EXHAUSTED > MID_BREAK > TIME_STOP
 - STOP_LOSS 提升到 LUNCH_CLOSE 之前（防止午休前大亏不止损）
 - TREND_COMPLETE：5分钟上轨 + 15分钟上轨 = 两个周期都到极端才平仓
 - 用15分钟布林带判断趋势阶段，5分钟只用于跟踪止盈
 - 动态跟踪止盈：持仓时间越长宽度越大（0.5%→1.0%）
+- **IC trailing_stop_scale=2.0x（2026-04-04）**：IC的trailing stop宽度是IM的2倍（IC震荡性更强），+186pt
 - **MOMENTUM_EXHAUSTED最小持仓20分钟（2026-03-30）**：5-15min止出75%是过早的（54笔中36笔），加最小持仓4根K线。32天PnL +634→+735pt（+16%），breakeven滑点2.5→4.0pt
+- **ME narrow_range ratio 0.20→0.10（2026-04-04）**：ME触发条件收严（只有更窄的K线才算耗尽），IM+IC +393pt合计
+- **MID_BREAK bars 2→3（2026-04-04）**：需要3根K线破中轨（而非2根），IM+IC +76pt合计
 - 平仓后15分钟同方向冷却期
 - 开仓窗口：09:45~11:20, 13:05~14:30（`NO_OPEN_EOD = "06:30"` = 14:30 BJ，从14:15推迟，尾盘信号WR=67-80%）
 
@@ -103,6 +106,14 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
   - B2: 高IV+VRP<0+趋势 → 最危险，禁止卖方
 - Morning Briefing 和 quadrant_monitor 均输出 Hurst 值和历史分位
 
+### 研究指标自动记录（2026-04-02新增）
+- signal_log 每笔交易自动记录以下研究指标（不参与评分，仅用于积累样本后统计分析）：
+  - `adx_14`：ADX趋势强度（待100+笔ADX>35样本后验证硬过滤）
+  - `body_ratio`：K线实体占比（IM/IC品种特征不同，待更多样本）
+  - `vwap_offset`：VWAP偏离度（与M冗余r=0.67，不计分）
+  - `style_spread`：IM-IH收益率差（中性区间73%WR，待100+笔验证）
+  - `cross_rank`：跨品种相对强弱rank（整体亏钱-50%，不计分）
+
 ### 情绪乘数 sentiment_mult（2026-03-26修正）
 - VRP 不参与日内信号的情绪打折（VRP是波动率交易指标，与日内方向无关）
 - 保留的调节因子：IV变动、Skew变化、PCR逆向、期限结构倒挂
@@ -115,14 +126,21 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - 放量突破 +2分、窄带突破 +3分、15分钟同方向确认 +5分
 - 面板/回测中显示 `B{n}` 标注
 
-### 日内策略品种配置（2026-04-02验证，34天干净回测）
+### 日内策略品种配置（2026-04-04更新，34天干净回测，含全部bug修复）
 
 | 品种 | 类型 | 状态 | 阈值 | dm(顺/逆) | 版本 | PnL | 均PnL | BE |
 |------|------|------|------|-----------|------|-----|-------|-----|
-| IM | 动量 | **实盘** | 60 | 1.2/0.8 | v2 | +537 | +5.6 | 2.8 |
-| IC | 动量 | **实盘** | 65 | 1.2/0.8 | v2 | +454 | +5.3 | 2.6 |
-| IF | 均值回归 | 观察 | 60 | 1.0/1.0 | v2 | +255 | +2.5 | 1.2 |
-| IH | — | 放弃 | 60 | 1.2/0.8 | v2 | +106 | +1.1 | 0.6 |
+| IM | 动量 | **实盘** | 60 | 1.2/0.8 | v2 | +983 | +10.2 | 5.1 |
+| IC | 动量 | **实盘** | 65 | 1.2/0.8 | v2 | +1048 | +12.3 | 6.1 |
+| IF | 均值回归 | 观察 | 60 | 1.0/1.0 | v2 | ~+330 | ~+3.2 | ~1.6 |
+| IH | — | 放弃 | 60 | 1.2/0.8 | v2 | ~+130 | ~+1.4 | ~0.7 |
+
+IM+IC合计 +2031pt（vs 旧baseline +1207pt，+68%总改善）。主要改善来源：
+- 15分钟重采样对齐修复（label='left'）：最大单项改善
+- ME narrow_range ratio 0.20→0.10（+393pt合计）
+- MID_BREAK bars 2→3（+76pt合计）
+- IC trailing_stop_scale=2.0x（+186pt）
+- 午后session_weight 0.8→1.0（+76pt）
 
 - **实盘品种**：IM+IC，`IntradayConfig.tradeable = {"IM", "IC"}`，只有这两个品种通过strategy开仓占position_mgr槽位、写信号给executor、注册shadow持仓
 - **IF观察**：monitor全品种监控面板显示评分，但不占position_mgr槽位、不触发开仓。IF的BE=1.2pt余量小，等shadow验证2-4周后决定
@@ -149,6 +167,12 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - **CLOSE信号timestamp**：用`datetime.now()`（北京时间），与OPEN信号一致（不用utcnow）
 - **两进程完全独立**：Monitor不知道executor做了什么，executor不读position_mgr。通过JSON文件单向通信。executor自己跟TQ对账，自己判断是否执行信号
 - **position_mgr角色**：纯占位计数器（控制can_open/max_total_lots），不做实际止损/PnL。实际持仓管理由shadow系统（monitor端）和positions字典（executor端）分别负责
+
+### Monitor 盘中重启与信号系统Bug修复（2026-04-02~04-03）
+- **prompted_bars去重（2026-04-03）**：改用bar_data时间戳而非`_last_bar_time`（per-symbol不同步）去重，修复信号重复发送2次给executor的bug
+- **remove_by_symbol清理lock_pairs（2026-04-03）**：退出后清理lock_pairs，修复IM ME退出后无法再开仓的bug（position_mgr孤立entry）
+- **非可交易品种不占position_mgr槽位（2026-04-02）**：IF/IH面板显示但不占tradeable槽位，修复position_mgr被非实盘品种占满导致IM/IC无法开仓
+- **孤立持仓清理**：启动恢复时如发现position_mgr中有孤立entry（无对应shadow），自动清理
 
 ### Monitor 盘中重启状态恢复（2026-04-01修复）
 - **问题**：重启后position_mgr.positions清空，`_total_net_lots()=0`，突破max_total_lots=2限制
@@ -183,6 +207,11 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - order_executor 自动判断品种，锁仓记录 action="LOCK"
 - 启动时检查前日锁仓持仓并提醒
 
+### vol_monitor 订阅修复（2026-04-03）
+- **问题**：持仓的行权价（如MO2605-P-6000中的6000）被加入当月订阅的行权价列表，导致跨月污染，对应日期的全部行权价订阅失败
+- **修复**：订阅时按到期月份过滤，每个月份只订阅ATM附近的行权价，持仓行权价仅在匹配到期月份时才加入
+- **ATM优先测试**：订阅失败时先测试ATM合约是否可连接，快速定位是网络还是行权价问题
+
 ### Morning Briefing（2026-03-29新增）
 - 盘前运行 `python scripts/morning_briefing.py`，综合5维度评分输出方向Guidance
 - 数据源：Tushare（A50/美股/恒生/涨跌家数/成交额）+ 本地DB（IV/VRP/价格位置）
@@ -192,9 +221,10 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - **本地DB优先**：`download_briefing_history.py` 预下载历史数据到7个表，briefing优先读本地（快速），Tushare作fallback
 - 增量更新：`python scripts/download_briefing_history.py --update`
 
-### 回测注意事项（重要！2026-04-01全面审计）
+### 回测注意事项（重要！2026-04-01全面审计，04-04新增15m修复）
 - **Lookahead fix**：`bar_5m_signal = bar_5m.iloc[:-1]`，信号评分用上一根完成bar，执行价用当前bar close（详见 `docs/lookahead_audit.md`）
 - **止损精确化**：check_exit前先用bar high/low检查止损位，触发时exit_price=stop_price（不是close）
+- **15分钟K线重采样对齐（2026-04-04，关键！）**：`resample('15min', label='left', closed='left')`。旧版用`label='right'`导致每根15m bar的标签时间偏移15分钟，影响全部回测结果（时段判断、持仓时间、MID_BREAK等）。修复后IM+IC改善显著
 - `daily_df` 必须按回测日期截断（`trade_date < td`）
 - Z-Score 也必须按日期截断计算（`trade_date < td`）
 - sentiment / GARCH regime 也必须按回测日期加载（`trade_date < '{td}'`）
@@ -204,6 +234,7 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - **跨日GAP不修复**：M/V/Q中的隔夜gap"失真"是有益的开盘过滤器（验证修复后IM -53%）
 - **per-symbol阈值**：`effective_threshold` 从 SYMBOL_PROFILES.signal_threshold 读取（IC=65）
 - **--version v2/v3/auto**：支持切换信号版本回测
+- **动量lookback硬编码修复（2026-04-04）**：V2的`_score_momentum`原用硬编码`MOM_5M_LOOKBACK=12`，SYMBOL_PROFILES的IF/IH值18未生效。已修复为从prof读取。IF/IH配置从18改回12（grid search验证lb=12对四品种均最优或接近最优）
 
 ---
 
@@ -237,7 +268,9 @@ atm_iv_market,                                          ← 市场IV（期货价
 pnl_total, pnl_realized, pnl_unrealized,                ← P&L
 pnl_delta, pnl_gamma, pnl_theta, pnl_vega, pnl_residual, ← P&L归因
 iv_percentile_hist, signal_primary,                     ← IV分位主信号
-garch_reliable                                          ← GARCH可靠性（1=可靠，0=偏高已降权）
+garch_reliable,                                         ← GARCH可靠性（1=可靠，0=偏高已降权）
+hurst_60d,                                              ← Hurst指数60日滚动（2026-04-02新增）
+rr_25d                                                  ← 25D Risk Reversal（2026-04-02新增，插值法）
 ```
 
 ---
