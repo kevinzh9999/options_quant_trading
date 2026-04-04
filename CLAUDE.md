@@ -75,6 +75,21 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
   - 顺势：`daily_mult = 1.2`，中性：`daily_mult = 1.0`
   - 注：之前逆势做空曾设为0.5，基于含未来数据泄漏的回测（WR=42%,-2.5pt），修复数据泄漏后干净数据显示WR=60%,+26pt，改为0.8后+72pt增量（+13%），breakeven滑点4.2pt
 
+### 开盘振幅过滤器（2026-04-04新增）
+- 开盘30分钟（前6根5分钟bar）的振幅 < 0.4% → 后续不开新仓
+- 215天验证：低振幅日(<1%)均PnL=-27pt/天，过滤13天+274pt改善，误杀率15%
+- 开盘30min振幅与全天振幅的相关系数r=0.66（实用价值）
+- `check_low_amplitude(bar_5m)` 在 `A_share_momentum_signal_v2.py` 中定义
+- Monitor 在 10:00 BJ (UTC 02:00) 后检查，backtest 同样逻辑
+- 10:00前的交易正常进行（因为需要6根bar数据才能判断）
+
+### dm_trend/dm_contrarian（2026-04-04调整）
+- **IM/IC/IH：1.1/0.9**（从1.2/0.8调整，215天最优+691pt差距最大的参数）
+- **IF：保持1.0/1.0**（均值回归型，逆势是利润来源）
+- 默认fallback：1.1/0.9
+- 215天验证：1.0/1.0(中性) > 1.1/0.9(轻度) > 1.2/0.8(当前) > 1.3/0.7(激进)
+- 历史教训：1.2/0.8对逆势惩罚过重，逆势交易在长期也是盈利的
+
 ### 平仓信号系统（2026-03-24新增，03-26优先级调整，04-02~04-04参数优化）
 - 7个优先级：EOD_CLOSE > STOP_LOSS > LUNCH_CLOSE > TRAILING_STOP > TREND_COMPLETE > MOMENTUM_EXHAUSTED > MID_BREAK > TIME_STOP
 - STOP_LOSS 提升到 LUNCH_CLOSE 之前（防止午休前大亏不止损）
@@ -82,6 +97,7 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - 用15分钟布林带判断趋势阶段，5分钟只用于跟踪止盈
 - 动态跟踪止盈：持仓时间越长宽度越大（0.5%→1.0%）
 - **IC trailing_stop_scale=2.0x（2026-04-04）**：IC的trailing stop宽度是IM的2倍（IC震荡性更强），+186pt
+- **IM trailing_stop_scale=1.5x（2026-04-04）**：215天验证IM 1.5x > 1.0x（+259pt），止盈过紧频繁被震出
 - **MOMENTUM_EXHAUSTED最小持仓20分钟（2026-03-30）**：5-15min止出75%是过早的（54笔中36笔），加最小持仓4根K线。32天PnL +634→+735pt（+16%），breakeven滑点2.5→4.0pt
 - **ME narrow_range ratio 0.20→0.10（2026-04-04）**：ME触发条件收严（只有更窄的K线才算耗尽），IM+IC +393pt合计
 - **MID_BREAK bars 2→3（2026-04-04）**：需要3根K线破中轨（而非2根），IM+IC +76pt合计
@@ -126,16 +142,23 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - 放量突破 +2分、窄带突破 +3分、15分钟同方向确认 +5分
 - 面板/回测中显示 `B{n}` 标注
 
-### 日内策略品种配置（2026-04-04更新，34天干净回测，含全部bug修复）
+### 日内策略品种配置（2026-04-04更新，215天全量回测验证）
 
-| 品种 | 类型 | 状态 | 阈值 | dm(顺/逆) | 版本 | PnL | 均PnL | BE |
-|------|------|------|------|-----------|------|-----|-------|-----|
-| IM | 动量 | **实盘** | 60 | 1.2/0.8 | v2 | +983 | +10.2 | 5.1 |
-| IC | 动量 | **实盘** | 65 | 1.2/0.8 | v2 | +1048 | +12.3 | 6.1 |
-| IF | 均值回归 | 观察 | 60 | 1.0/1.0 | v2 | ~+330 | ~+3.2 | ~1.6 |
-| IH | — | 放弃 | 60 | 1.2/0.8 | v2 | ~+130 | ~+1.4 | ~0.7 |
+| 品种 | 类型 | 状态 | 阈值 | dm(顺/逆) | trail_scale | PnL(215d) | 均PnL |
+|------|------|------|------|-----------|-------------|-----------|-------|
+| IM | 动量 | **实盘** | 60 | 1.1/0.9 | 1.5x | +1870 | +9.4 |
+| IC | 动量 | **实盘** | 65 | 1.1/0.9 | 2.0x | +2197 | +12.1 |
+| IF | 均值回归 | 观察 | 60 | 1.0/1.0 | 1.0x | 未测 | — |
+| IH | — | 放弃 | 60 | 1.1/0.9 | 1.0x | 未测 | — |
 
-IM+IC合计 +2031pt（vs 旧baseline +1207pt，+68%总改善）。主要改善来源：
+IM+IC合计 +4067pt/215天（2025-05-16~2026-04-03）。无任何月份合计亏损。
+
+**04-04三项改动（215天敏感分析后实施，+21%/+717pt）：**
+- dm_trend/dm_contrarian 1.2/0.8→1.1/0.9（IM/IC/IH，IF保持1.0/1.0）
+- IM trailing_stop_scale 1.0→1.5x
+- 开盘30min振幅<0.4%过滤器（`check_low_amplitude()`）
+
+**此前改善来源（34天验证期）：**
 - 15分钟重采样对齐修复（label='left'）：最大单项改善
 - ME narrow_range ratio 0.20→0.10（+393pt合计）
 - MID_BREAK bars 2→3（+76pt合计）
@@ -310,7 +333,7 @@ python scripts/daily_record.py model --date YYYYMMDD  # 补跑模型
 
 ---
 
-## 项目当前状态（2026-03）
+## 项目当前状态（2026-04）
 
 ### 已完成 ✅
 | 模块 | 说明 |
@@ -318,7 +341,7 @@ python scripts/daily_record.py model --date YYYYMMDD  # 补跑模型
 | 数据层 | Tushare/TqSdk/SQLite/统一接口/质量检查/所有下载脚本/现货分钟线归档 |
 | 模型层 | GJR-GARCH / RealizedVol / ImpliedVol / VolSurface / Greeks / 统计模型 / 技术指标，638+ 测试全绿 |
 | 贴水策略 | DiscountSignal / DiscountPosition（含 Put Spread 对比）/ DiscountBacktest / DiscountCaptureStrategy |
-| 日内策略 | v2/v3信号系统 / 4层Z-Score过滤 / 布林带突破+平仓 / 现货数据源 / 离线回测 / 信号质量分析 |
+| 日内策略 | v2/v3信号系统 / 4层Z-Score过滤 / 布林带突破+平仓 / 现货数据源 / 离线回测 / 信号质量分析 / 215天全量敏感分析 / 振幅过滤器 |
 | 半自动下单 | order_executor.py / 限价单+手工确认 / 锁仓（股指期货平今优化）/ TqBacktest验证 |
 | Morning Briefing | P1(跨市场/宽度/成交额/波动率/价格) + P2(北向/融资/PCR/ETF/期货持仓) + 极端值逆向修正 |
 | 象限监控 | quadrant_monitor.py / A/B/C/D判定 / 持仓匹配 / 象限切换alert |
@@ -354,7 +377,9 @@ strategies/intraday/             ← 日内策略（v2/v3信号 + 平仓系统 +
 scripts/daily_record.py          ← EOD 主流程（~1500 行）
 scripts/portfolio_analysis.py    ← 持仓分析主流程（~950 行）
 scripts/vol_monitor.py           ← 期权波动率实时监控面板（~1650 行）
-scripts/backtest_signals_day.py  ← 日内信号离线回测
+scripts/backtest_signals_day.py  ← 日内信号离线回测（含振幅过滤）
+scripts/exit_sensitivity.py      ← Exit参数敏感分析（参数化check_exit）
+scripts/sensitivity_215d.py      ← 全量215天敏感分析（7参数×IM+IC）
 dashboard/pages/model_diagnostics.py ← 含 GARCH 预测回测 section
 ```
 
@@ -384,8 +409,13 @@ python scripts/backtest_signals_day.py --symbol IM --date 20260324
 # 多日（逗号分隔，内置汇总输出）
 python scripts/backtest_signals_day.py --symbol IM --date 20260324,20260323,20260320
 
-# 30天完整回测（截至2026-03-26）
-python scripts/backtest_signals_day.py --symbol IM --date 20260204,20260205,20260206,20260209,20260210,20260211,20260212,20260213,20260225,20260226,20260227,20260302,20260303,20260304,20260305,20260306,20260309,20260310,20260311,20260312,20260313,20260316,20260317,20260318,20260319,20260320,20260323,20260324,20260325,20260326
+# 215天完整回测（2025-05-16 ~ 2026-04-03，index_min全量）
+python scripts/backtest_signals_day.py --symbol IM --date 20250516-20260403
+python scripts/backtest_signals_day.py --symbol IC --date 20250516-20260403
+
+# 敏感分析（全量215天，7参数×IM+IC并排）
+python scripts/sensitivity_215d.py --param P1          # 单参数
+python scripts/sensitivity_215d.py --param ALL          # 全部7参数
 ```
 
 ### 日内监控
