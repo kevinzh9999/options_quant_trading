@@ -490,7 +490,7 @@ def check_exit(
         last3_l = bar_5m["low"].astype(float).iloc[-3:]
         total_range = float(last3_h.max() - last3_l.min())
         boll_width = 4 * b5_std
-        if total_range < boll_width * 0.20:
+        if total_range < boll_width * 0.10:
             # Narrow range — but is price still trending?
             close_change = float(last3_c.iloc[-1]) - float(last3_c.iloc[0])
             still_trending = False
@@ -522,7 +522,7 @@ def check_exit(
             bars_below_mid = position.get("bars_below_mid", 0) + 1
             position["bars_below_mid"] = bars_below_mid
             # Need 2 bars + 15m confirmation
-            if bars_below_mid >= 2 and fifteen_below:
+            if bars_below_mid >= 3 and fifteen_below:
                 return {"should_exit": True, "exit_volume": volume,
                         "exit_reason": "MID_BREAK", "exit_urgency": "NORMAL"}
         else:
