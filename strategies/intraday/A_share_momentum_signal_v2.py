@@ -458,6 +458,9 @@ def check_exit(
             if pnl_pct > 0.005 and fifteen_ok:
                 trail_pct += 0.002  # +0.2% bonus
 
+        # Per-symbol trailing scale（IC=2.0x需要更宽trailing）
+        trail_pct *= _prof.get("trailing_stop_scale", 1.0)
+
         if direction == "LONG" and highest > entry_price:
             dd = (highest - current_price) / highest
             if dd > trail_pct:
@@ -769,6 +772,7 @@ SYMBOL_PROFILES: Dict[str, Dict] = {
         "daily_align_bonus": 1.2,
         "daily_conflict_penalty": 0.7,
         "signal_threshold": 65,       # IC的60-64是死亡区间（38%WR, -7.1pt/笔）
+        "trailing_stop_scale": 2.0,   # IC趋势中震荡大，需要更宽trailing（5/5周稳健验证）
         "session_multiplier": {
             "0935-1030": 1.0,
             "1030-1130": 1.1,
