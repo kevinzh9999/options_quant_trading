@@ -418,6 +418,8 @@ class IntradayMonitor:
         self._last_bar_time: Dict[str, str] = {}
         # 已经prompt过的 (symbol, bar_dt) 集合，防止同一根bar重复触发
         self._prompted_bars: set = set()
+        # 开盘振幅过滤：per-symbol，每天重置
+        self._low_amplitude: Dict[str, bool] = {}
         # 日线数据（启动时从数据库加载）
         self._daily_data: Dict[str, pd.DataFrame] = {}
         # 最新各维度评分（供面板显示）— 路由后的最终得分
@@ -1117,6 +1119,33 @@ class IntradayMonitor:
                 continue
             filtered_actions.append(act)
         actions = filtered_actions
+
+        # 开盘振幅过滤：10:00后如果前30min振幅<0.4%，阻断OPEN
+        # 215天验证：过滤13天低振幅日，+274pt改善
+        from strategies.intraday.A_share_momentum_signal_v2 import check_low_amplitude
+        if current_time_utc >= "02:00":  # 10:00 BJ = 02:00 UTC
+            amp_filtered = []
+            for act in actions:
+                if act.get("action") != "OPEN":
+                    amp_filtered.append(act)
+                    continue
+                sym = act.get("symbol", "")
+                b5 = bar_data.get(sym)
+                if b5 is not None and not self._low_amplitude.get(sym, False):
+                    # 首次检查（只做一次/天）
+                    if sym not in self._low_amplitude:
+                        is_low = check_low_amplitude(b5)
+                        self._low_amplitude[sym] = is_low
+                        if is_low:
+                            print(f"  [AMP-FILTER] {sym} 开盘30min振幅<0.4%，今日不开新仓")
+                if self._low_amplitude.get(sym, False):
+                    print(f"  [AMP-FILTER] {sym} {act.get('direction','')} "
+                          f"score={act.get('score',0)} BLOCKED (低振幅日)")
+                    # 撤销strategy.on_bar已创建的position_mgr占位
+                    self.strategy.position_mgr.remove_by_symbol(sym)
+                    continue
+                amp_filtered.append(act)
+            actions = amp_filtered
 
         # 暂存信号日志所需数据（延迟到信号发出之后再写DB，避免阻塞信号流程）
         _signal_log_data = []

@@ -336,6 +336,34 @@ def is_open_allowed(utc_hm: str) -> bool:
     return True
 
 
+# ── 开盘振幅过滤器 ─────────────────────────────────────────
+# 215天验证：开盘30min振幅<0.4%的日子策略均PnL=-21pt/天
+# 过滤后+274pt改善，误杀率仅15%
+OPEN_RANGE_FILTER_PCT = 0.004   # 0.4%
+OPEN_RANGE_BARS = 6             # 前6根5分钟bar = 30分钟
+
+
+def check_low_amplitude(bar_5m: pd.DataFrame) -> bool:
+    """判断当天是否为低振幅日（开盘30分钟振幅<0.4%）。
+
+    Args:
+        bar_5m: 当天的5分钟K线（至少需要前6根bar）
+
+    Returns:
+        True if low amplitude (should suppress new entries), False otherwise
+    """
+    if bar_5m is None or len(bar_5m) < OPEN_RANGE_BARS:
+        return False
+    first_bars = bar_5m.iloc[:OPEN_RANGE_BARS]
+    open_price = float(first_bars.iloc[0]["open"])
+    if open_price <= 0:
+        return False
+    high_max = float(first_bars["high"].astype(float).max())
+    low_min = float(first_bars["low"].astype(float).min())
+    amplitude = (high_max - low_min) / open_price
+    return amplitude < OPEN_RANGE_FILTER_PCT
+
+
 def check_exit(
     position: dict,
     current_price: float,
@@ -706,6 +734,9 @@ SYMBOL_PROFILES: Dict[str, Dict] = {
         "reversal_weight": 0,
         "daily_align_bonus": 1.2,     # 保守与v2一致
         "daily_conflict_penalty": 0.7, # 与v2一致
+        "dm_trend": 1.1,              # 215天验证：1.1/0.9 > 1.2/0.8（+691pt合计）
+        "dm_contrarian": 0.9,         # 轻度逆势惩罚，避免过度打折逆势交易
+        "trailing_stop_scale": 1.5,   # 215天验证：1.5x > 1.0x（IM+259pt）
         "session_multiplier": {
             "0935-1030": 1.0,
             "1030-1130": 1.1,
@@ -750,6 +781,8 @@ SYMBOL_PROFILES: Dict[str, Dict] = {
         "reversal_weight": 20,        # 反转维度
         "daily_align_bonus": 1.2,
         "daily_conflict_penalty": 0.7,
+        "dm_trend": 1.1,              # 215天验证：1.1/0.9统一
+        "dm_contrarian": 0.9,
         "session_multiplier": {
             "0935-1030": 1.0,
             "1030-1130": 1.0,
@@ -771,6 +804,8 @@ SYMBOL_PROFILES: Dict[str, Dict] = {
         "reversal_weight": 0,
         "daily_align_bonus": 1.2,
         "daily_conflict_penalty": 0.7,
+        "dm_trend": 1.1,              # 215天验证：1.1/0.9 > 1.2/0.8
+        "dm_contrarian": 0.9,
         "signal_threshold": 65,       # IC的60-64是死亡区间（38%WR, -7.1pt/笔）
         "trailing_stop_scale": 2.0,   # IC趋势中震荡大，需要更宽trailing（5/5周稳健验证）
         "session_multiplier": {
@@ -1141,8 +1176,8 @@ class SignalGeneratorV2:
             return 1.0
         # Per-symbol dm from SYMBOL_PROFILES（IF中性1.0/1.0, IM/IC动量1.2/0.8）
         prof = SYMBOL_PROFILES.get(symbol, _DEFAULT_PROFILE) if symbol else _DEFAULT_PROFILE
-        dm_trend = prof.get("dm_trend", 1.2)
-        dm_contra = prof.get("dm_contrarian", 0.8)
+        dm_trend = prof.get("dm_trend", 1.1)
+        dm_contra = prof.get("dm_contrarian", 0.9)
         daily_dir = "LONG" if daily_mom > 0 else "SHORT"
         if daily_dir == signal_dir:
             return dm_trend

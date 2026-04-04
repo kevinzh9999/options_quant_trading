@@ -202,6 +202,9 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
     # Cooldown tracker: prevent same-direction re-entry within 15min
     last_exit_utc: str = ""
     last_exit_dir: str = ""
+    # 开盘振幅过滤（215天验证：<0.4%日均亏-21pt，过滤+274pt）
+    from strategies.intraday.A_share_momentum_signal_v2 import check_low_amplitude
+    _low_amplitude: Optional[bool] = None  # None=未判断, True=低振幅, False=正常
     COOLDOWN_MINUTES = 15
 
     # Truncate daily data to replay date (no future leakage, strict < to exclude today)
@@ -417,8 +420,20 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
             if 0 < cd_elapsed < COOLDOWN_MINUTES:
                 in_cooldown = True
 
+        # 开盘振幅过滤：10:00(UTC 02:00)后判断前6根bar
+        if _low_amplitude is None and utc_hm >= "02:00":
+            bar_idx_in_day = today_indices.index(idx) if idx in today_indices else 0
+            if bar_idx_in_day >= 6:
+                today_first6 = all_bars.loc[today_indices[:6]]
+                _low_amplitude = check_low_amplitude(today_first6)
+                if _low_amplitude and verbose:
+                    print(f"  [AMP-FILTER] 开盘30min振幅<0.4%，后续不开新仓")
+            else:
+                _low_amplitude = False
+
         if (position is None and not action_str and result and not in_cooldown
-                and score >= effective_threshold and direction and is_open_allowed(utc_hm)):
+                and score >= effective_threshold and direction and is_open_allowed(utc_hm)
+                and not _low_amplitude):
             # Apply slippage adversely on entry
             entry_p = price + slippage if direction == "LONG" else price - slippage
             # Compute rebound/pullback from recent 20-bar extreme (use signal bars)
