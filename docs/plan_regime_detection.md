@@ -3,6 +3,19 @@
 > 目标：用期权市场数据（IV/RV/Skew）构建 intraday_regime_score，辅助判断当天适合日内交易还是多日持仓。
 >
 > 创建：2026-04-04
+>
+> **开发进展**
+> - 2026-04-04 Phase 1 启动：`scripts/backfill_iv_history.py` 编写完成
+>   - 新增DB列：`iv_term_spread`, `realized_vol_5d`（schemas.py）
+>   - 复用 `portfolio_analysis.py:get_atm_iv()` + `vol_monitor.py:calc_rr_bf()`
+>   - 数据覆盖：options_daily 215天无缺失（每天200-300行MO），需补atm_iv 201天
+>   - Phase 1 完成：190天ATM IV/RV/VRP/RR/IV Term Spread/Hurst入库
+>   - Phase 2 完成：**No-Go**——无期权指标达到独立增量阈值(偏相关>0.15)
+>     - IV Term Spread(期限结构倒挂) r=0.05 vs PnL，偏相关-0.066，无用
+>     - VRP偏相关-0.084（弱增量但不够强），高VRP=低振幅=策略不利
+>     - ATM IV偏相关-0.110（负！），完全是振幅代理
+>   - **结论**：振幅过滤器已是最优方案，不构建regime_score
+>   - **附加价值**：190天IV/RV/VRP/RR数据已入库，供象限监控/sentiment校准使用
 
 ---
 
