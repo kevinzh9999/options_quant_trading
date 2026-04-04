@@ -243,7 +243,8 @@ def _get_vol_environment(db: DBManager) -> dict:
 
 def _get_price_position(db: DBManager, trade_date: str) -> dict:
     result = {"current": 0, "high_20": 0, "low_20": 0,
-              "range_pos": 0.5, "mom_5d": 0, "streak": 0, "streak_dir": ""}
+              "range_pos": 0.5, "mom_5d": 0, "streak": 0, "streak_dir": "",
+              "bb_width": 0.0}
     df = db.query_df(
         "SELECT trade_date, close FROM index_daily "
         "WHERE ts_code='000852.SH' AND trade_date <= ? "
@@ -278,6 +279,13 @@ def _get_price_position(db: DBManager, trade_date: str) -> dict:
             break
     result["streak"] = streak
     result["streak_dir"] = streak_dir
+
+    # BB width = 2*std(20)/ma(20)，用于波段趋势提示
+    if len(closes) >= 20:
+        ma20 = np.mean(closes[-20:])
+        std20 = np.std(closes[-20:], ddof=1)
+        result["bb_width"] = (2 * std20 / ma20) if ma20 > 0 else 0
+
     return result
 
 
@@ -898,6 +906,24 @@ def print_briefing(trade_date, direction, confidence, score,
     if ip and ip > 70: print(f"  期权: IV仍在P{ip:.0f}高位，卖方持仓持有但不加仓")
     if vrp_v and ((abs(vrp_v) < 1 and vrp_v < -0.05) or (abs(vrp_v) >= 1 and vrp_v < -5)):
         print(f"  风险提示: VRP为负，警惕波动率再次扩大")
+
+    # 波段趋势提示（215天研究：长趋势特征=连续5天+BB>3%+ret>3%）
+    streak = price_pos.get("streak", 0)
+    streak_dir = price_pos.get("streak_dir", "")
+    mom_5d = price_pos.get("mom_5d", 0)
+    bb_w = price_pos.get("bb_width", 0)
+    if streak >= 5 and bb_w > 0.03 and abs(mom_5d) > 0.03:
+        dir_cn = "涨" if streak_dir == "up" else "跌"
+        side_cn = "多" if streak_dir == "up" else "空"
+        print(f"\n【波段机会提示】")
+        print(f"  连续{streak}天{dir_cn}  BB width: {bb_w:.1%}  5日涨跌: {mom_5d:+.1%}")
+        print(f"  → 可考虑额外1手{side_cn}头波段仓（出场: 跌破MA20或持仓满15天）")
+    elif streak >= 3:
+        dir_cn = "涨" if streak_dir == "up" else "跌"
+        print(f"\n【趋势观察】连续{streak}天{dir_cn}"
+              f"  BB={bb_w:.1%}  ret5d={mom_5d:+.1%}"
+              f"{'  (暂未达标: 需5天+BB>3%%+ret>3%%)' if streak < 5 else ''}")
+
     print(f"{'═' * W}")
 
 
