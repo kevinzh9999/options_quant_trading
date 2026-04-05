@@ -244,9 +244,9 @@ def _get_vol_environment(db: DBManager) -> dict:
 def _get_price_position(db: DBManager, trade_date: str) -> dict:
     result = {"current": 0, "high_20": 0, "low_20": 0,
               "range_pos": 0.5, "mom_5d": 0, "streak": 0, "streak_dir": "",
-              "bb_width": 0.0}
+              "bb_width": 0.0, "vol_ratio": 1.0}
     df = db.query_df(
-        "SELECT trade_date, close FROM index_daily "
+        "SELECT trade_date, close, volume FROM index_daily "
         "WHERE ts_code='000852.SH' AND trade_date <= ? "
         "ORDER BY trade_date DESC LIMIT 25",
         (trade_date,))
@@ -285,6 +285,11 @@ def _get_price_position(db: DBManager, trade_date: str) -> dict:
         ma20 = np.mean(closes[-20:])
         std20 = np.std(closes[-20:], ddof=1)
         result["bb_width"] = (2 * std20 / ma20) if ma20 > 0 else 0
+
+    # vol_ratio = 当日成交量 / 20日均量（放量确认）
+    volumes = df["volume"].astype(float).values
+    if len(volumes) >= 20 and volumes[-20:].mean() > 0:
+        result["vol_ratio"] = float(volumes[-1] / volumes[-20:].mean())
 
     return result
 
@@ -907,22 +912,57 @@ def print_briefing(trade_date, direction, confidence, score,
     if vrp_v and ((abs(vrp_v) < 1 and vrp_v < -0.05) or (abs(vrp_v) >= 1 and vrp_v < -5)):
         print(f"  风险提示: VRP为负，警惕波动率再次扩大")
 
-    # 波段趋势提示（215天研究：长趋势特征=连续5天+BB>3%+ret>3%）
+    # 波段趋势提示（215天研究：长趋势5项显著特征，全部p<0.05）
+    # BB width>3%, ret_5d>3%, pos_20d>0.7, vol_ratio>1.1, streak>=5
     streak = price_pos.get("streak", 0)
     streak_dir = price_pos.get("streak_dir", "")
     mom_5d = price_pos.get("mom_5d", 0)
     bb_w = price_pos.get("bb_width", 0)
-    if streak >= 5 and bb_w > 0.03 and abs(mom_5d) > 0.03:
+    pos_20d = price_pos.get("range_pos", 0.5)
+    vol_ratio = price_pos.get("vol_ratio", 1.0)
+
+    # 计算达标项数（5项显著特征）
+    swing_hits = []
+    swing_misses = []
+    if streak >= 5:
+        swing_hits.append(f"连续{streak}天")
+    elif streak >= 3:
+        swing_misses.append(f"连续{streak}天(需5)")
+    else:
+        swing_misses.append(f"连续{streak}天(需5)")
+    if bb_w > 0.03:
+        swing_hits.append(f"BB={bb_w:.1%}")
+    else:
+        swing_misses.append(f"BB={bb_w:.1%}(需>3%)")
+    if abs(mom_5d) > 0.03:
+        swing_hits.append(f"ret5d={mom_5d:+.1%}")
+    else:
+        swing_misses.append(f"ret5d={mom_5d:+.1%}(需>3%)")
+    if pos_20d > 0.7 or pos_20d < 0.3:  # 高位做多或低位做空
+        swing_hits.append(f"pos20d={pos_20d:.0%}")
+    else:
+        swing_misses.append(f"pos20d={pos_20d:.0%}(需>70%)")
+    if vol_ratio > 1.1:
+        swing_hits.append(f"放量{vol_ratio:.2f}x")
+    else:
+        swing_misses.append(f"量比{vol_ratio:.2f}x(需>1.1)")
+
+    n_hits = len(swing_hits)
+    if n_hits >= 4:
         dir_cn = "涨" if streak_dir == "up" else "跌"
         side_cn = "多" if streak_dir == "up" else "空"
-        print(f"\n【波段机会提示】")
-        print(f"  连续{streak}天{dir_cn}  BB width: {bb_w:.1%}  5日涨跌: {mom_5d:+.1%}")
+        print(f"\n【波段机会提示】{n_hits}/5项达标")
+        print(f"  达标: {' | '.join(swing_hits)}")
+        if swing_misses:
+            print(f"  未达: {' | '.join(swing_misses)}")
         print(f"  → 可考虑额外1手{side_cn}头波段仓（出场: 跌破MA20或持仓满15天）")
     elif streak >= 3:
         dir_cn = "涨" if streak_dir == "up" else "跌"
-        print(f"\n【趋势观察】连续{streak}天{dir_cn}"
-              f"  BB={bb_w:.1%}  ret5d={mom_5d:+.1%}"
-              f"{'  (暂未达标: 需5天+BB>3%%+ret>3%%)' if streak < 5 else ''}")
+        print(f"\n【趋势观察】连续{streak}天{dir_cn}  {n_hits}/5项达标")
+        if swing_hits:
+            print(f"  达标: {' | '.join(swing_hits)}")
+        if swing_misses:
+            print(f"  未达: {' | '.join(swing_misses)}")
 
     print(f"{'═' * W}")
 
