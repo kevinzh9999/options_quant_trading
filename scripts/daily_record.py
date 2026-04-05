@@ -474,8 +474,9 @@ def _eod_archive_minute_bars(api, trade_date: str, db) -> int:
     symbols = ["IF", "IH", "IM", "IC"]
     total = 0
     try:
+        from utils.cffex_calendar import get_main_contract
         for sym in symbols:
-            full_sym = f"CFFEX.{sym}2604"  # 当月合约，需根据实际调整
+            full_sym = get_main_contract(sym, api=api)
             klines = api.get_kline_serial(full_sym, 300, 200)
             api.wait_update(deadline=time.time() + 10)
 
