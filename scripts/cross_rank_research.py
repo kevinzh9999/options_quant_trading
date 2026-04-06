@@ -31,7 +31,7 @@ ROOT = str(Path(__file__).resolve().parents[1])
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from config.config_loader import ConfigLoader
 
 # ---------------------------------------------------------------------------
@@ -974,7 +974,7 @@ def main():
     print(f" 日期: {dates[0]} ~ {dates[-1]} ({len(dates)}天)")
     print(f"{'='*70}")
 
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
 
     # ---------------------------------------------------------------------------
     # 加载数据

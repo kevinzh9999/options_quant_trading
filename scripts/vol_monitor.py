@@ -38,7 +38,7 @@ except ImportError:
     pass
 
 from config.config_loader import ConfigLoader
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from models.pricing.forward_price import calc_implied_forward
 from models.pricing.implied_vol import calc_implied_vol
 from models.pricing.greeks import calc_all_greeks
@@ -92,7 +92,7 @@ def _find_near_month(months: list, expire_map: dict, today: str, min_dte: int = 
 
 def _open_db():
     try:
-        return DBManager(ConfigLoader().get_db_path())
+        return get_db()
     except Exception as e:
         print(f"  [警告] DB: {e}")
         return None

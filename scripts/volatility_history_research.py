@@ -32,7 +32,7 @@ try:
 except ImportError:
     pass
 
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from config.config_loader import ConfigLoader
 
 OUTPUT_DIR = Path(ROOT) / "logs" / "research"
@@ -656,7 +656,7 @@ def main():
     print("=" * 60)
     print()
 
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
     report_parts = []
     report_parts.append("# 波动率历史研究")
     report_parts.append(f"> 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")

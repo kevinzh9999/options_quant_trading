@@ -182,6 +182,19 @@ class ConfigLoader:
             p = _PROJECT_ROOT / p
         return str(p)
 
+    def get_options_db_path(self) -> str:
+        """
+        获取期权数据库文件路径（绝对路径）。
+
+        默认为项目根目录下的 data/storage/options_data.db。
+        存放 options_daily / options_contracts / options_min。
+        """
+        raw_path: str = self.get("database.options_path", "data/storage/options_data.db")
+        p = Path(raw_path)
+        if not p.is_absolute():
+            p = _PROJECT_ROOT / p
+        return str(p)
+
     def get_tmp_dir(self) -> str:
         """项目级 tmp 目录，所有运行时临时文件放这里。"""
         tmp_dir = _PROJECT_ROOT / "tmp"

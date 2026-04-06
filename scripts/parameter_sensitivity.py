@@ -28,7 +28,7 @@ if ROOT not in sys.path:
 
 import numpy as np
 
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from config.config_loader import ConfigLoader
 
 # ---------------------------------------------------------------------------
@@ -806,7 +806,7 @@ def main():
     print(f"  Baseline thresholds: {BASE_THRESHOLD}")
     print(f"{'═'*80}")
 
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
 
     # Select groups to run
     if args.group:

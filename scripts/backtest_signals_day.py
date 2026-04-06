@@ -22,7 +22,7 @@ ROOT = str(Path(__file__).resolve().parents[1])
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from config.config_loader import ConfigLoader
 
 IM_MULT = 200  # IM合约乘数
@@ -642,7 +642,7 @@ def main():
                         help="Run sensitivity sweep: slippage 0/5/10 × threshold 50/55/60")
     args = parser.parse_args()
 
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
 
     # Expand date range
     if "-" in args.date and len(args.date) == 17:

@@ -772,12 +772,91 @@ CREATE INDEX IF NOT EXISTS idx_execlog_time ON executor_log (receive_time);
 CREATE INDEX IF NOT EXISTS idx_execlog_sym ON executor_log (symbol, receive_time);
 """
 
-# 所有建表语句按依赖顺序排列
+# ---------------------------------------------------------------------------
+# 期权分钟线（MO 5分钟K线）
+# ---------------------------------------------------------------------------
+
+OPTIONS_MIN_SQL = """
+CREATE TABLE IF NOT EXISTS options_min (
+    ts_code      TEXT    NOT NULL,          -- 期权合约代码 MO2605-C-7000.CFX
+    datetime     TEXT    NOT NULL,          -- 时间戳 YYYY-MM-DD HH:MM:SS
+    period       INT     NOT NULL,          -- 周期秒数 300=5m
+    open         REAL,
+    high         REAL,
+    low          REAL,
+    close        REAL,
+    volume       REAL,                      -- 成交量（手）
+    open_interest REAL,                     -- 持仓量
+    PRIMARY KEY (ts_code, datetime, period)
+);
+CREATE INDEX IF NOT EXISTS idx_om_tscode   ON options_min (ts_code);
+CREATE INDEX IF NOT EXISTS idx_om_datetime ON options_min (datetime);
+"""
+
+# ---------------------------------------------------------------------------
+# 期货 Tick 数据（单独 DB：tick_data.db）
+# schema 定义放这里方便统一管理，建表在 download_tick_pro.py 中执行
+# ---------------------------------------------------------------------------
+
+FUTURES_TICK_SQL = """
+CREATE TABLE IF NOT EXISTS futures_tick (
+    symbol       TEXT    NOT NULL,          -- 品种代码 IM/IC/IF/IH
+    datetime     TEXT    NOT NULL,          -- 纳秒精度时间 YYYY-MM-DD HH:MM:SS.ffffff
+    last_price   REAL,                      -- 最新价
+    average      REAL,                      -- 当日均价
+    highest      REAL,                      -- 当日最高价
+    lowest       REAL,                      -- 当日最低价
+    bid_price1   REAL,                      -- 买一价
+    bid_volume1  INT,                       -- 买一量
+    ask_price1   REAL,                      -- 卖一价
+    ask_volume1  INT,                       -- 卖一量
+    volume       INT,                       -- 当日累计成交量
+    amount       REAL,                      -- 当日累计成交额
+    open_interest INT,                      -- 持仓量
+    PRIMARY KEY (symbol, datetime)
+);
+CREATE INDEX IF NOT EXISTS idx_ft_symbol   ON futures_tick (symbol);
+CREATE INDEX IF NOT EXISTS idx_ft_datetime ON futures_tick (datetime);
+"""
+
+# ---------------------------------------------------------------------------
+# ETF 分钟线（独立存放于 etf_data.db）
+# ---------------------------------------------------------------------------
+
+ETF_MIN_SQL = """
+CREATE TABLE IF NOT EXISTS etf_min (
+    symbol       TEXT    NOT NULL,          -- ETF代码 512100/510500/510300/510050
+    datetime     TEXT    NOT NULL,
+    period       INT     NOT NULL,          -- 周期秒数 300=5m
+    open         REAL,
+    high         REAL,
+    low          REAL,
+    close        REAL,
+    volume       REAL,                      -- 成交量（股）
+    open_interest REAL,
+    PRIMARY KEY (symbol, datetime, period)
+);
+CREATE INDEX IF NOT EXISTS idx_etf_symbol   ON etf_min (symbol);
+CREATE INDEX IF NOT EXISTS idx_etf_datetime ON etf_min (datetime);
+"""
+
+# ---------------------------------------------------------------------------
+# 期权表（独立存放于 options_data.db）
+# ---------------------------------------------------------------------------
+
+OPTIONS_TABLES: list[str] = [
+    OPTIONS_DAILY_SQL,
+    OPTIONS_CONTRACTS_SQL,
+    OPTIONS_MIN_SQL,
+]
+
+# ---------------------------------------------------------------------------
+# 主库表（trading.db）— 不含期权表
+# ---------------------------------------------------------------------------
+
 ALL_TABLES: list[str] = [
     FUTURES_DAILY_SQL,
     FUTURES_MIN_SQL,
-    OPTIONS_DAILY_SQL,
-    OPTIONS_CONTRACTS_SQL,
     COMMODITY_DAILY_SQL,
     TRADE_CALENDAR_SQL,
     INDEX_DAILY_SQL,

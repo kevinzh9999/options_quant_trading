@@ -34,7 +34,7 @@ except ImportError:
     pass
 
 from config.config_loader import ConfigLoader
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 
 W = 70  # panel width
 BRIEFING_JSON = os.path.join(ConfigLoader().get_tmp_dir(), "morning_briefing.json")
@@ -1042,7 +1042,7 @@ def _save_markdown(trade_date, direction, confidence, score, reasons):
 # ---------------------------------------------------------------------------
 
 def run_briefing(target_date=None):
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
     if target_date is None:
         target_date = datetime.now().strftime("%Y%m%d")
 

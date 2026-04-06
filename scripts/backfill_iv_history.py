@@ -27,7 +27,7 @@ if ROOT not in sys.path:
 
 warnings.filterwarnings("ignore")
 
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from config.config_loader import ConfigLoader
 
 # Reuse existing calculation functions
@@ -273,7 +273,7 @@ def main():
     parser.add_argument("--force", action="store_true", help="覆盖已有数据")
     args = parser.parse_args()
 
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
 
     # Get all dates from index_min
     r = db.query_df(

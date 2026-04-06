@@ -63,9 +63,9 @@ def main():
     print(f"Backfill {db_symbol} {args.period}s bars → {table}")
     print(f"  TQ symbol: {tq_sym}, requesting {args.bars} bars")
 
-    from data.storage.db_manager import DBManager
+    from data.storage.db_manager import DBManager, get_db
     from config.config_loader import ConfigLoader
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
 
     from data.sources.tq_client import TqClient
     creds = {

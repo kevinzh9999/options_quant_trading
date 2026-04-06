@@ -29,9 +29,9 @@ PRODUCT_COLORS = {"IF": "#3498db", "IH": "#e74c3c", "IM": "#e67e22", "IC": "#9b5
 @st.cache_resource
 def _get_db():
     try:
-        from data.storage.db_manager import DBManager
+        from data.storage.db_manager import DBManager, get_db
         from config.config_loader import ConfigLoader
-        db = DBManager(ConfigLoader().get_db_path())
+        db = get_db()
         db.initialize_tables()
         return db
     except Exception as e:

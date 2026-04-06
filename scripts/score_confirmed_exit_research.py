@@ -28,7 +28,7 @@ ROOT = str(Path(__file__).resolve().parents[1])
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from config.config_loader import ConfigLoader
 
 # 和baseline一致的常量
@@ -713,7 +713,7 @@ def main():
     parser.add_argument("--date", default="", help="YYYYMMDD 单日详细模式（可逗号分隔）")
     args = parser.parse_args()
 
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
 
     # Full date list
     ALL_DATES = (

@@ -217,8 +217,8 @@ def _has_tq_broker() -> bool:
 
 
 def _open_db():
-    from data.storage.db_manager import DBManager
-    db = DBManager(DB_PATH)
+    from data.storage.db_manager import get_db
+    db = get_db()
     db.initialize_tables()
     return db
 

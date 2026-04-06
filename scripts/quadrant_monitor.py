@@ -32,7 +32,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from config.config_loader import ConfigLoader
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 
 W = 80  # 面板宽度
 
@@ -767,7 +767,7 @@ def run_once(db: DBManager, prev_quadrant: str = "",
 
 
 def main():
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
 
     if "--once" in sys.argv:
         tq_acc, tq_pos = _load_tq_account_and_positions()

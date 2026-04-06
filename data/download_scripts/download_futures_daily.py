@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from config import load_config
 from data.quality_check import DataQualityChecker
 from data.sources.tushare_client import TushareClient
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 
 logger = logging.getLogger(__name__)
 
@@ -188,7 +188,7 @@ def main() -> None:
     config = load_config(args.config)
     client = TushareClient(token=config.tushare_token)
 
-    with DBManager(config.db_path) as db:
+    with get_db(config) as db:
         download_futures_daily(
             start_date=args.start,
             end_date=end_date,

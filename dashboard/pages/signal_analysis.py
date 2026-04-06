@@ -20,7 +20,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from config.config_loader import ConfigLoader
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 
 
 def _load_signal_log(db, days=30):
@@ -40,7 +40,7 @@ def _load_order_log(db):
 def render():
     st.title("日内信号分析")
 
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
 
     # 侧边栏
     days = st.sidebar.slider("回看天数", 7, 90, 30)

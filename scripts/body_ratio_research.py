@@ -24,7 +24,7 @@ ROOT = str(Path(__file__).resolve().parents[1])
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from config.config_loader import ConfigLoader
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -773,7 +773,7 @@ def main():
     args = parser.parse_args()
 
     symbols = [s.strip().upper() for s in args.symbol.split(",")]
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
 
     print("\n" + "=" * 80)
     print(f"  K线实体占比 Body Ratio 调节器可行性分析")

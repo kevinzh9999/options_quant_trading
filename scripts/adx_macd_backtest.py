@@ -28,7 +28,7 @@ ROOT = str(Path(__file__).resolve().parents[1])
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from config.config_loader import ConfigLoader
 
 # Import the backtest framework
@@ -460,7 +460,7 @@ def main():
                         help="逗号分隔的回测日期，默认30天")
     args = parser.parse_args()
 
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
     dates = [d.strip() for d in args.dates.split(",")]
 
     print(f"\n{'═'*70}")

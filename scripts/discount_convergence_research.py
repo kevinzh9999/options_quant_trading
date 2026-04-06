@@ -33,7 +33,7 @@ try:
 except ImportError:
     pass
 
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from config.config_loader import ConfigLoader
 
 # ── 常量 ──────────────────────────────────────────────
@@ -763,7 +763,7 @@ def main():
     print("=" * 60)
     print()
 
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
 
     # Step 1: 下载具体合约数据
     print(">>> Step 1: 下载IM具体合约日线数据...")

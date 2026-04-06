@@ -24,7 +24,7 @@ if ROOT not in sys.path:
 
 warnings.filterwarnings("ignore")
 
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from config.config_loader import ConfigLoader
 from models.factors.evaluator import FactorEvaluator
 from models.factors.catalog_price import (
@@ -194,7 +194,7 @@ def main():
                         help="Forward periods (bar count)")
     args = parser.parse_args()
 
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
     need_cross = args.category in ("cross", "all")
     bar_5m, daily_range = load_data(db, with_cross=need_cross)
 

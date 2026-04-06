@@ -81,10 +81,10 @@ class DiscountCaptureStrategy(BaseStrategy):
         if self._db is not None:
             return self._db
         try:
-            from data.storage.db_manager import DBManager
+            from data.storage.db_manager import DBManager, get_db
             from config.config_loader import ConfigLoader
             config = ConfigLoader()
-            db = DBManager(config.get_db_path())
+            db = get_db(config)
             self._db = db
             return db
         except Exception as e:

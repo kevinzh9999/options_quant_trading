@@ -34,10 +34,10 @@ from plotly.subplots import make_subplots
 @st.cache_resource
 def _get_db():
     try:
-        from data.storage.db_manager import DBManager
+        from data.storage.db_manager import DBManager, get_db
         from config.config_loader import ConfigLoader
         cfg = ConfigLoader()
-        db = DBManager(cfg.get_db_path())
+        db = get_db(cfg)
         db.initialize_tables()
         return db
     except Exception as e:

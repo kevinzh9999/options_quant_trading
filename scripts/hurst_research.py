@@ -24,7 +24,7 @@ warnings.filterwarnings('ignore')
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from config.config_loader import ConfigLoader
 
 # ─────────────────────────────────────────────
@@ -899,7 +899,7 @@ def main():
 
     # 初始化DB
     print('\n[初始化] 连接数据库...')
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
 
     # 确定分析品种
     syms = [args.symbol] if args.symbol else list(SYMBOLS.keys())

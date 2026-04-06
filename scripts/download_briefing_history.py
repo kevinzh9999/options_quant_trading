@@ -32,7 +32,7 @@ except ImportError:
     pass
 
 from config.config_loader import ConfigLoader
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 
 
 def _get_pro():
@@ -409,7 +409,7 @@ def main():
                         help="跳过的数据集（global breadth turnover north margin etf fut）")
     args = parser.parse_args()
 
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
     db.initialize_tables()
     pro = _get_pro()
     today = datetime.now().strftime("%Y%m%d")

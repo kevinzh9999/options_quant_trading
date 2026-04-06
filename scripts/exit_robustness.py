@@ -39,7 +39,7 @@ ROOT = str(Path(__file__).resolve().parents[1])
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from config.config_loader import ConfigLoader
 
 # Import core functions from exit_sensitivity
@@ -296,7 +296,7 @@ def main():
     slippage = args.slippage
     symbols = [s.strip().upper() for s in args.symbol.split(",") if s.strip()]
 
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
 
     # Preload data for each symbol
     print("=" * 70)

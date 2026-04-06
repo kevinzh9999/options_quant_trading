@@ -19,11 +19,11 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from config.config_loader import ConfigLoader
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 
 
 def _load_data():
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
     briefing = db.query_df(
         "SELECT trade_date, direction, confidence, score, ad_ratio, "
         "iv_percentile, vrp, daily_5d_mom, range_position "

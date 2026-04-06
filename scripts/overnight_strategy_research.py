@@ -12,10 +12,10 @@ from scipy import stats
 import warnings
 warnings.filterwarnings('ignore')
 
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from config.config_loader import ConfigLoader
 
-db = DBManager(ConfigLoader().get_db_path())
+db = get_db()
 
 SYMBOLS = {
     '000852': '中证1000',

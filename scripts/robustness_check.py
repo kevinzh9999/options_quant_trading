@@ -24,7 +24,7 @@ ROOT = str(Path(__file__).resolve().parents[1])
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from config.config_loader import ConfigLoader
 
 # ---------------------------------------------------------------------------
@@ -334,7 +334,7 @@ def main():
                         help="ME测试的品种（默认: both）")
     args = parser.parse_args()
 
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
     print(f"数据库: {ConfigLoader().get_db_path()}")
     print(f"回测日期: {len(ALL_DATES)} 天 ({ALL_DATES[0]} ~ {ALL_DATES[-1]})")
 

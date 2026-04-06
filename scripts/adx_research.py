@@ -26,7 +26,7 @@ warnings.filterwarnings("ignore")
 
 sys.path.insert(0, "/Users/kevinzhao/Library/CloudStorage/GoogleDrive-kevinzh@gmail.com/我的云端硬盘/options_quant_trading")
 
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from config.config_loader import ConfigLoader
 
 # ─────────────────────────────────────────────
@@ -806,7 +806,7 @@ def main():
     print(f"  运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*70)
 
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
 
     # 加载所有品种的index_min数据并计算全部指标
     print("\n  加载数据并计算指标...")

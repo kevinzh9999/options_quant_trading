@@ -34,7 +34,7 @@ ROOT = str(Path(__file__).resolve().parents[1])
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from config.config_loader import ConfigLoader
 
 # ─────────────────────────────────────────────────────────────
@@ -892,7 +892,7 @@ def main():
             print(f"Unknown groups: {invalid}. Valid: {list(SWEEP_GROUPS.keys())}")
             sys.exit(1)
 
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
 
     print(f"\n{'═'*75}")
     print(f"  EXIT SENSITIVITY ANALYSIS — {sym}")

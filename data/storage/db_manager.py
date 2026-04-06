@@ -20,43 +20,70 @@ from typing import Any, Optional, Sequence
 
 import pandas as pd
 
-from .schemas import ALL_TABLES, DAILY_MODEL_OUTPUT_ALTER_SQLS, SIGNAL_LOG_ALTER_SQLS
+from .schemas import (
+    ALL_TABLES, OPTIONS_TABLES, DAILY_MODEL_OUTPUT_ALTER_SQLS, SIGNAL_LOG_ALTER_SQLS,
+)
 
 logger = logging.getLogger(__name__)
 
 # ts_code 含 % 时使用 LIKE，否则使用 =
 _LIKE_OPERATORS = {True: "LIKE", False: "="}
 
+# 期权相关表名集合，用于路由到 options DB
+_OPTIONS_TABLE_NAMES = {"options_daily", "options_contracts", "options_min"}
+
+
+def _open_conn(db_path: str) -> sqlite3.Connection:
+    """打开一个 SQLite 连接，统一 WAL + busy_timeout 设置。"""
+    if db_path != ":memory:":
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
 
 class DBManager:
     """
-    SQLite 数据库管理器。
+    SQLite 数据库管理器（双库模式）。
 
     Parameters
     ----------
     db_path : str
-        数据库文件路径，不存在时自动创建；传入 ":memory:" 使用纯内存数据库。
+        主数据库文件路径（trading.db）。
+    options_db_path : str | None
+        期权数据库路径（options_data.db）。为 None 时退化为单库模式（向后兼容）。
     """
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, options_db_path: str | None = None) -> None:
         self.db_path = db_path
-        # :memory: 必须保持单连接；文件数据库也用持久连接简化管理
-        if db_path != ":memory:":
-            p = Path(db_path)
-            p.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        self.options_db_path = options_db_path
+        self._conn = _open_conn(db_path)
+        self._options_conn: sqlite3.Connection | None = None
+        if options_db_path:
+            self._options_conn = _open_conn(options_db_path)
         self.initialize_tables()
 
     # ------------------------------------------------------------------
     # 初始化
     # ------------------------------------------------------------------
 
+    def _conn_for_table(self, table_name: str) -> sqlite3.Connection:
+        """根据表名路由到主库或期权库。"""
+        if self._options_conn and table_name in _OPTIONS_TABLE_NAMES:
+            return self._options_conn
+        return self._conn
+
     def initialize_tables(self) -> None:
         """执行所有 CREATE TABLE IF NOT EXISTS 语句（幂等）。"""
         for ddl in ALL_TABLES:
             self._conn.executescript(ddl)
+        # 期权表建在 options DB（如有），否则建在主库
+        target = self._options_conn or self._conn
+        for ddl in OPTIONS_TABLES:
+            target.executescript(ddl)
+        target.commit()
         # 增量 ALTER TABLE（新增列，列已存在时静默忽略）
         for alter_sql in DAILY_MODEL_OUTPUT_ALTER_SQLS + SIGNAL_LOG_ALTER_SQLS:
             try:
@@ -88,20 +115,30 @@ class DBManager:
         """
         if df.empty:
             return 0
+        conn = self._conn_for_table(table_name)
         cols = list(df.columns)
         placeholders = ", ".join("?" * len(cols))
         col_list = ", ".join(cols)
         sql = f"INSERT OR REPLACE INTO {table_name} ({col_list}) VALUES ({placeholders})"
         # itertuples 比 to_dict 快，None 自动变 NULL
         data = [tuple(row) for row in df.itertuples(index=False, name=None)]
-        self._conn.executemany(sql, data)
-        self._conn.commit()
+        conn.executemany(sql, data)
+        conn.commit()
         logger.debug("upsert %d rows into %s", len(df), table_name)
         return len(df)
 
     # ------------------------------------------------------------------
     # 通用查询
     # ------------------------------------------------------------------
+
+    def _conn_for_sql(self, sql: str) -> sqlite3.Connection:
+        """根据 SQL 语句中的表名路由到合适的连接。"""
+        if self._options_conn:
+            sql_lower = sql.lower()
+            for tbl in _OPTIONS_TABLE_NAMES:
+                if tbl in sql_lower:
+                    return self._options_conn
+        return self._conn
 
     def query(self, sql: str, params: Optional[tuple] = None) -> pd.DataFrame:
         """
@@ -119,7 +156,8 @@ class DBManager:
         pd.DataFrame
             查询结果；无数据时返回带列名的空 DataFrame。
         """
-        cursor = self._conn.execute(sql, params or ())
+        conn = self._conn_for_sql(sql)
+        cursor = conn.execute(sql, params or ())
         rows = cursor.fetchall()
         cols = [d[0] for d in cursor.description] if cursor.description else []
         if not rows:
@@ -378,6 +416,8 @@ class DBManager:
     def close(self) -> None:
         """关闭数据库连接，释放资源。"""
         self._conn.close()
+        if self._options_conn:
+            self._options_conn.close()
         logger.debug("数据库连接已关闭: %s", self.db_path)
 
     def __enter__(self) -> "DBManager":
@@ -406,15 +446,34 @@ class DBManager:
 
     def query_scalar(self, sql: str, params: Sequence[Any] | None = None) -> Any:
         """向后兼容：执行查询返回第一行第一列。"""
-        cursor = self._conn.execute(sql, tuple(params) if params else ())
+        conn = self._conn_for_sql(sql)
+        cursor = conn.execute(sql, tuple(params) if params else ())
         row = cursor.fetchone()
         return row[0] if row is not None else None
 
     def get_max_date(self, table: str, date_col: str = "trade_date") -> str | None:
         """向后兼容：等同于 get_latest_date（无 ts_code 过滤）。"""
-        cursor = self._conn.execute(f"SELECT MAX({date_col}) FROM {table}")
+        conn = self._conn_for_table(table)
+        cursor = conn.execute(f"SELECT MAX({date_col}) FROM {table}")
         row = cursor.fetchone()
         return row[0] if row and row[0] is not None else None
+
+
+# ======================================================================
+# 工厂函数
+# ======================================================================
+
+def get_db(config=None) -> DBManager:
+    """
+    创建标准的双库 DBManager（推荐入口）。
+
+    自动从 ConfigLoader 获取 trading.db 和 options_data.db 路径。
+    所有代码统一用此函数创建 DBManager，确保期权表路由正确。
+    """
+    if config is None:
+        from config.config_loader import ConfigLoader
+        config = ConfigLoader()
+    return DBManager(config.get_db_path(), config.get_options_db_path())
 
 
 # ======================================================================

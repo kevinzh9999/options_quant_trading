@@ -19,11 +19,11 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from config.config_loader import ConfigLoader
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 
 
 def _load_data():
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
     briefing = db.query_df(
         "SELECT * FROM morning_briefing ORDER BY trade_date"
     )

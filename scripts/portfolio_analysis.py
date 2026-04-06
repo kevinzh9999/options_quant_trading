@@ -129,8 +129,8 @@ def _open_db():
     if not os.path.exists(DB_PATH):
         return None
     try:
-        from data.storage.db_manager import DBManager
-        return DBManager(DB_PATH)
+        from data.storage.db_manager import get_db
+        return get_db()
     except Exception as e:
         print(f"  [警告] 无法连接数据库: {e}")
         return None

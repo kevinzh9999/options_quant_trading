@@ -30,7 +30,7 @@ ROOT = str(Path(__file__).resolve().parents[1])
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from config.config_loader import ConfigLoader
 
 # ---------------------------------------------------------------------------
@@ -465,7 +465,7 @@ def run_scenario(sym: str, dates: List[str], db: DBManager,
 # ---------------------------------------------------------------------------
 
 def main():
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
     dates = DATES_30D
     symbols = ["IM", "IC"]
 

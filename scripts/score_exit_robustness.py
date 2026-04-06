@@ -30,7 +30,7 @@ ROOT = str(Path(__file__).resolve().parents[1])
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from config.config_loader import ConfigLoader
 
 # Import everything from the research script
@@ -377,7 +377,7 @@ def main():
                         help="逗号分隔的测试编号 (default: 1,2,3,4,5)")
     args = parser.parse_args()
 
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
 
     syms = ["IM", "IC"] if args.symbol == "ALL" else [args.symbol.upper()]
     tests = [int(x.strip()) for x in args.tests.split(",")]

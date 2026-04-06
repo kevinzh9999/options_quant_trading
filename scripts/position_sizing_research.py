@@ -24,7 +24,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from config.config_loader import ConfigLoader
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from scripts.backtest_signals_day import run_day
 
 IM_MULT = 200
@@ -231,7 +231,7 @@ def _evaluate(
 # ---------------------------------------------------------------------------
 
 def run(sym: str, date_spec: str, account: float, risk_pct: float, target_vol: float):
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
     dates = _get_dates(db, sym, date_spec)
     if not dates:
         print("没有可用数据")

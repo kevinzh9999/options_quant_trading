@@ -263,21 +263,41 @@ IM+IC合计 +4067pt/215天（2025-05-16~2026-04-03）。无任何月份合计亏
 
 ## 数据库
 
-### 文件路径
-- 主数据库：`data/storage/trading.db`（代码用 `ConfigLoader().get_db_path()`）
-- 旧路径别名：`data/market_data.db`（config.example.yaml 默认值，实际不使用）
-- 打开方式：`DBManager(ConfigLoader().get_db_path())`
+### 文件路径（四库分离，2026-04-06）
+- **主库**：`data/storage/trading.db`（~680MB）— 期货/现货K线 + 模型 + 信号/交易 + Briefing
+- **期权库**：`data/storage/options_data.db`（~4.7GB）— options_daily / options_contracts / options_min
+- **Tick库**：`data/storage/tick_data.db`（~28.5GB）— IM/IC/IF 主连逐笔tick
+- **ETF库**：`data/storage/etf_data.db`（~56MB）— 512100/510500/510300/510050 5分钟K线
+- **打开方式**：`from data.storage.db_manager import get_db; db = get_db()`
+  - `get_db()` 自动创建双库 DBManager，期权表查询自动路由到 options_data.db
+  - 上层代码不需要关心哪个表在哪个库
 
-### 主要表和数据量（截至 2026-03）
+### 主要表和数据量（截至 2026-04-06）
+
+**trading.db:**
 | 表 | 行数 | 时间范围 | 说明 |
 |---|---|---|---|
-| futures_daily | ~44,500 | 2015~2026 | IM/IF/IH/IC 日线 |
-| options_daily | ~755,000 | 2019~2026 | MO/IO 日线 |
-| index_daily | ~10,880 | 2015~2026 | 000852/000300/000905/000016 |
-| index_min | 累积中 | 2026-03~ | 现货5分钟K线（日内信号数据源） |
-| daily_model_output | 累积中 | 2026-03~ | GARCH/IV/VRP/贴水/Greeks |
-| account_snapshots | 累积中 | 2026-03~ | 每日账户快照 |
-| position_snapshots | 累积中 | 2026-03~ | 每日持仓快照 |
+| futures_daily | 48,349 | 2015~04-03 | IM/IF/IH/IC 日线 |
+| futures_min | 2,447,680 | 2016~04-03 | 主连 1m/5m K线 |
+| index_daily | 10,932 | 2015~04-03 | 000852/000300/000016/000905 |
+| index_min | 1,986,912 | 2018~04-03 | 现货 1m/5m K线（日内策略核心） |
+| daily_model_output | 190 | 2025-06~04-03 | GARCH/IV/VRP/贴水/Greeks |
+
+**options_data.db:**
+| 表 | 行数 | 时间范围 | 说明 |
+|---|---|---|---|
+| options_daily | 764,114 | 2019~04-03 | MO/IO/HO 日线 |
+| options_min | 23,880,339 | 2020~04-03 | MO/IO/HO 5分钟K线 |
+
+**tick_data.db:**
+| 表 | 行数 | 时间范围 | 说明 |
+|---|---|---|---|
+| futures_tick | 141,405,179 | 2016~04-03 | IM/IC/IF 逐笔tick |
+
+**etf_data.db:**
+| 表 | 行数 | 时间范围 | 说明 |
+|---|---|---|---|
+| etf_min | 331,872 | 2018~04-03 | 4 ETF 5分钟K线 |
 
 ### daily_model_output 字段（含最新增加的）
 ```
@@ -446,8 +466,8 @@ python scripts/backfill_minute_bars.py --symbol 000852 --exchange SSE --bars 100
 
 ### 数据库
 ```
-data/storage/trading.db (SQLite)
-关键表：index_min, index_daily, futures_min, futures_daily,
-       signal_log, trade_records, position_snapshots,
-       volatility_history, daily_model_output, vol_monitor_snapshots
+data/storage/trading.db     — 主库（期货/现货/模型/信号/交易）
+data/storage/options_data.db — 期权库（options_daily/contracts/min）
+data/storage/tick_data.db   — Tick库（IM/IC/IF逐笔）
+data/storage/etf_data.db    — ETF库（4品种5分钟）
 ```

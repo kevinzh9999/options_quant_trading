@@ -24,7 +24,7 @@ import pandas as pd
 import numpy as np
 from scipy import stats
 
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from config.config_loader import ConfigLoader
 
 # ─── 常量 ───────────────────────────────────────────────────────────────────
@@ -586,7 +586,7 @@ def main():
     print(f"  数据库: {ConfigLoader().get_db_path()}")
     print("=" * 70)
 
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
 
     # 加载所有品种数据
     print("\n正在加载数据...")

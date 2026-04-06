@@ -28,7 +28,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from config.config_loader import ConfigLoader
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from models.pricing.forward_price import calc_implied_forward
 from models.pricing.implied_vol import calc_implied_vol
 from models.pricing.greeks import calc_all_greeks
@@ -468,7 +468,7 @@ def main():
                         help="回测品种，逗号分隔（默认 IM,IC）")
     args = parser.parse_args()
 
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
     symbols = [s.strip() for s in args.symbols.split(",")]
 
     print("=" * 70)

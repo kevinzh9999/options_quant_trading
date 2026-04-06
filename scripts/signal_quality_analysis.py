@@ -25,7 +25,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from config.config_loader import ConfigLoader
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from scripts.backtest_signals_day import run_day
 
 
@@ -166,7 +166,7 @@ def _analyze_reversals(db: DBManager, sym: str, dates: list[str]):
 
 def analyze(sym: str, days: int = 30):
     """运行分析。"""
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
     dates = _get_dates(db, sym, days)
     if not dates:
         print("没有可用数据")

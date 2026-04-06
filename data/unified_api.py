@@ -24,7 +24,7 @@ import pandas as pd
 from config import Config
 from data.sources.tq_client import TqClient
 from data.sources.tushare_client import TushareClient
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +111,7 @@ class UnifiedDataAPI:
 
     def __init__(self, config: Config) -> None:
         self.config = config
-        self.db = DBManager(config.db_path)
+        self.db = get_db(config)
         self.tushare = TushareClient(config.tushare_token)
         self._tq: Optional[TqClient] = None
 

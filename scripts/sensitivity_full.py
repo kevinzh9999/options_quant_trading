@@ -20,7 +20,7 @@ ROOT = str(Path(__file__).resolve().parents[1])
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from data.storage.db_manager import DBManager
+from data.storage.db_manager import DBManager, get_db
 from config.config_loader import ConfigLoader
 from scripts.backtest_signals_day import run_day
 
@@ -325,7 +325,7 @@ def main():
     parser.add_argument("--version", default="auto", choices=["v2", "v3", "auto"])
     args = parser.parse_args()
 
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
 
     if args.param == "all":
         for param_name in PARAM_GRID:
