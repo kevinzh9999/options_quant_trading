@@ -237,3 +237,30 @@ def linreg_slope(series: pd.Series, n: int) -> pd.Series:
         slope = np.polyfit(x, vals, 1)[0]
         return slope / vals[-1] if vals[-1] != 0 else 0
     return series.rolling(n).apply(_slope, raw=True)
+
+
+# ── 期权专用算子 ────────────────────────────────────────────
+
+def iv_percentile(iv_series: pd.Series, n: int) -> pd.Series:
+    """IV在过去N期中的分位数（0-1）。"""
+    return ts_rank(iv_series, n)
+
+
+def vrp(iv: pd.Series, rv: pd.Series) -> pd.Series:
+    """波动率风险溢价 = IV - RV。"""
+    return iv - rv
+
+
+def iv_term_spread(iv_near: pd.Series, iv_far: pd.Series) -> pd.Series:
+    """期限结构价差 = 近月IV - 远月IV。正值=倒挂。"""
+    return iv_near - iv_far
+
+
+def iv_change(iv: pd.Series, n: int) -> pd.Series:
+    """IV的N期变化。"""
+    return delta(iv, n)
+
+
+def vrp_regime(vrp_series: pd.Series, n: int) -> pd.Series:
+    """VRP在过去N期中的分位数（0-1）。"""
+    return ts_rank(vrp_series, n)

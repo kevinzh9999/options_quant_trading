@@ -2,6 +2,11 @@
 Layer 1.5: Factor Evaluator（因子评估器）
 =========================================
 评估因子的预测力：IC、分组收益、单调性、因子间相关性。
+
+两个评估器：
+  - FactorEvaluator：5分钟bar → 未来price_return（日内策略因子）
+  - OptionsFactorEvaluator：日频数据 → 已实现VRP/IV变化（期权策略因子）
+
 支持按振幅regime分组评估（04-04研究结论：高/低振幅日表现可能完全不同）。
 """
 from __future__ import annotations
@@ -278,3 +283,157 @@ class FactorEvaluator:
                 print(f"  {r['name']:<25} {gr_str}")
 
         print("=" * 100)
+
+
+# ======================================================================
+# 期权因子评估器
+# ======================================================================
+
+class OptionsFactorEvaluator:
+    """
+    期权因子评估器（日频数据）。
+
+    与 FactorEvaluator 的区别：
+      - 输入：daily_data（日频 DataFrame），不是5分钟bar
+      - Target variable：已实现VRP / IV变化 / 标的收益（可选）
+      - 因子通过 factor.compute_series(daily=daily_data) 调用
+    """
+
+    def __init__(self, daily_data: pd.DataFrame,
+                 target_type: str = "realized_vrp",
+                 forward_periods: list = None):
+        """
+        Args:
+            daily_data: 日频数据，必须包含 close 列；
+                        realized_vrp 模式还需要 atm_iv 列
+            target_type:
+                'realized_vrp': 当日IV - 未来N天的实际RV（卖方盈亏）
+                'iv_change': 未来N天的IV变化
+                'price_return': 标的价格收益率
+            forward_periods: 评估的未来天数，默认 [5, 10, 20]
+        """
+        if forward_periods is None:
+            forward_periods = [5, 10, 20]
+        self.daily_data = daily_data
+        self.target_type = target_type
+        self.forward_periods = forward_periods
+
+        self.targets = {}
+        for n in forward_periods:
+            if target_type == "realized_vrp":
+                future_rv = (
+                    daily_data["close"].pct_change()
+                    .rolling(n).std().shift(-n) * np.sqrt(252)
+                )
+                self.targets[n] = daily_data["atm_iv"] - future_rv
+            elif target_type == "iv_change":
+                self.targets[n] = daily_data["atm_iv"].diff(n).shift(-n)
+            elif target_type == "price_return":
+                self.targets[n] = daily_data["close"].pct_change(n).shift(-n)
+            else:
+                raise ValueError(f"Unknown target_type: {target_type}")
+
+    def evaluate(self, factor: Factor) -> dict:
+        """评估单个期权因子。"""
+        values = factor.compute_series(daily=self.daily_data)
+        values = values.replace([np.inf, -np.inf], np.nan)
+
+        result = {
+            "name": factor.name,
+            "category": factor.category,
+            "stats": self._calc_stats(values),
+            "ic": {},
+            "group_returns": {},
+            "monotonicity": {},
+        }
+
+        for n in self.forward_periods:
+            target = self.targets[n].reindex(values.index)
+            valid = pd.concat([values.rename("f"), target.rename("t")], axis=1).dropna()
+            if len(valid) < 20:
+                continue
+
+            ic = valid["f"].corr(valid["t"], method="spearman")
+            result["ic"][f"IC_{n}d"] = round(float(ic), 4)
+
+            try:
+                valid["group"] = pd.qcut(valid["f"], 5,
+                                         labels=[f"Q{i+1}" for i in range(5)],
+                                         duplicates="drop")
+                gr = valid.groupby("group")["t"].mean()
+                result["group_returns"][f"{n}d"] = {
+                    k: round(float(v) * 100, 2) for k, v in gr.items()
+                }
+                corr, pval = spearmanr(range(len(gr)), gr.values)
+                result["monotonicity"][f"{n}d"] = {
+                    "corr": round(float(corr), 3),
+                    "pval": round(float(pval), 4),
+                }
+            except (ValueError, TypeError):
+                pass
+
+        return result
+
+    def _calc_stats(self, values: pd.Series) -> dict:
+        v = values.dropna()
+        return {
+            "count": len(v),
+            "mean": float(v.mean()) if len(v) > 0 else 0,
+            "std": float(v.std()) if len(v) > 0 else 0,
+            "pct_nan": float(values.isna().mean()),
+        }
+
+    def batch_evaluate(self, factors: List[Factor]) -> tuple:
+        """批量评估 + 相关性矩阵。"""
+        results = []
+        series_dict = {}
+        for f in factors:
+            result = self.evaluate(f)
+            results.append(result)
+            series_dict[f.name] = f.compute_series(daily=self.daily_data)
+        corr_df = pd.DataFrame(series_dict).corr()
+        return results, corr_df
+
+    def print_report(self, factors: List[Factor]):
+        """打印期权因子评估报告。"""
+        results, corr = self.batch_evaluate(factors)
+
+        print("=" * 90)
+        print(f"  OPTIONS FACTOR REPORT | {len(factors)} factors"
+              f" | {len(self.daily_data)} days | target={self.target_type}")
+        print("=" * 90)
+
+        header = f"\n  {'Factor':<25} {'Category':<18}"
+        for n in self.forward_periods:
+            header += f" {'IC_'+str(n)+'d':>10}"
+        print(header)
+        print("  " + "-" * (len(header) - 4))
+
+        sort_key = f"IC_{self.forward_periods[0]}d"
+        for r in sorted(results, key=lambda x: abs(x["ic"].get(sort_key, 0)), reverse=True):
+            row = f"  {r['name']:<25} {r['category']:<18}"
+            for n in self.forward_periods:
+                ic = r["ic"].get(f"IC_{n}d", float("nan"))
+                row += f" {ic:>+10.4f}" if not np.isnan(ic) else f" {'N/A':>10}"
+            print(row)
+
+        print(f"\n--- Monotonicity ---")
+        for r in results:
+            mono_str = ", ".join(
+                f"{k}: {v['corr']:+.2f}(p={v['pval']:.3f})"
+                for k, v in r["monotonicity"].items()
+            )
+            if mono_str:
+                print(f"  {r['name']:<25} {mono_str}")
+
+        print(f"\n--- Correlation ---")
+        print(corr.round(3).to_string())
+
+        print(f"\n--- Group Returns ({self.forward_periods[0]}d, in %) ---")
+        for r in results:
+            gr = r["group_returns"].get(f"{self.forward_periods[0]}d", {})
+            if gr:
+                gr_str = "  ".join(f"{k}:{v:+.2f}" for k, v in gr.items())
+                print(f"  {r['name']:<25} {gr_str}")
+
+        print("=" * 90)
