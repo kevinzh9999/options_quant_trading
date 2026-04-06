@@ -459,9 +459,9 @@ class IntradayMonitor:
         _SPOT_INDEX = {"IM": "000852.SH", "IF": "000300.SH", "IH": "000016.SH", "IC": "000905.SH"}
 
         try:
-            from data.storage.db_manager import DBManager
+            from data.storage.db_manager import DBManager, get_db
             from config.config_loader import ConfigLoader
-            db = DBManager(ConfigLoader().get_db_path())
+            db = get_db()
 
             # 1. 解析合约（离线 fallback，TQ连接后会按持仓量重新选择）
             from utils.cffex_calendar import get_main_contract
@@ -628,9 +628,9 @@ class IntradayMonitor:
     def _load_account_equity(self) -> None:
         """从 account_snapshots 读取最新权益（用于计算建议手数）。"""
         try:
-            from data.storage.db_manager import DBManager
+            from data.storage.db_manager import DBManager, get_db
             from config.config_loader import ConfigLoader
-            db = DBManager(ConfigLoader().get_db_path())
+            db = get_db()
             df = db.query_df(
                 "SELECT balance FROM account_snapshots "
                 "ORDER BY trade_date DESC LIMIT 1"
@@ -723,7 +723,6 @@ class IntradayMonitor:
                 "SELECT symbol, pnl_pts FROM shadow_trades WHERE trade_date = ?",
                 (trade_date,),
             ).fetchall()
-            conn.close()
             if rows:
                 for symbol, pnl_pts in rows:
                     self.strategy.position_mgr.daily_trades += 1
@@ -734,15 +733,67 @@ class IntradayMonitor:
                     self._shadow_closed_count += 1
                 print(f"  恢复当日交易: {len(rows)}笔已平仓, "
                       f"累计{self._shadow_closed_pnl:+.0f}pt")
+
+            # --- 3. 安全网：从 order_log 交叉验证是否有孤立持仓 ---
+            # executor 已 FILLED 的 OPEN 单如果没有对应的 LOCK/CLOSE，
+            # 说明有真实持仓但 shadow 丢失了——必须恢复
+            open_fills = conn.execute(
+                "SELECT symbol, direction, filled_price, datetime "
+                "FROM order_log "
+                "WHERE datetime LIKE ? AND action='OPEN' AND status='FILLED'",
+                (f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}%",),
+            ).fetchall()
+            closed_syms = set()
+            lock_rows = conn.execute(
+                "SELECT symbol FROM order_log "
+                "WHERE datetime LIKE ? AND action IN ('LOCK','CLOSE') "
+                "AND status='FILLED'",
+                (f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}%",),
+            ).fetchall()
+            for r in lock_rows:
+                closed_syms.add(r[0])
+
+            for sym, direction, price, dt in open_fills:
+                if sym in closed_syms:
+                    continue  # 已有平仓/锁仓记录
+                if sym in self._shadow_positions:
+                    continue  # shadow 已恢复
+                # 孤立持仓：executor 开了仓但 shadow 丢失
+                entry_time_bj = dt[11:16] if len(dt) > 15 else "09:30"
+                entry_time_utc = entry_time_bj  # 近似
+                print(f"  ⚠ 发现孤立持仓: {sym} {direction}@{price}"
+                      f" (order_log有FILLED但shadow缺失)")
+                self._shadow_positions[sym] = {
+                    "direction": direction,
+                    "entry_time_utc": entry_time_utc,
+                    "entry_time_bj": entry_time_bj,
+                    "entry_price": float(price),
+                    "highest_since": float(price),
+                    "lowest_since": float(price),
+                    "volume": 1,
+                    "bars_below_mid": 0,
+                    "entry_score": 0,
+                    "entry_dm": 0, "entry_f": 0, "entry_t": 0, "entry_s": 0,
+                    "entry_m": 0, "entry_v": 0, "entry_q": 0,
+                    "operator_action": "RECOVERED",
+                    "is_executed": 1,
+                    "fut_symbol": self._tq_symbols.get(sym, ""),
+                }
+                self.strategy.position_mgr.inject_position(
+                    sym, direction, float(price), entry_time_bj, 0)
+                self._save_shadow_state()
+                print(f"    → 已恢复shadow持仓，退出信号将正常生成")
+
+            conn.close()
         except Exception as e:
-            print(f"  [WARN] shadow_trades恢复失败: {e}")
+            print(f"  [WARN] shadow_trades/order_log恢复失败: {e}")
 
     def _load_sentiment(self) -> None:
         """从 vol_monitor_snapshots 或 daily_model_output 加载情绪数据。"""
         try:
-            from data.storage.db_manager import DBManager
+            from data.storage.db_manager import DBManager, get_db
             from config.config_loader import ConfigLoader
-            db = DBManager(ConfigLoader().get_db_path())
+            db = get_db()
 
             # 优先用 vol_monitor_snapshots（盘中最新）
             snap = db.query_df(
@@ -1293,9 +1344,10 @@ class IntradayMonitor:
                 self.strategy.position_mgr.remove_by_symbol(sym)
                 self._save_shadow_state()
 
-        # 持久化shadow状态（极值更新后checkpoint，防crash丢失）
-        if self._shadow_positions:
-            self._save_shadow_state()
+        # 持久化shadow状态（每根bar都保存，防crash丢失）
+        # 注意：不能只在有持仓时保存——空持仓时也需要保存prompted_bars
+        # 否则crash后恢复到旧的有持仓状态，导致幽灵持仓
+        self._save_shadow_state()
 
         # 打印状态面板（传入现货bar和期货行情）
         self._print_status(bar_data, fut_quotes, actions)
