@@ -29,14 +29,14 @@ def run_vol_arb_backtest(
 ):
     """Execute vol_arb strategy backtest. Returns (report, strategy)."""
     from config.config_loader import ConfigLoader
-    from data.storage.db_manager import DBManager
+    from data.storage.db_manager import DBManager, get_db
     from backtest.data_feed import DataFeed
     from backtest.broker import SimBroker
     from backtest.engine import BacktestEngine
     from strategies.vol_arb.strategy import VolArbStrategy, VolArbConfig
 
     config = ConfigLoader()
-    db = DBManager(config.get_db_path())
+    db = get_db(config)
 
     # Include "MO.CFX" so that DataFeed triggers options data loading (MO prefix → load
     # options_daily + options_contracts tables), and the engine injects options_chain into

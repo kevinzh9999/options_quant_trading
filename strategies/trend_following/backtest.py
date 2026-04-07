@@ -26,7 +26,7 @@ def run_trend_backtest(
 ):
     """Execute trend following backtest."""
     from config.config_loader import ConfigLoader
-    from data.storage.db_manager import DBManager
+    from data.storage.db_manager import DBManager, get_db
     from backtest.data_feed import DataFeed
     from backtest.broker import SimBroker
     from backtest.engine import BacktestEngine
@@ -36,7 +36,7 @@ def run_trend_backtest(
         symbols = ["IF.CFX", "IC.CFX", "IH.CFX", "IM.CFX"]
 
     config = ConfigLoader()
-    db = DBManager(config.get_db_path())
+    db = get_db(config)
 
     feed = DataFeed(db, start_date, end_date, symbols)
     broker = SimBroker(initial_capital=initial_capital)

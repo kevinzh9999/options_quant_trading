@@ -992,9 +992,9 @@ def main():
     )
 
     from config.config_loader import ConfigLoader
-    from data.storage.db_manager import DBManager
+    from data.storage.db_manager import DBManager, get_db
 
-    db = DBManager(ConfigLoader().get_db_path())
+    db = get_db()
     bt = DiscountGammaBacktester(
         db,
         initial_capital=args.capital,
