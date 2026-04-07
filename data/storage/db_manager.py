@@ -79,11 +79,11 @@ class DBManager:
         """执行所有 CREATE TABLE IF NOT EXISTS 语句（幂等）。"""
         for ddl in ALL_TABLES:
             self._conn.executescript(ddl)
-        # 期权表建在 options DB（如有），否则建在主库
-        target = self._options_conn or self._conn
-        for ddl in OPTIONS_TABLES:
-            target.executescript(ddl)
-        target.commit()
+        # 期权表只建在 options DB（不建在主库，防止路由混淆）
+        if self._options_conn:
+            for ddl in OPTIONS_TABLES:
+                self._options_conn.executescript(ddl)
+            self._options_conn.commit()
         # 增量 ALTER TABLE（新增列，列已存在时静默忽略）
         for alter_sql in DAILY_MODEL_OUTPUT_ALTER_SQLS + SIGNAL_LOG_ALTER_SQLS:
             try:
@@ -388,14 +388,15 @@ class DBManager:
         str | None
             最大日期 YYYYMMDD，表为空时返回 None
         """
+        conn = self._conn_for_table(table_name)
         if ts_code:
             op = _LIKE_OPERATORS["%" in ts_code]
-            cursor = self._conn.execute(
+            cursor = conn.execute(
                 f"SELECT MAX(trade_date) FROM {table_name} WHERE ts_code {op} ?",
                 (ts_code,),
             )
         else:
-            cursor = self._conn.execute(
+            cursor = conn.execute(
                 f"SELECT MAX(trade_date) FROM {table_name}"
             )
         row = cursor.fetchone()
