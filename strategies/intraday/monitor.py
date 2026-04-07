@@ -549,24 +549,11 @@ class IntradayMonitor:
             except Exception:
                 pass
 
-            # 5. Morning Briefing d_override
-            try:
-                from datetime import date as _date
-                today_str = _date.today().strftime("%Y%m%d")
-                br = db.query_df(
-                    "SELECT d_override_long, d_override_short FROM morning_briefing "
-                    f"WHERE trade_date = '{today_str}' LIMIT 1"
-                )
-                if br is not None and len(br) > 0:
-                    d_long = br.iloc[0].get("d_override_long")
-                    d_short = br.iloc[0].get("d_override_short")
-                    if d_long is not None and d_short is not None:
-                        self._d_override = {
-                            "LONG": float(d_long), "SHORT": float(d_short),
-                        }
-                        print(f"  Briefing d_override: LONG={d_long} SHORT={d_short}")
-            except Exception:
-                pass
+            # 5. Morning Briefing d_override — 已禁用
+            # 215天回测验证：d_override 导致 -794pt (-19.2% 劣化)
+            # 纯算法 dm (1.1/0.9) 已是最优，briefing 的激进覆盖(0.5/1.2)过度干预
+            # self._d_override 保持 None，score_all 会使用算法 dm
+            pass
 
         except Exception as e:
             print(f"  [WARNING] daily data load failed: {e}")
