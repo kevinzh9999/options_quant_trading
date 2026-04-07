@@ -1278,17 +1278,25 @@ def run_live(db):
                 im_contracts.append(tq_fut)
                 print(f"  额外期货: {tq_fut} (for MO{em})")
 
-    # 行权价: ATM ± 5档（间距100）
-    base_strikes = sorted(atm_base + i * 100 for i in range(-5, 7))
+    # 行权价: ATM 附近，间距根据月份不同
+    # 当月/次月: 间距100, 季月/隔季: 间距200
+    base_strikes_100 = sorted(atm_base + i * 100 for i in range(-5, 7))
+    base_strikes_200 = sorted(atm_base + i * 200 for i in range(-3, 4))
 
     opt_syms = []
     for m in opt_months_to_sub:
+        # 判断是否远月（季月/隔季）：月份号能被3整除的是季月
+        month_num = int(m[2:4]) if len(m) == 4 else 0
+        is_quarterly = (month_num % 3 == 0)
+        # 前两个月用100间距，后面用200间距
+        idx = opt_months_to_sub.index(m)
+        base_strikes = base_strikes_200 if (is_quarterly and idx >= 2) else base_strikes_100
         # 每月份用基础行权价 + 该月份的持仓行权价（不混入其他月份的）
         month_strikes = sorted(set(base_strikes) | pos_strikes_extra.get(m, set()))
         for k in month_strikes:
             for cp in ["C", "P"]:
                 opt_syms.append(f"CFFEX.MO{m}-{cp}-{k}")
-    strikes = base_strikes  # 面板显示用
+    strikes = base_strikes_100  # 面板显示用（当月间距）
 
     print(f"  订阅期货: {', '.join(im_contracts)}")
     print(f"  订阅期权月份: {opt_months_to_sub}  行权价: {min(strikes)}~{max(strikes)}")
