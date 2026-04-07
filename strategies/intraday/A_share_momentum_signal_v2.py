@@ -500,6 +500,15 @@ def check_exit(
                 return {"should_exit": True, "exit_volume": volume,
                         "exit_reason": "TRAILING_STOP", "exit_urgency": "NORMAL"}
 
+    # P3b: Band Reversal — 研究结果(2026-04-07)
+    # Phase 1: 因子有效（bounce_from_lower WR=69% +14bps, 1911样本）
+    # Phase 2: 但作为exit信号净效果 -32%（退出后再入场被止损 + 趋势日错过利润）
+    # 结论: 单独作为exit不可行。需要搭配：
+    #   a. 退出后同方向冷却期（防止反转行情中再入场止损）
+    #   b. 或只在低振幅日/震荡regime启用
+    #   c. 或作为反手信号而非纯退出
+    # 暂不启用，留待进一步研究
+
     # P4: Trend complete — requires 5m ABOVE upper + 15m ABOVE upper
     # Both timeframes at the most extreme zone = trend truly exhausted
     # UPPER_ZONE alone is not enough (trend still pushing)
