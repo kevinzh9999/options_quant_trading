@@ -535,6 +535,45 @@ def _eod_archive_minute_bars(api, trade_date: str, db) -> int:
             "period": 0, "db": "tick",
         }
 
+    # 期权 5m（MO/IO/HO 当天活跃合约）→ options_data.db
+    try:
+        from config.config_loader import ConfigLoader
+        _opt_db_path = ConfigLoader().get_options_db_path()
+        import sqlite3 as _sq
+        _opt_conn = _sq.connect(_opt_db_path, timeout=30)
+        # 查当天（或最近）有日线数据的合约
+        _opt_date = trade_date
+        _opt_rows = _opt_conn.execute(
+            "SELECT DISTINCT ts_code FROM options_daily WHERE trade_date = ?",
+            (_opt_date,)
+        ).fetchall()
+        if not _opt_rows:
+            # fallback: 用最近的交易日
+            _latest = _opt_conn.execute(
+                "SELECT MAX(trade_date) FROM options_daily"
+            ).fetchone()[0]
+            if _latest:
+                _opt_rows = _opt_conn.execute(
+                    "SELECT DISTINCT ts_code FROM options_daily WHERE trade_date = ?",
+                    (_latest,)
+                ).fetchall()
+        _opt_conn.close()
+
+        opt_contracts = [r[0] for r in _opt_rows]  # MO2605-C-7000.CFX etc
+        print(f"  期权合约: {len(opt_contracts)} 个", flush=True)
+        for ts_code in opt_contracts:
+            # MO2605-C-7000.CFX → CFFEX.MO2605-C-7000
+            tq_sym = "CFFEX." + ts_code.replace(".CFX", "")
+            key = f"opt_{ts_code}"
+            tasks[key] = {
+                "dl": DataDownloader(api, tq_sym, 300, start_dt=td, end_dt=td,
+                                     csv_file_name=str(csv_dir / f"{key}.csv")),
+                "table": "options_min", "sym_col": "ts_code", "symbol": ts_code,
+                "period": 300, "db": "options",
+            }
+    except Exception as e:
+        logger.warning("期权合约列表获取失败: %s", e)
+
     # ── 并行下载 ──
     print(f"  DataDownloader: {len(tasks)} 个任务并行下载...", flush=True)
     try:
@@ -551,6 +590,7 @@ def _eod_archive_minute_bars(api, trade_date: str, db) -> int:
     # ── CSV → DB 导入 ──
     total = 0
     db_path_trading = db.db_path
+    db_path_options = str(Path(ROOT) / "data" / "storage" / "options_data.db")
     db_path_tick = str(Path(ROOT) / "data" / "storage" / "tick_data.db")
     db_path_etf = str(Path(ROOT) / "data" / "storage" / "etf_data.db")
 
@@ -575,6 +615,8 @@ def _eod_archive_minute_bars(api, trade_date: str, db) -> int:
                 target_path = db_path_tick
             elif task["db"] == "etf":
                 target_path = db_path_etf
+            elif task["db"] == "options":
+                target_path = db_path_options
             else:
                 target_path = db_path_trading
 
