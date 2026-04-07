@@ -208,7 +208,8 @@ def get_main_contract(symbol_prefix: str, api=None) -> str:
             except Exception:
                 pass
         if quotes:
-            api.wait_update()
+            import time as _time
+            api.wait_update(deadline=_time.time() + 10)
             best_contract = None
             max_oi = 0
             for contract, quote in quotes.items():
