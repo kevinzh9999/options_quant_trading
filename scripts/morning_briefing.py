@@ -1041,6 +1041,46 @@ def _save_markdown(trade_date, direction, confidence, score, reasons):
 # 主流程
 # ---------------------------------------------------------------------------
 
+def _check_and_update_briefing_data(db, prev_trade_date: str) -> None:
+    """检查 Briefing 数据源是否覆盖到前一交易日，不够则自动更新。"""
+    stale_tables = []
+    check_tables = [
+        ("market_turnover", "成交额"),
+        ("market_breadth", "涨跌家数"),
+        ("northbound_flow", "北向资金"),
+        ("option_pcr_daily", "期权PCR"),
+    ]
+    for table, label in check_tables:
+        try:
+            row = db.query_scalar(f"SELECT MAX(trade_date) FROM {table}")
+            if row is None or str(row) < prev_trade_date:
+                stale_tables.append((table, label, row))
+        except Exception:
+            stale_tables.append((table, label, "N/A"))
+
+    if not stale_tables:
+        return
+
+    print(f"\n  ⚠ Briefing数据源过期，自动更新中...")
+    for table, label, latest in stale_tables:
+        print(f"    {label}({table}): 最新={latest}, 需要>={prev_trade_date}")
+
+    try:
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, "scripts/download_briefing_history.py", "--update"],
+            capture_output=True, text=True, timeout=180,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
+        if result.returncode == 0:
+            print(f"  ✓ Briefing数据源已更新")
+        else:
+            print(f"  ⚠ 更新失败: {result.stderr[-200:]}")
+    except Exception as e:
+        print(f"  ⚠ 自动更新异常: {e}")
+        print(f"    请手动运行: python scripts/download_briefing_history.py --update")
+
+
 def run_briefing(target_date=None):
     db = get_db()
     if target_date is None:
@@ -1055,6 +1095,9 @@ def run_briefing(target_date=None):
     if prev_trade_date == target_date and len(recent) >= 2:
         prev_trade_date = recent[1]
     print(f"  Briefing日期: {target_date}  数据日: {prev_trade_date}")
+
+    # 自动检查并更新过期的数据源
+    _check_and_update_briefing_data(db, prev_trade_date)
 
     # P1 数据（优先本地DB，fallback到Tushare）
     print(f"  获取跨市场数据...")
