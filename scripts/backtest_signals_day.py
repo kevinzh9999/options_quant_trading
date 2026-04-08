@@ -168,9 +168,9 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
     # Select signal generator version
     _ver = version if version != "auto" else SIGNAL_ROUTING.get(sym, "v2")
     if _ver == "v3":
-        gen = SignalGeneratorV3({"min_signal_score": 60})
+        gen = SignalGeneratorV3({"min_signal_score": 55})
     else:
-        gen = SignalGeneratorV2({"min_signal_score": 60})
+        gen = SignalGeneratorV2({"min_signal_score": 55})
 
     # Per-symbol threshold（IC=65等，从SYMBOL_PROFILES读取）
     from strategies.intraday.A_share_momentum_signal_v2 import SYMBOL_PROFILES, _DEFAULT_PROFILE
@@ -685,7 +685,7 @@ def _patch_threshold(threshold: int):
 
 
 # Module-level threshold (patched by _patch_threshold)
-_SIGNAL_THRESHOLD = 60
+_SIGNAL_THRESHOLD = 55  # 动态lb方案配套（从60降至55）
 
 
 def _run_sensitivity(sym: str, dates: List[str], db: DBManager,

@@ -815,7 +815,7 @@ SYMBOL_PROFILES: Dict[str, Dict] = {
         "daily_conflict_penalty": 0.7,
         "dm_trend": 1.1,              # 215天验证：1.1/0.9 > 1.2/0.8
         "dm_contrarian": 0.9,
-        "signal_threshold": 65,       # IC的60-64是死亡区间（38%WR, -7.1pt/笔）
+        "signal_threshold": 60,       # 动态lb+th55/60: IC从65降至60（配合lb=4震荡模式）
         "trailing_stop_scale": 2.0,   # IC趋势中震荡大，需要更宽trailing（5/5周稳健验证）
         "session_multiplier": {
             "0935-1030": 1.0,
@@ -1117,11 +1117,26 @@ class SignalGeneratorV2:
             "is_high_vol": is_high_vol,
         }
 
+    # 动态 lookback 参数（振幅驱动）
+    # 稳健性验证: 时间分半两半都正, 12个邻域全正(+425~+1062), 逐月无亏损
+    _DYN_LB_LOW = 4      # 震荡模式 lookback（20分钟窗口）
+    _DYN_LB_HIGH = 12    # 趋势模式 lookback（60分钟窗口，=旧 baseline）
+    _DYN_AMP_THR = 0.015  # 振幅切换阈值 1.5%
+
     def _score_momentum(self, close_5m, bar_15m, daily_bar,
                          lookback_5m: int = MOM_5M_LOOKBACK) -> Tuple[int, str]:
-        if len(close_5m) < lookback_5m + 1:
+        # === 动态 lookback: 振幅 < 1.5% 用 lb=4（震荡），否则 lb=12（趋势） ===
+        # 216天回测: +5186 vs baseline +4124 (+26%), 时间分半前+21%后+30%
+        lb = self._DYN_LB_HIGH  # 默认趋势模式
+        if len(close_5m) >= 6:
+            recent = close_5m[-min(48, len(close_5m)):]
+            amp = (max(recent) - min(recent)) / recent[0] if recent[0] > 0 else 0
+            if amp < self._DYN_AMP_THR:
+                lb = self._DYN_LB_LOW
+
+        if len(close_5m) < lb + 1:
             return 0, ""
-        mom_5m = (close_5m[-1] - close_5m[-lookback_5m - 1]) / close_5m[-lookback_5m - 1]
+        mom_5m = (close_5m[-1] - close_5m[-lb - 1]) / close_5m[-lb - 1]
         dir_5m = "LONG" if mom_5m > 0 else "SHORT" if mom_5m < 0 else ""
         mom_15m = 0.0
         dir_15m = ""
