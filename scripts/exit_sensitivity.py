@@ -170,6 +170,11 @@ def check_exit_param(
     time_stop_min:  int   = 60,
     lunch_mode:     str   = "loss_only",   # "always"|"loss_only"|"never"
     mid_break_bars: int   = 2,
+    # ── dynamic trailing (Phase 1.1) ────────────────────────
+    trail_atr_mult: float = 0,     # >0 启用ATR-based trailing，替代固定阶梯
+    day_atr:        float = 0,     # 开盘30min ATR（由run_day_param计算传入）
+    # ── dynamic stop loss (Phase 1.2) ───────────────────────
+    sl_atr_mult:    float = 0,     # >0 启用ATR-based stop loss，替代固定百分比
     # ── fixed constants ─────────────────────────────────────
     EOD_CLOSE_UTC:    str = "06:45",
     LUNCH_CLOSE_UTC:  str = "03:25",
@@ -197,10 +202,13 @@ def check_exit_param(
         return {"should_exit": True, "exit_volume": volume,
                 "exit_reason": "EOD_CLOSE", "exit_urgency": "URGENT"}
 
-    # P1b: Stop loss
+    # P1b: Stop loss (dynamic ATR-based or fixed %)
+    effective_sl = stop_loss_pct
+    if sl_atr_mult > 0 and day_atr > 0:
+        effective_sl = max(day_atr * sl_atr_mult, 0.003)  # ATR-based，下限0.3%
     loss_pct = ((entry_price - current_price) / entry_price if direction == "LONG"
                 else (current_price - entry_price) / entry_price)
-    if loss_pct > stop_loss_pct:
+    if loss_pct > effective_sl:
         return {"should_exit": True, "exit_volume": volume,
                 "exit_reason": "STOP_LOSS", "exit_urgency": "URGENT"}
 
@@ -254,16 +262,28 @@ def check_exit_param(
             pass
 
     # P3: Dynamic trailing stop (scaled)
-    # Base ladder (production values) × trail_scale
-    # IC禁用trailing_stop by SYMBOL_PROFILES (not re-implemented here; IC sweep is still informative)
-    if hold_minutes < 15:
-        base_trail = 0.005
-    elif hold_minutes < 30:
-        base_trail = 0.006
-    elif hold_minutes < 60:
-        base_trail = 0.008
+    # Two modes: ATR-based (trail_atr_mult>0) or fixed ladder
+    if trail_atr_mult > 0 and day_atr > 0:
+        # ATR-based: base = day_atr * mult, time-scaled 1.0~2.0x
+        if hold_minutes < 15:
+            time_mult = 1.0
+        elif hold_minutes < 30:
+            time_mult = 1.2
+        elif hold_minutes < 60:
+            time_mult = 1.6
+        else:
+            time_mult = 2.0
+        base_trail = max(day_atr * trail_atr_mult * time_mult, 0.003)
     else:
-        base_trail = 0.010
+        # Fixed ladder (production values)
+        if hold_minutes < 15:
+            base_trail = 0.005
+        elif hold_minutes < 30:
+            base_trail = 0.006
+        elif hold_minutes < 60:
+            base_trail = 0.008
+        else:
+            base_trail = 0.010
 
     trail_pct = base_trail * trail_scale
 
@@ -386,6 +406,9 @@ def run_day_param(
     time_stop_min:  int   = 60,
     lunch_mode:     str   = "loss_only",
     mid_break_bars: int   = 2,
+    # dynamic trailing/SL (Phase 1.1/1.2)
+    trail_atr_mult: float = 0,
+    sl_atr_mult:    float = 0,
 ) -> List[Dict]:
     from strategies.intraday.A_share_momentum_signal_v2 import is_open_allowed
 
@@ -418,12 +441,33 @@ def run_day_param(
     last_exit_utc = ""
     last_exit_dir = ""
 
-    # Stop-loss price uses stop_loss_pct param
+    # Compute day_atr from opening 6 bars (30min)
+    day_atr = 0.0
+    if len(today_indices) >= 6:
+        open_bars = all_bars.loc[today_indices[:6]]
+        _h = open_bars["high"].astype(float).values
+        _l = open_bars["low"].astype(float).values
+        _c = open_bars["close"].astype(float).values
+        _trs = []
+        for i in range(len(_h)):
+            hl = _h[i] - _l[i]
+            if i > 0:
+                hc = abs(_h[i] - _c[i - 1])
+                lc = abs(_l[i] - _c[i - 1])
+                _trs.append(max(hl, hc, lc) / _c[i])
+            else:
+                _trs.append(hl / _c[i] if _c[i] > 0 else 0)
+        day_atr = float(np.mean(_trs)) if _trs else 0.0
+
+    # Stop-loss price uses stop_loss_pct or ATR-based
     def _make_stop(entry_p, direction):
+        effective_sl = stop_loss_pct
+        if sl_atr_mult > 0 and day_atr > 0:
+            effective_sl = max(day_atr * sl_atr_mult, 0.003)
         if direction == "LONG":
-            return entry_p * (1 - stop_loss_pct)
+            return entry_p * (1 - effective_sl)
         else:
-            return entry_p * (1 + stop_loss_pct)
+            return entry_p * (1 + effective_sl)
 
     for idx in today_indices:
         bar_5m = all_bars.loc[:idx].tail(200).copy()
@@ -503,6 +547,9 @@ def run_day_param(
                     time_stop_min=time_stop_min,
                     lunch_mode=lunch_mode,
                     mid_break_bars=mid_break_bars,
+                    trail_atr_mult=trail_atr_mult,
+                    day_atr=day_atr,
+                    sl_atr_mult=sl_atr_mult,
                 )
 
                 if exit_info["should_exit"]:

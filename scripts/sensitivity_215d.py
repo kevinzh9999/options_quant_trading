@@ -6,14 +6,16 @@ sensitivity_215d.py
 
 每次只变一个参数，其他保持当前值。同时对IM和IC跑，输出并排对比表。
 
-参数清单：
-  P1  ME窄幅阈值     me_ratio          当前0.10（从0.20改过来）
-  P2  MID_BREAK bars mid_break_bars    当前3（从2改过来）
-  P3  IC trailing     trail_scale       当前IC=2.0, IM=1.0
-  P4  信号阈值       threshold         当前IM=60, IC=65
-  P5  dm顺势/逆势    dm_trend/contra   当前1.2/0.8
+参数清单（方案E baseline, 2026-04-08）：
+  P1  ME窄幅阈值     me_ratio          当前0.10
+  P2  MID_BREAK bars mid_break_bars    当前3
+  P3  trailing scale  trail_scale       当前IM=1.5, IC=2.0
+  P4  信号阈值       threshold         当前IM=55, IC=60
+  P5  dm顺势/逆势    dm_trend/contra   当前1.1/0.9
   P6  止损幅度       stop_loss_pct     当前0.5%
-  P7  午后session_wt session_afternoon 当前1.0（从0.8改过来）
+  P7  午后session_wt session_afternoon 当前1.0
+  P8  动态trailing   trail_atr_mult    当前0(禁用)  ← Phase 1.1
+  P9  动态止损       sl_atr_mult       当前0(禁用)  ← Phase 1.2
 
 用法：
     python scripts/sensitivity_215d.py                    # 全部参数
@@ -48,24 +50,25 @@ from scripts.exit_sensitivity import (
 import strategies.intraday.A_share_momentum_signal_v2 as sig_mod
 
 # ─────────────────────────────────────────────────────────────
-# 当前值（baseline）— 反映04-04最新参数
+# 当前值（baseline）— 反映04-08方案E最新参数
 # ─────────────────────────────────────────────────────────────
-# exit_sensitivity.py的BASELINE还是旧值，这里覆盖为当前值
 CURRENT_BASELINE = {
     "stop_loss_pct":     0.005,
-    "trail_scale":       1.0,      # IM=1.0, IC单独处理
+    "trail_scale":       1.0,      # IM=1.5, IC=2.0（per-symbol覆盖）
     "trail_bonus":       0.002,
     "me_hold_min":       20,
     "me_ratio":          0.10,     # 当前值（从0.20改过来）
     "time_stop_min":     60,
     "lunch_mode":        "loss_only",
     "mid_break_bars":    3,        # 当前值（从2改过来）
+    "trail_atr_mult":    0,        # 0=禁用ATR trailing（固定阶梯）
+    "sl_atr_mult":       0,        # 0=禁用ATR stop loss（固定0.5%）
 }
 
-# Per-symbol overrides
+# Per-symbol overrides — 方案E参数
 SYMBOL_BASELINE = {
-    "IM": {"trail_scale": 1.0, "threshold": 60, "dm_trend": 1.2, "dm_contrarian": 0.8},
-    "IC": {"trail_scale": 2.0, "threshold": 65, "dm_trend": 1.2, "dm_contrarian": 0.8},
+    "IM": {"trail_scale": 1.5, "threshold": 55, "dm_trend": 1.1, "dm_contrarian": 0.9},
+    "IC": {"trail_scale": 2.0, "threshold": 60, "dm_trend": 1.1, "dm_contrarian": 0.9},
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -113,6 +116,18 @@ PARAM_DEFS = {
         "key": "session_afternoon",
         "values": [0.7, 0.8, 0.9, 1.0, 1.1],
         "type": "entry",
+    },
+    "P8": {
+        "name": "动态trailing(ATR mult)",
+        "key": "trail_atr_mult",
+        "values": [0, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5],
+        "type": "exit",
+    },
+    "P9": {
+        "name": "动态止损(ATR mult)",
+        "key": "sl_atr_mult",
+        "values": [0, 1.5, 2.0, 2.5, 3.0, 4.0],
+        "type": "exit",
     },
 }
 
@@ -418,11 +433,11 @@ def main():
 
             # Current value
             if key == "threshold":
-                cur_str = "IM60/IC65"
+                cur_str = "IM55/IC60"
             elif key == "trail_scale":
-                cur_str = "IM1.0/IC2.0"
+                cur_str = "IM1.5/IC2.0"
             elif key == "dm":
-                cur_str = "1.2/0.8"
+                cur_str = "1.1/0.9"
             elif key == "session_afternoon":
                 cur_str = "1.0"
             elif key == "stop_loss_pct":
@@ -431,6 +446,10 @@ def main():
                 cur_str = "0.10"
             elif key == "mid_break_bars":
                 cur_str = "3"
+            elif key == "trail_atr_mult":
+                cur_str = "0(off)"
+            elif key == "sl_atr_mult":
+                cur_str = "0(off)"
             else:
                 cur_str = "?"
 
