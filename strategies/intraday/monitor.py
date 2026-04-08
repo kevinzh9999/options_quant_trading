@@ -1066,6 +1066,15 @@ class IntradayMonitor:
                 df.index = pd.to_datetime(completed["datetime"], unit="ns")
                 if len(df) > 0:
                     bar_data[sym] = df
+                    # DEBUG: 检查TQ现货volume是否正常（Q分偏差排查，确认后删除）
+                    if sym == "IM" and len(df) >= 2:
+                        last_vol = float(df["volume"].iloc[-1])
+                        prev_vol = float(df["volume"].iloc[-2])
+                        avg20 = float(df["volume"].tail(20).mean())
+                        ratio = last_vol / avg20 if avg20 > 0 else 0
+                        last_dt = df.index[-1].strftime("%H:%M") if hasattr(df.index[-1], 'strftime') else str(df.index[-1])
+                        print(f"  [Q-DEBUG] IM spot vol: {last_dt} vol={last_vol:.0f}"
+                              f" prev={prev_vol:.0f} avg20={avg20:.0f} ratio={ratio:.2f}", flush=True)
 
             k15 = spot_klines_15m.get(sym)
             if k15 is not None and len(k15) > 1:
