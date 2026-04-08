@@ -1,6 +1,6 @@
 # 开发进度追踪
 
-> 最后更新：2026-04-01（Executor持久连接 + Monitor重启状态恢复 + Shadow浮盈修复）
+> 最后更新：2026-04-08（方案E动态lb + d_override禁用 + EOD重构四库分离 + Shadow恢复修复）
 
 ## 总体状态
 
@@ -626,9 +626,42 @@ Breakeven滑点：~2.5pt → ~4.0pt
 
 ---
 
+## 2026-04-07~08：方案E动态lb + d_override禁用 + EOD重构 + Bug修复
+
+### 方案E：动态M分lookback（核心改进）
+- [x] **动态lb=4/12**：开盘30min振幅<1.5%用lb=4（20分钟），否则lb=12（60分钟）
+- [x] 原理：赚钱日趋势35-40min用lb=12，亏钱日震荡25-30min反转用lb=4
+- [x] 216天回测：IM+2120 IC+2836 = **+4956pt**（+20.2% vs 旧baseline +4124pt）
+- [x] 稳健性验证：时间分半前+21%后+30%，12个邻域全正，逐月无亏损
+- [x] signal_threshold下调：IM 60→55，IC 65→60（动态lb改善了低分段信号质量）
+
+### d_override禁用
+- [x] **briefing dm累计-19.2%负贡献**：d_override在216天回测中净亏损，禁用后改为纯算法dm 1.1/0.9
+- [x] Monitor/Backtest不再加载morning_briefing表的d_override_long/short
+
+### Shadow恢复修复
+- [x] **monitor重启孤立持仓检测**：从order_log检测孤立shadow持仓，修复重启后position_mgr状态不一致
+
+### EOD重构：DataDownloader并行归档
+- [x] **四库分离**：trading.db(680MB) + options_data.db(4.7GB) + tick_data.db(28.5GB) + etf_data.db(56MB)
+- [x] 并行归档：1m+5m+tick+ETF+期权5m分别写入对应DB
+- [x] `get_db()` 自动路由查询到正确的库
+
+### Bug修复
+- [x] **get_main_contract wait_update deadline修复**：防止TQ wait_update无限阻塞
+- [x] **get_latest_date DB路由修复**：期权表查询正确路由到options_data.db
+- [x] **vol_monitor行权价间距修复**：季月合约使用200pt间距（非当月100pt）
+- [x] **Briefing自动更新**：stale数据时自动触发download_briefing_history更新
+
+### BAND_REVERSAL研究结论
+- [x] 因子有效（WR=69%），但作为独立exit信号-32%，加regime+cooldown仍-5.3%
+- [x] 结论：不实施，保持当前exit系统
+
+---
+
 ## 已知问题 / TODO
 
-- [ ] **Morning Briefing外盘数据滞后（2026-03-31）**：`make briefing` 未自动更新本地DB，若忘记先跑 `download_briefing_history.py --update`，`global_index_daily` 会用旧数据（如3/31 briefing用了3/27的IXIC -2.15%而非实际-0.73%）。修复方案：在 `Makefile` 的 `briefing` target 中自动先跑 `--update`，或在 `morning_briefing.py` 启动时检查DB数据是否超过1个交易日并警告。
+- [x] **Morning Briefing外盘数据滞后（2026-03-31，04-08修复）**：briefing启动时自动检查数据新鲜度，stale时触发download_briefing_history更新。
 - [ ] TqSdk 异步架构需要特殊处理（事件循环）
 - [ ] 期货分钟线数据量大，需要分批下载和压缩存储
 - [ ] 多标的同时运行时的相关性处理

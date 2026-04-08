@@ -142,16 +142,29 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - 放量突破 +2分、窄带突破 +3分、15分钟同方向确认 +5分
 - 面板/回测中显示 `B{n}` 标注
 
-### 日内策略品种配置（2026-04-04更新，215天全量回测验证）
+### 动量lookback动态切换（2026-04-07，方案E）
+- **动态 lb=4/12**：开盘30min振幅<1.5%用lb=4（20分钟），否则lb=12（60分钟）
+- 原理：赚钱日趋势持续35-40min用lb=12捕捉大波动，亏钱日震荡25-30min反转用lb=4及时止损
+- 216天回测：IM+2120 IC+2836 = **+4956pt**（+20.2% vs 旧baseline +4124）
+- 稳健性：时间分半前+21%后+30%，12个邻域全正，逐月无亏损
+- `_score_momentum()` 根据 `check_low_amplitude()` 返回的振幅动态选择lookback
+- 振幅阈值1.5%在1.0-2.0%范围内稳健（12个邻域全正）
 
-| 品种 | 类型 | 状态 | 阈值 | dm(顺/逆) | trail_scale | PnL(215d) | 均PnL |
-|------|------|------|------|-----------|-------------|-----------|-------|
-| IM | 动量 | **实盘** | 60 | 1.1/0.9 | 1.5x | +1870 | +9.4 |
-| IC | 动量 | **实盘** | 65 | 1.1/0.9 | 2.0x | +2197 | +12.1 |
-| IF | 均值回归 | 观察 | 60 | 1.0/1.0 | 1.0x | 未测 | — |
-| IH | — | 放弃 | 60 | 1.1/0.9 | 1.0x | 未测 | — |
+### 日内策略品种配置（2026-04-08更新，方案E 216天回测验证）
 
-IM+IC合计 +4067pt/215天（2025-05-16~2026-04-03）。无任何月份合计亏损。
+| 品种 | 类型 | 状态 | 阈值 | dm(顺/逆) | trail_scale | M分lb | PnL(216d) | 均PnL |
+|------|------|------|------|-----------|-------------|-------|-----------|-------|
+| IM | 动量 | **实盘** | 55 | 1.1/0.9 | 1.5x | 动态4/12 | +2120 | +9.8 |
+| IC | 动量 | **实盘** | 60 | 1.1/0.9 | 2.0x | 动态4/12 | +2836 | +13.1 |
+| IF | 均值回归 | 观察 | 60 | 1.0/1.0 | 1.0x | 动态4/12 | 未测 | — |
+| IH | — | 放弃 | 60 | 1.1/0.9 | 1.0x | 动态4/12 | 未测 | — |
+
+IM+IC合计 **+4956pt/216天**（2025-05-16~2026-04-04）。无任何月份合计亏损。
+
+**04-07~08 方案E改动（+20.2% vs 旧baseline +4124pt）：**
+- M分lookback：静态lb=12 → 动态lb=4/12（振幅<1.5%用4，否则12）
+- signal_threshold：IM 60→55，IC 65→60（动态lb提升了低分段信号质量）
+- d_override禁用（briefing dm累计-19.2%负贡献，改为纯算法dm 1.1/0.9）
 
 **04-04三项改动（215天敏感分析后实施，+21%/+717pt）：**
 - dm_trend/dm_contrarian 1.2/0.8→1.1/0.9（IM/IC/IH，IF保持1.0/1.0）
@@ -168,12 +181,13 @@ IM+IC合计 +4067pt/215天（2025-05-16~2026-04-03）。无任何月份合计亏
 - **实盘品种**：IM+IC，`IntradayConfig.tradeable = {"IM", "IC"}`，只有这两个品种通过strategy开仓占position_mgr槽位、写信号给executor、注册shadow持仓
 - **IF观察**：monitor全品种监控面板显示评分，但不占position_mgr槽位、不触发开仓。IF的BE=1.2pt余量小，等shadow验证2-4周后决定
 - **IH放弃日内**：BE=0.6pt无法覆盖滑点+手续费
-- IC的thr=65：60-64分是"死亡区间"（26笔38%WR -7.1pt/笔），thr=65砍掉后+125%
+- IC的thr=60（从65下调）：动态lb改善了低分段信号质量，60-64分不再是"死亡区间"
 - IF的dm=1.0/1.0：IF逆势59%WR是利润主力，中性dm比惩罚逆势(0.8)+75%
 - 全品种统一v2：v3消灭了IF/IH的逆势交易（利润来源），干净数据验证v2更优
 
-### 信号阈值
-- **默认阈值 60**（从55上调），IC例外用65（SYMBOL_PROFILES.signal_threshold）
+### 信号阈值（2026-04-08更新）
+- **默认阈值 55**（从60下调，方案E动态lb改善了低分段信号质量），IC用60（从65下调）
+- 阈值来源：`SYMBOL_PROFILES.signal_threshold`（IM=55, IC=60, IF=60, IH=60）
 - 可通过 `--threshold` 参数覆盖回测阈值
 
 ### Monitor/Executor 职责分离（2026-03-31重构，04-02补充）
@@ -239,7 +253,7 @@ IM+IC合计 +4067pt/215天（2025-05-16~2026-04-03）。无任何月份合计亏
 - 盘前运行 `python scripts/morning_briefing.py`，综合5维度评分输出方向Guidance
 - 数据源：Tushare（A50/美股/恒生/涨跌家数/成交额）+ 本地DB（IV/VRP/价格位置）
 - 输出 JSON 到 `tmp/morning_briefing.json`
-- **d_override**：Monitor启动时从 `morning_briefing` 表读取 `d_override_long/short`，覆盖 `daily_mult`；Backtest同样加载
+- **d_override已禁用（2026-04-07）**：briefing dm累计-19.2%负贡献，现改为纯算法dm 1.1/0.9。Monitor/Backtest不再加载d_override
 - 结果写入 `morning_briefing` 表 + `logs/briefing/YYYYMMDD.md`
 - **本地DB优先**：`download_briefing_history.py` 预下载历史数据到7个表，briefing优先读本地（快速），Tushare作fallback
 - 增量更新：`python scripts/download_briefing_history.py --update`
@@ -257,7 +271,7 @@ IM+IC合计 +4067pt/215天（2025-05-16~2026-04-03）。无任何月份合计亏
 - **跨日GAP不修复**：M/V/Q中的隔夜gap"失真"是有益的开盘过滤器（验证修复后IM -53%）
 - **per-symbol阈值**：`effective_threshold` 从 SYMBOL_PROFILES.signal_threshold 读取（IC=65）
 - **--version v2/v3/auto**：支持切换信号版本回测
-- **动量lookback硬编码修复（2026-04-04）**：V2的`_score_momentum`原用硬编码`MOM_5M_LOOKBACK=12`，SYMBOL_PROFILES的IF/IH值18未生效。已修复为从prof读取。IF/IH配置从18改回12（grid search验证lb=12对四品种均最优或接近最优）
+- **动量lookback动态切换（2026-04-07，方案E）**：V2的`_score_momentum`根据开盘30min振幅动态选择lb=4或12（振幅<1.5%用4，否则12）。原硬编码lb=12已替换。详见"动量lookback动态切换"章节
 
 ---
 
@@ -361,7 +375,7 @@ python scripts/daily_record.py model --date YYYYMMDD  # 补跑模型
 | 数据层 | Tushare/TqSdk/SQLite/统一接口/质量检查/所有下载脚本/现货分钟线归档 |
 | 模型层 | GJR-GARCH / RealizedVol / ImpliedVol / VolSurface / Greeks / 统计模型 / 技术指标，638+ 测试全绿 |
 | 贴水策略 | DiscountSignal / DiscountPosition（含 Put Spread 对比）/ DiscountBacktest / DiscountCaptureStrategy |
-| 日内策略 | v2/v3信号系统 / 4层Z-Score过滤 / 布林带突破+平仓 / 现货数据源 / 离线回测 / 信号质量分析 / 215天全量敏感分析 / 振幅过滤器 |
+| 日内策略 | v2/v3信号系统 / 4层Z-Score过滤 / 布林带突破+平仓 / 现货数据源 / 离线回测 / 信号质量分析 / 216天全量敏感分析 / 振幅过滤器 / 动态lb |
 | 半自动下单 | order_executor.py / 限价单+手工确认 / 锁仓（股指期货平今优化）/ TqBacktest验证 |
 | Morning Briefing | P1(跨市场/宽度/成交额/波动率/价格) + P2(北向/融资/PCR/ETF/期货持仓) + 极端值逆向修正 |
 | 象限监控 | quadrant_monitor.py / A/B/C/D判定 / 持仓匹配 / 象限切换alert |
