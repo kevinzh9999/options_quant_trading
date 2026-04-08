@@ -467,88 +467,151 @@ def _eod_trade_records(trade_ref, trade_date: str, db) -> int:
 
 def _eod_archive_minute_bars(api, trade_date: str, db) -> int:
     """
-    用 TQ DataDownloader 并行归档当天的全部分钟线/Tick/ETF 数据。
+    用 get_kline_serial/get_tick_serial 归档当天的全部分钟线/Tick/ETF 数据。
+    免费版API，无需DataDownloader（Pro功能）。
 
     归档内容（四库分流）:
       trading.db:   期货主连 1m+5m, 现货指数 1m+5m
       tick_data.db: IM/IC/IF 主连 tick
       etf_data.db:  512100/510500/510300/510050 5m
+      options_data.db: MO/IO/HO 活跃合约 5m
 
-    DataDownloader 比 get_kline_serial 更快（并行下载，无逐个 wait_update）。
+    get_kline_serial的datetime是纳秒时间戳(UTC)，无需BJ→UTC转换。
     """
-    from contextlib import closing
-    from datetime import date as _date
-    from tqsdk.tools import DataDownloader
     from pathlib import Path
     import sqlite3 as _sqlite3
 
-    td = _date(int(trade_date[:4]), int(trade_date[4:6]), int(trade_date[6:8]))
-    csv_dir = Path(ROOT) / "tmp" / "eod_archive"
-    csv_dir.mkdir(parents=True, exist_ok=True)
+    date_dash = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}"
+    db_path_trading = db.db_path
+    db_path_options = str(Path(ROOT) / "data" / "storage" / "options_data.db")
+    db_path_tick = str(Path(ROOT) / "data" / "storage" / "tick_data.db")
+    db_path_etf = str(Path(ROOT) / "data" / "storage" / "etf_data.db")
 
-    # ── 定义所有下载任务 ──
-    tasks = {}
+    total = 0
 
-    # 期货主连 1m + 5m
+    def _get_db_conn(db_name):
+        p = {"trading": db_path_trading, "options": db_path_options,
+             "tick": db_path_tick, "etf": db_path_etf}[db_name]
+        conn = _sqlite3.connect(p, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        return conn
+
+    def _archive_kline(tq_sym, duration, symbol, table, sym_col, db_name, data_length=500):
+        """用get_kline_serial获取K线并写入DB。"""
+        nonlocal total
+        try:
+            kl = api.get_kline_serial(tq_sym, duration, data_length=data_length)
+            api.wait_update()  # 确保数据到位
+            if kl is None or kl.empty:
+                return 0
+            # 转换datetime（纳秒→UTC字符串）
+            df = kl[kl["close"] > 0].copy()
+            df["dt_str"] = pd.to_datetime(df["datetime"], unit="ns").dt.strftime(
+                "%Y-%m-%d %H:%M:%S")
+            # 只保留当天数据
+            df = df[df["dt_str"].str.startswith(date_dash)]
+            if df.empty:
+                return 0
+            n = len(df)
+            oi = df["close_oi"].fillna(0).tolist() if "close_oi" in df.columns else [None]*n
+            rows = list(zip(
+                [symbol]*n, df["dt_str"].tolist(), [duration]*n,
+                df["open"].tolist(), df["high"].tolist(),
+                df["low"].tolist(), df["close"].tolist(),
+                df["volume"].tolist(), oi,
+            ))
+            conn = _get_db_conn(db_name)
+            conn.executemany(
+                f"INSERT OR IGNORE INTO {table} "
+                f"({sym_col},datetime,period,open,high,low,close,volume,"
+                f"open_interest) VALUES (?,?,?,?,?,?,?,?,?)", rows)
+            conn.commit()
+            conn.close()
+            total += n
+            logger.info("归档 %s %ss %s: %d 行", symbol, duration, db_name, n)
+            return n
+        except Exception as e:
+            logger.warning("归档 %s %ss 失败: %s", symbol, duration, e)
+            return 0
+
+    def _archive_tick(tq_sym, symbol):
+        """用get_tick_serial获取Tick并写入DB。"""
+        nonlocal total
+        try:
+            tk = api.get_tick_serial(tq_sym, data_length=10000)
+            api.wait_update()
+            if tk is None or tk.empty:
+                return 0
+            df = tk[tk["last_price"] > 0].copy()
+            df["dt_str"] = pd.to_datetime(df["datetime"], unit="ns").dt.strftime(
+                "%Y-%m-%d %H:%M:%S.%f")
+            df = df[df["dt_str"].str.startswith(date_dash)]
+            if df.empty:
+                return 0
+            n = len(df)
+            def _c(name, dtype=float, default=0):
+                return df[name].fillna(default).astype(dtype).tolist() \
+                    if name in df.columns else [default]*n
+            rows = list(zip(
+                [symbol]*n, df["dt_str"].tolist(),
+                _c("last_price"), _c("average"), _c("highest"), _c("lowest"),
+                _c("bid_price1"), _c("bid_volume1", int),
+                _c("ask_price1"), _c("ask_volume1", int),
+                _c("volume", int), _c("amount"), _c("open_interest", int),
+            ))
+            conn = _get_db_conn("tick")
+            conn.executemany(
+                "INSERT OR IGNORE INTO futures_tick VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            conn.commit()
+            conn.close()
+            total += n
+            logger.info("归档 tick %s: %d 行", symbol, n)
+            return n
+        except Exception as e:
+            logger.warning("归档 tick %s 失败: %s", symbol, e)
+            return 0
+
+    # ── 期货主连 1m + 5m ──
+    print("  归档期货K线...", flush=True)
     for sym, tq in [("IM","KQ.m@CFFEX.IM"),("IC","KQ.m@CFFEX.IC"),
                      ("IF","KQ.m@CFFEX.IF"),("IH","KQ.m@CFFEX.IH")]:
-        for dur, label in [(60,"1m"),(300,"5m")]:
-            key = f"fut_{sym}_{label}"
-            tasks[key] = {
-                "dl": DataDownloader(api, tq, dur, start_dt=td, end_dt=td,
-                                     csv_file_name=str(csv_dir/f"{key}.csv")),
-                "table": "futures_min", "sym_col": "symbol", "symbol": sym,
-                "period": dur, "db": "trading",
-            }
+        for dur in [60, 300]:
+            _archive_kline(tq, dur, sym, "futures_min", "symbol", "trading")
 
-    # 现货指数 1m + 5m
+    # ── 现货指数 1m + 5m ──
+    print("  归档现货指数K线...", flush=True)
     for sym, tq in [("000852","SSE.000852"),("000300","SSE.000300"),
                      ("000016","SSE.000016"),("000905","SSE.000905")]:
-        for dur, label in [(60,"1m"),(300,"5m")]:
-            key = f"spot_{sym}_{label}"
-            tasks[key] = {
-                "dl": DataDownloader(api, tq, dur, start_dt=td, end_dt=td,
-                                     csv_file_name=str(csv_dir/f"{key}.csv")),
-                "table": "index_min", "sym_col": "symbol", "symbol": sym,
-                "period": dur, "db": "trading",
-            }
+        for dur in [60, 300]:
+            _archive_kline(tq, dur, sym, "index_min", "symbol", "trading")
 
-    # ETF 5m
+    # ── ETF 5m ──
+    print("  归档ETF K线...", flush=True)
     for sym, tq in [("512100","SSE.512100"),("510500","SSE.510500"),
                      ("510300","SSE.510300"),("510050","SSE.510050")]:
-        key = f"etf_{sym}_5m"
-        tasks[key] = {
-            "dl": DataDownloader(api, tq, 300, start_dt=td, end_dt=td,
-                                 csv_file_name=str(csv_dir/f"{key}.csv")),
-            "table": "etf_min", "sym_col": "symbol", "symbol": sym,
-            "period": 300, "db": "etf",
-        }
+        _archive_kline(tq, 300, sym, "etf_min", "symbol", "etf")
 
-    # Tick (IM/IC/IF)
+    # ── Tick (IM/IC/IF) ──
+    print("  归档Tick...", flush=True)
     for sym, tq in [("IM","KQ.m@CFFEX.IM"),("IC","KQ.m@CFFEX.IC"),
                      ("IF","KQ.m@CFFEX.IF")]:
-        key = f"tick_{sym}"
-        tasks[key] = {
-            "dl": DataDownloader(api, tq, 0, start_dt=td, end_dt=td,
-                                 csv_file_name=str(csv_dir/f"{key}.csv")),
-            "table": "futures_tick", "sym_col": "symbol", "symbol": sym,
-            "period": 0, "db": "tick",
-        }
+        _archive_tick(tq, sym)
 
-    # 期权 5m（MO/IO/HO 当天活跃合约）→ options_data.db
+    # ── 期权 5m ──
+    print("  归档期权5m K线...", flush=True)
     try:
         from config.config_loader import ConfigLoader
         _opt_db_path = ConfigLoader().get_options_db_path()
         import sqlite3 as _sq
         _opt_conn = _sq.connect(_opt_db_path, timeout=30)
-        # 查当天（或最近）有日线数据的合约
         _opt_date = trade_date
         _opt_rows = _opt_conn.execute(
             "SELECT DISTINCT ts_code FROM options_daily WHERE trade_date = ?",
             (_opt_date,)
         ).fetchall()
         if not _opt_rows:
-            # fallback: 用最近的交易日
             _latest = _opt_conn.execute(
                 "SELECT MAX(trade_date) FROM options_daily"
             ).fetchone()[0]
@@ -559,126 +622,18 @@ def _eod_archive_minute_bars(api, trade_date: str, db) -> int:
                 ).fetchall()
         _opt_conn.close()
 
-        opt_contracts = [r[0] for r in _opt_rows]  # MO2605-C-7000.CFX etc
+        opt_contracts = [r[0] for r in _opt_rows]
         print(f"  期权合约: {len(opt_contracts)} 个", flush=True)
+        opt_done = 0
         for ts_code in opt_contracts:
-            # MO2605-C-7000.CFX → CFFEX.MO2605-C-7000
             tq_sym = "CFFEX." + ts_code.replace(".CFX", "")
-            key = f"opt_{ts_code}"
-            tasks[key] = {
-                "dl": DataDownloader(api, tq_sym, 300, start_dt=td, end_dt=td,
-                                     csv_file_name=str(csv_dir / f"{key}.csv")),
-                "table": "options_min", "sym_col": "ts_code", "symbol": ts_code,
-                "period": 300, "db": "options",
-            }
+            n = _archive_kline(tq_sym, 300, ts_code, "options_min", "ts_code", "options",
+                               data_length=200)
+            opt_done += 1
+            if opt_done % 50 == 0:
+                print(f"    期权进度: {opt_done}/{len(opt_contracts)}", flush=True)
     except Exception as e:
-        logger.warning("期权合约列表获取失败: %s", e)
-
-    # ── 并行下载 ──
-    print(f"  DataDownloader: {len(tasks)} 个任务并行下载...", flush=True)
-    try:
-        last_print = time.time()
-        while not all(t["dl"].is_finished() for t in tasks.values()):
-            api.wait_update()
-            if time.time() - last_print > 10:
-                done = sum(1 for t in tasks.values() if t["dl"].is_finished())
-                print(f"    下载进度: {done}/{len(tasks)}", flush=True)
-                last_print = time.time()
-    except Exception as e:
-        logger.warning("DataDownloader 下载异常: %s", e)
-
-    # ── CSV → DB 导入 ──
-    total = 0
-    db_path_trading = db.db_path
-    db_path_options = str(Path(ROOT) / "data" / "storage" / "options_data.db")
-    db_path_tick = str(Path(ROOT) / "data" / "storage" / "tick_data.db")
-    db_path_etf = str(Path(ROOT) / "data" / "storage" / "etf_data.db")
-
-    for key, task in tasks.items():
-        csv_path = str(csv_dir / f"{key}.csv")
-        if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
-            continue
-
-        try:
-            df = pd.read_csv(csv_path)
-            # DataDownloader 列名带合约前缀，去掉
-            df.columns = [c.split(".")[-1] if "." in c else c for c in df.columns]
-            if "close" in df.columns:
-                df = df[df["close"] > 0].copy()
-            elif "last_price" in df.columns:
-                df = df[df["last_price"] > 0].copy()
-            if df.empty:
-                continue
-
-            # 选择目标 DB
-            if task["db"] == "tick":
-                target_path = db_path_tick
-            elif task["db"] == "etf":
-                target_path = db_path_etf
-            elif task["db"] == "options":
-                target_path = db_path_options
-            else:
-                target_path = db_path_trading
-
-            conn = _sqlite3.connect(target_path, timeout=30)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=30000")
-
-            if task["period"] == 0:
-                # Tick 导入（DataDownloader输出BJ时间，DB统一存UTC → 减8小时）
-                df["datetime"] = (pd.to_datetime(df["datetime"])
-                                  - pd.Timedelta(hours=8)).dt.strftime(
-                    "%Y-%m-%d %H:%M:%S.%f")
-                n = len(df)
-                def _c(name, dtype=float, default=0):
-                    return df[name].fillna(default).astype(dtype).tolist() \
-                        if name in df.columns else [default]*n
-                rows = list(zip(
-                    [task["symbol"]]*n, df["datetime"].tolist(),
-                    _c("last_price"), _c("average"), _c("highest"), _c("lowest"),
-                    _c("bid_price1"), _c("bid_volume1",int),
-                    _c("ask_price1"), _c("ask_volume1",int),
-                    _c("volume",int), _c("amount"), _c("open_interest",int),
-                ))
-                conn.executemany(
-                    "INSERT OR IGNORE INTO futures_tick VALUES "
-                    "(?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
-            else:
-                # K线导入（DataDownloader输出BJ时间，DB统一存UTC → 减8小时）
-                df["datetime"] = (pd.to_datetime(df["datetime"])
-                                  - pd.Timedelta(hours=8)).dt.strftime(
-                    "%Y-%m-%d %H:%M:%S")
-                n = len(df)
-                oi_col = "close_oi" if "close_oi" in df.columns else None
-                oi = df[oi_col].fillna(0).tolist() if oi_col else [None]*n
-                rows = list(zip(
-                    [task["symbol"]]*n, df["datetime"].tolist(),
-                    [task["period"]]*n,
-                    df["open"].tolist(), df["high"].tolist(),
-                    df["low"].tolist(), df["close"].tolist(),
-                    df["volume"].tolist(), oi,
-                ))
-                table = task["table"]
-                sym_col = task["sym_col"]
-                conn.executemany(
-                    f"INSERT OR IGNORE INTO {table} "
-                    f"({sym_col},datetime,period,open,high,low,close,volume,"
-                    f"open_interest) VALUES (?,?,?,?,?,?,?,?,?)", rows)
-
-            conn.commit()
-            conn.close()
-            total += n
-            logger.info("归档 %s: %d 行 → %s", key, n, task["db"])
-
-        except Exception as e:
-            logger.warning("归档 %s 失败: %s", key, e)
-
-    # 清理 CSV
-    for f in csv_dir.glob("*.csv"):
-        try:
-            f.unlink()
-        except Exception:
-            pass
+        logger.warning("期权归档失败: %s", e)
 
     return total
 
