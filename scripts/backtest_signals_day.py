@@ -449,7 +449,8 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
             # Gap alignment: 低开+做空=True, 高开+做多=True
             _gap_aligned = ((_gap_pct < 0 and direction == "SHORT") or
                             (_gap_pct > 0 and direction == "LONG"))
-            stop = entry_p * (1 - STOP_LOSS_PCT) if direction == "LONG" else entry_p * (1 + STOP_LOSS_PCT)
+            _sl_pct = SYMBOL_PROFILES.get(sym, _DEFAULT_PROFILE).get("stop_loss_pct", STOP_LOSS_PCT)
+            stop = entry_p * (1 - _sl_pct) if direction == "LONG" else entry_p * (1 + _sl_pct)
             position = {
                 "entry_price": entry_p,
                 "direction": direction,
@@ -617,6 +618,7 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
 # Import the constant we need
 from strategies.intraday.A_share_momentum_signal_v2 import (
     STOP_LOSS_PCT, TRAILING_STOP_HIVOL, TRAILING_STOP_NORMAL,
+    SYMBOL_PROFILES, _DEFAULT_PROFILE,
 )
 
 

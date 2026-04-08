@@ -151,7 +151,7 @@ NO_TRADE_AFTER = time(6, 50)
 # 平仓信号系统
 # ---------------------------------------------------------------------------
 
-STOP_LOSS_PCT = 0.005           # 固定止损0.5%
+STOP_LOSS_PCT = 0.005           # 默认止损0.5%（IM用0.3%，见SYMBOL_PROFILES）
 TRAILING_STOP_HIVOL = 0.008     # 高波动跟踪止盈0.8%
 TRAILING_STOP_NORMAL = 0.005    # 正常跟踪止盈0.5%
 TRAILING_STOP_LUNCH = 0.003     # 午休前紧止盈0.3%
@@ -406,11 +406,14 @@ def check_exit(
                 "exit_reason": "EOD_CLOSE", "exit_urgency": "URGENT"}
 
     # P1b: Stop loss (MUST be before lunch close — prevents large losses at lunch)
+    # Per-symbol stop loss: IM=0.3%（217天稳健性三检通过+366pt），其他0.5%
+    _prof = SYMBOL_PROFILES.get(symbol, _DEFAULT_PROFILE) if symbol else _DEFAULT_PROFILE
+    _sl_pct = _prof.get("stop_loss_pct", STOP_LOSS_PCT)
     if direction == "LONG":
         loss_pct = (entry_price - current_price) / entry_price
     else:
         loss_pct = (current_price - entry_price) / entry_price
-    if loss_pct > STOP_LOSS_PCT:
+    if loss_pct > _sl_pct:
         return {"should_exit": True, "exit_volume": volume,
                 "exit_reason": "STOP_LOSS", "exit_urgency": "URGENT"}
 
@@ -746,6 +749,7 @@ SYMBOL_PROFILES: Dict[str, Dict] = {
         "dm_trend": 1.1,              # 215天验证：1.1/0.9 > 1.2/0.8（+691pt合计）
         "dm_contrarian": 0.9,         # 轻度逆势惩罚，避免过度打折逆势交易
         "trailing_stop_scale": 1.5,   # 215天验证：1.5x > 1.0x（IM+259pt）
+        "stop_loss_pct": 0.003,       # 217天稳健性三检通过：+366pt，邻域✅分半✅单日18%✅
         "session_multiplier": {
             "0935-1030": 1.0,
             "1030-1130": 1.1,
