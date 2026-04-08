@@ -625,8 +625,9 @@ def _eod_archive_minute_bars(api, trade_date: str, db) -> int:
             conn.execute("PRAGMA busy_timeout=30000")
 
             if task["period"] == 0:
-                # Tick 导入
-                df["datetime"] = pd.to_datetime(df["datetime"]).dt.strftime(
+                # Tick 导入（DataDownloader输出BJ时间，DB统一存UTC → 减8小时）
+                df["datetime"] = (pd.to_datetime(df["datetime"])
+                                  - pd.Timedelta(hours=8)).dt.strftime(
                     "%Y-%m-%d %H:%M:%S.%f")
                 n = len(df)
                 def _c(name, dtype=float, default=0):
@@ -643,8 +644,9 @@ def _eod_archive_minute_bars(api, trade_date: str, db) -> int:
                     "INSERT OR IGNORE INTO futures_tick VALUES "
                     "(?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
             else:
-                # K线导入
-                df["datetime"] = pd.to_datetime(df["datetime"]).dt.strftime(
+                # K线导入（DataDownloader输出BJ时间，DB统一存UTC → 减8小时）
+                df["datetime"] = (pd.to_datetime(df["datetime"])
+                                  - pd.Timedelta(hours=8)).dt.strftime(
                     "%Y-%m-%d %H:%M:%S")
                 n = len(df)
                 oi_col = "close_oi" if "close_oi" in df.columns else None
