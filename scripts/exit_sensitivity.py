@@ -469,6 +469,10 @@ def run_day_param(
         else:
             return entry_p * (1 + effective_sl)
 
+    # 历史同时段volume profile（Q分分位数法）
+    from strategies.intraday.A_share_momentum_signal_v2 import compute_volume_profile
+    _vol_profile = compute_volume_profile(all_bars, before_date=td, lookback_days=20)
+
     for idx in today_indices:
         bar_5m = all_bars.loc[:idx].tail(200).copy()
         if len(bar_5m) < 15:
@@ -491,6 +495,7 @@ def run_day_param(
         result = gen.score_all(
             sym, bar_5m_signal, bar_15m, daily_df, None, sentiment,
             zscore=z_val, is_high_vol=is_high_vol, d_override=d_override,
+            vol_profile=_vol_profile,
         )
 
         score     = result["total"]     if result else 0

@@ -50,6 +50,10 @@ def precompute_signals(sym, dates, all_bars, daily_all, gen, per_day, threshold)
                 daily_df = None
 
         ema20, std20 = day["ema20"], day["std20"]
+
+        from strategies.intraday.A_share_momentum_signal_v2 import compute_volume_profile
+        _vol_profile = compute_volume_profile(all_bars, before_date=td, lookback_days=20)
+
         bars_data = []
 
         for idx in today_indices:
@@ -75,6 +79,7 @@ def precompute_signals(sym, dates, all_bars, daily_all, gen, per_day, threshold)
             result = gen.score_all(
                 sym, bar_5m_signal, bar_15m, daily_df, None, day["sentiment"],
                 zscore=z_val, is_high_vol=day["is_high_vol"], d_override=day["d_override"],
+                vol_profile=_vol_profile,
             )
 
             score     = result["total"]     if result else 0

@@ -135,6 +135,69 @@ VOLUME_SURGE_RATIO = 1.5
 VOLUME_LOW_RATIO = 0.5
 INTRADAY_REVERSAL_THRESHOLD = 0.015
 
+# Q分分位数阈值（历史同时段分位数）
+VOLUME_PCT_HIGH = 0.75    # 分位>75% → Q=20（该时段历史性放量）
+VOLUME_PCT_LOW = 0.25     # 分位<25% → Q=0（该时段历史性缩量）
+
+
+def compute_volume_profile(bar_5m_all: pd.DataFrame, before_date: str = "",
+                           lookback_days: int = 20) -> Dict[str, list]:
+    """
+    构建历史同时段volume列表，用于Q分的分位数计算。
+
+    返回 {time_slot: [vol1, vol2, ...]}，time_slot为UTC "HH:MM"格式。
+    每个slot保留最近lookback_days个交易日的volume值。
+
+    Args:
+        bar_5m_all: 全量5分钟K线（需有datetime和volume列）
+        before_date: 只用此日期之前的数据（YYYYMMDD或YYYY-MM-DD）
+        lookback_days: 使用最近N个交易日
+    """
+    df = bar_5m_all.copy()
+    if "datetime" in df.columns:
+        dt_col = df["datetime"].astype(str)
+    elif isinstance(df.index, pd.DatetimeIndex):
+        dt_col = df.index.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        return {}
+
+    if before_date:
+        bd = before_date.replace("-", "")
+        date_dash = f"{bd[:4]}-{bd[4:6]}-{bd[6:]}"
+        mask = dt_col < date_dash
+        df = df[mask].copy()
+        dt_col = dt_col[mask]
+
+    if len(df) == 0:
+        return {}
+
+    df = df.copy()
+    df["_slot"] = dt_col.str[11:16]
+    df["_date"] = dt_col.str[:10]
+    df["volume"] = df["volume"].astype(float)
+
+    unique_dates = sorted(df["_date"].unique())
+    if len(unique_dates) > lookback_days:
+        cutoff = unique_dates[-lookback_days]
+        df = df[df["_date"] >= cutoff]
+
+    profile: Dict[str, list] = {}
+    for slot, grp in df.groupby("_slot"):
+        profile[slot] = grp["volume"].tolist()
+    return profile
+
+
+def volume_percentile_q(vol: float, hist_vols: list) -> int:
+    """根据历史同时段volume列表计算Q分（分位数法）。"""
+    if not hist_vols or len(hist_vols) < 5:
+        return 10  # 数据不足，给中性分
+    pct = sum(1 for v in hist_vols if v <= vol) / len(hist_vols)
+    if pct > VOLUME_PCT_HIGH:
+        return 20
+    elif pct > VOLUME_PCT_LOW:
+        return 10
+    return 0
+
 _TIME_WEIGHTS = [
     (time(1, 35), time(2, 30), 1.0),
     (time(2, 30), time(3, 30), 1.1),
@@ -1009,6 +1072,7 @@ class SignalGeneratorV2:
         zscore: float | None = None,
         is_high_vol: bool = True,
         d_override: Dict[str, float] | None = None,
+        vol_profile: Dict[str, list] | None = None,
     ) -> Dict | None:
         prof = SYMBOL_PROFILES.get(symbol, _DEFAULT_PROFILE)
         lb_5m = prof.get("momentum_lookback_5m", MOM_5M_LOOKBACK)
@@ -1026,7 +1090,17 @@ class SignalGeneratorV2:
 
         s_mom, mom_dir = self._score_momentum(close_5m, bar_15m, daily_bar, lb_5m)
         s_vol, atr_short = self._score_volatility(high_5m, low_5m, close_5m)
-        s_qty = self._score_volume(volume_5m, mom_dir)
+
+        # Q分：优先用历史同时段分位数（消除跨日volume偏差），fallback到rolling均值
+        if vol_profile and utc_time:
+            slot = utc_time.strftime("%H:%M")
+            hist_vols = vol_profile.get(slot)
+            if hist_vols and len(hist_vols) >= 5:
+                s_qty = volume_percentile_q(float(volume_5m[-1]), hist_vols)
+            else:
+                s_qty = self._score_volume(volume_5m, mom_dir)
+        else:
+            s_qty = self._score_volume(volume_5m, mom_dir)
 
         # 布林带突破加分（0~20分，仅动量已确认方向时生效）
         s_breakout, breakout_note = 0, ""
@@ -1383,6 +1457,7 @@ class SignalGeneratorV3:
         zscore: float | None = None,
         is_high_vol: bool = True,
         d_override: Dict[str, float] | None = None,
+        vol_profile: Dict[str, list] | None = None,
     ) -> Dict | None:
         """使用 v2 的 50/30/20 评分体系，叠加品种差异化参数。"""
         prof = self._profile(symbol)
@@ -1407,8 +1482,16 @@ class SignalGeneratorV3:
         # --- 维度2: 波动率 (30分) ---
         s_vol, atr_short = self._score_volatility(high_5m, low_5m, close_5m)
 
-        # --- 维度3: 成交量 (20分) ---
-        s_qty = self._score_volume(volume_5m)
+        # --- 维度3: 成交量 (20分) — 同时段分位数法 ---
+        if vol_profile and utc_time:
+            slot = utc_time.strftime("%H:%M")
+            hist_vols = vol_profile.get(slot)
+            if hist_vols and len(hist_vols) >= 5:
+                s_qty = volume_percentile_q(float(volume_5m[-1]), hist_vols)
+            else:
+                s_qty = self._score_volume(volume_5m)
+        else:
+            s_qty = self._score_volume(volume_5m)
 
         # --- 维度4: 反转 (IH专属, 0-20附加分, 可覆盖方向) ---
         s_rev = 0

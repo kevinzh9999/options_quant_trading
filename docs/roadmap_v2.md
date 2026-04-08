@@ -217,11 +217,43 @@ ATR-based止损（day_atr × N替代固定0.5%）全面劣于固定百分比。
 
 **不采用Q=0修正的原因**：跳空高开+异常放量是有价值的入场信号，Q=0会杀掉这类信号
 
-**明天盘中待办**：
-1. Monitor加debug log，打印TQ SSE.000852 K线的raw volume值
-2. 对比实时volume vs 归档volume，确认延迟范围
-3. 如果确认是TQ实时延迟：考虑monitor启动时预加载index_min历史volume作为baseline
-4. 如果实时volume正常：排查monitor代码中Q=0的其他原因
+### 1.9 Q分重构：历史同时段分位数法（2026-04-09，已实施）
+
+**根因**：旧Q分用rolling 20-bar均值，跨日时被昨天尾盘低量拉低（开盘虚高Q=20），盘中被今天开盘高量拉高（中盘虚低Q=0）。全天43%的bar Q分评估不正确。
+
+**新算法**：
+```
+hist_vols = 过去20个交易日同一UTC时段的volume列表
+percentile = sum(v <= today_vol for v in hist_vols) / len(hist_vols)
+Q = 20 if pct > 0.75 else (10 if pct > 0.25 else 0)
+```
+
+**新旧Q分布对比**：
+| 时段 | 旧Q=20 | 旧Q=0 | 新Q=20 | 新Q=0 |
+|------|--------|-------|--------|-------|
+| 开盘 | **66%** | 0% | 29% | 30% |
+| 盘中 | **0%** | 33% | 28% | 29% |
+| 尾盘 | 12% | **0%** | 27% | 29% |
+
+新Q在三个时段分布均匀（~29%/44%/27%），消除了系统性偏差。
+
+**新baseline**：
+- IM: +2237pt（旧+2182，+55pt +3%）
+- IC: +2428pt（旧+2935，-507pt -17%）
+- 合计: +4665pt（旧+5117，-452pt -9%）
+- IC下降原因：旧Q在盘中永远给Q=10，新Q有时给Q=0→部分信号低于阈值不触发
+- 这是更真实的baseline（消除了跨日偏差的虚假利润）
+
+**实现**：
+- `compute_volume_profile(bar_5m_all, before_date, lookback_days=20)` 构建历史profile
+- `volume_percentile_q(vol, hist_vols)` 计算分位数Q
+- V2/V3 score_all新增`vol_profile`参数，有profile时用分位数法，无则fallback旧算法
+- 回测/sensitivity脚本传入profile，monitor待接入（需预加载历史volume）
+
+**待办**：
+- 在新baseline上重新优化阈值和参数配合
+- Monitor接入分位数Q（启动时从index_min加载历史volume profile）
+- TQ实时volume debug仍需确认（但分位数法不依赖实时volume的绝对准确性）
 
 ---
 
