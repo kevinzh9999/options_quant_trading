@@ -954,6 +954,8 @@ class IntradayMonitor:
             # 订阅现货指数K线（信号计算用）
             spot_klines_5m: Dict[str, pd.DataFrame] = {}
             spot_klines_15m: Dict[str, pd.DataFrame] = {}
+            spot_quotes: Dict = {}  # DEBUG: 现货quote（volume对比用）
+            _prev_spot_cum_vol: Dict[str, float] = {}  # DEBUG: 上一根bar的累计volume
             # 订阅期货K线和行情（下单参考+归档+贴水计算）
             fut_klines_5m: Dict[str, pd.DataFrame] = {}
             fut_quotes: Dict = {}
@@ -964,6 +966,10 @@ class IntradayMonitor:
                 if spot_sym:
                     spot_klines_5m[sym] = api.get_kline_serial(spot_sym, 300, 200)
                     spot_klines_15m[sym] = api.get_kline_serial(spot_sym, 900, 100)
+
+                # 现货quote（用于Q分volume对比debug）
+                if spot_sym:
+                    spot_quotes[sym] = api.get_quote(spot_sym)
 
                 # 期货
                 fut_sym = self._tq_symbols[sym]
@@ -1073,8 +1079,17 @@ class IntradayMonitor:
                         avg20 = float(df["volume"].tail(20).mean())
                         ratio = last_vol / avg20 if avg20 > 0 else 0
                         last_dt = df.index[-1].strftime("%H:%M") if hasattr(df.index[-1], 'strftime') else str(df.index[-1])
-                        print(f"  [Q-DEBUG] IM spot vol: {last_dt} vol={last_vol:.0f}"
-                              f" prev={prev_vol:.0f} avg20={avg20:.0f} ratio={ratio:.2f}", flush=True)
+                        # Quote cumulative volume（方案2：用差值算bar volume）
+                        sq = spot_quotes.get(sym)
+                        cum_vol = float(sq.volume) if sq is not None and hasattr(sq, 'volume') else -1
+                        prev_cum = _prev_spot_cum_vol.get(sym, 0)
+                        bar_vol_from_quote = cum_vol - prev_cum if cum_vol > 0 and prev_cum > 0 else -1
+                        _prev_spot_cum_vol[sym] = cum_vol
+                        print(f"  [Q-DEBUG] IM {last_dt}"
+                              f" kline_vol={last_vol:.0f}"
+                              f" quote_cum={cum_vol:.0f}"
+                              f" quote_bar={bar_vol_from_quote:.0f}"
+                              f" avg20={avg20:.0f} ratio={ratio:.2f}", flush=True)
 
             k15 = spot_klines_15m.get(sym)
             if k15 is not None and len(k15) > 1:
