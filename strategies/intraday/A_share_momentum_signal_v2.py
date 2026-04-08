@@ -1028,12 +1028,6 @@ class SignalGeneratorV2:
         s_vol, atr_short = self._score_volatility(high_5m, low_5m, close_5m)
         s_qty = self._score_volume(volume_5m, mom_dir)
 
-        # 开盘30分钟Q分修正：实盘monitor在此时段Q=0（TQ现货volume数据问题），
-        # 回测的rolling 20-bar均值包含昨日低量bar导致Q虚高。强制Q=0对齐实盘。
-        # UTC 02:00 = BJ 10:00（开盘后30分钟/6根bar）
-        if utc_time and utc_time < time(2, 0):
-            s_qty = 0
-
         # 布林带突破加分（0~20分，仅动量已确认方向时生效）
         s_breakout, breakout_note = 0, ""
         if s_mom > 0 and mom_dir:
@@ -1415,10 +1409,6 @@ class SignalGeneratorV3:
 
         # --- 维度3: 成交量 (20分) ---
         s_qty = self._score_volume(volume_5m)
-
-        # 开盘30分钟Q分修正（同V2，对齐实盘monitor行为）
-        if utc_time and utc_time < time(2, 0):
-            s_qty = 0
 
         # --- 维度4: 反转 (IH专属, 0-20附加分, 可覆盖方向) ---
         s_rev = 0
