@@ -1,330 +1,427 @@
-# SignalGenerator 升级蓝图 V2（2026-04-02更新）
+# 日内策略研究路线图（2026-04-08 V3合并版）
 
-> 基于 101 Formulaic Alphas 论文、现代量化前沿扫描、及 V2 系统34天实盘/回测验证的综合修订版。
-> 核心原则：**先榨干现有数据的线性逻辑 → 再引入外部数据 → 最后才上非线性模型**。
-> 最后更新：2026-04-04
+> 基于方案E baseline（IM+IC **+4956pt/216天**，均+23pt/天）。
+> 核心原则：**先榨干现有参数空间 → 再挖掘新数据源alpha → 最后做策略品类扩展**
+> 过拟合防线：每项改动必须通过稳健性三检（时间分半、参数邻域、单日贡献<30%）
 
 ---
 
-## 当前系统评估
+## 一、当前系统评估
 
 ### 已有维度
 
-| 维度 | 衡量内容 | 信息源 | 101 Alphas对应 |
-|------|---------|--------|---------------|
-| M分（0-50） | 动量方向和速度 | 5m/15m close差值 | Alpha#19, #101 |
-| V分（0-30） | 波动率扩张/收缩 | ATR短期/长期比 | 部分覆盖 |
-| Q分（0-20） | 成交量确认 | 当前volume/20根均量 | Alpha#12 |
-| B分（0-20） | 布林带突破 | 中轨穿越+放量+多周期 | Alpha#32 |
-| daily_mult | 多周期方向一致 | 日线5日动量 | Alpha#19 |
-| sentiment_mult | 期权情绪 | IV/VRP/Skew/PCR（日频） | — |
-| Z-Score过滤 | 极端偏离保护 | EMA20/STD20 | Alpha#32 |
-| 趋势启动检测器 | 突破+放量+振幅三重确认 | 5m OHLCV | — |
-| Hurst(60d) | 趋势/震荡regime | 日线R/S分析 | — |
+| 维度 | 衡量内容 | 信息源 | 当前状态 |
+|------|---------|--------|---------|
+| M分（0-50） | 动量方向和速度 | 5m/15m close差值，动态lb=4/12 | 方案E核心改进 |
+| V分（0-30） | 波动率扩张/收缩 | ATR短期/长期比 | 唯一正Daily IC因子，已最优 |
+| Q分（0-20） | 成交量确认 | 当前volume/20根均量 | 弱正IC，稳定 |
+| B分（0-20） | 布林带突破 | 中轨穿越+放量+多周期 | Daily IC为负，但经乘数链过滤后正贡献 |
+| daily_mult | 顺逆势方向 | 日线5日动量 | dm=1.1/0.9（04-04调整）|
+| sentiment_mult | 期权情绪 | IV/VRP/Skew/PCR（日频） | 04-04验证偏相���<0.15 |
+| Z-Score过滤 | 极端偏离保护 | EMA20/STD20 | 安全阀，不动 |
+| 振幅过滤 | regime切换 | 开盘30min振幅 | r=0.43最强PnL预测因子 |
 
-### 已验证不加的维度（2026-04-04完整测试）
+### 已验证不实施的方向（20+方向，完整测试）
 
-| 维度 | 测试方法 | 结果 | 原因 | 脚本 |
-|------|---------|------|------|------|
-| ADX趋势强度乘数 | 事后模拟⚠ | IM+IC -108pt | 低ADX反而高WR，乘数打折好交易 | adx_macd_backtest.py |
-| MACD顺逆势确认 | 事后模拟⚠ | IM+IC -86pt | IC中逆势WR=57%，无预测力 | adx_macd_backtest.py |
-| ADX+MACD组合 | 事后模拟⚠ | IM+IC -161pt | 两个负效果叠加更差 | adx_macd_backtest.py |
-| CCI/Williams%R | 相关性分析 | r>0.9 | 和M/V/Q高度冗余 | adx_research.py |
-| Z-Score极值bonus | 直接加total ✅ | IM-12/IC+24pt | 现有Z-Score+RSI层已覆盖 | mean_reversion_research |
-| 分级冷却 | 独立回测循环 ✅ | -136~-335pt | 延长冷却全部亏钱 | afternoon_cooldown_research.py |
-| OU动态TIME_STOP | grid search | 60min最优 | 半衰期日间波动太大(std>mean) | mean_reversion_research |
-| ~~VWAP偏离度~~ | 相关性+回测 ✅ | r(M)=0.67 | **与M高度冗余**，非独立维度 | vwap_research.py |
-| ~~K线实体占比~~ | 独立回测循环 ✅ | IC -252pt | IM有效但**IC灾难性**，品种差异过大 | body_ratio_research.py |
-| ~~跨品种rank~~ | 独立回测循环 ✅ | -350~-598pt | rank过滤误杀好信号 | cross_rank_research.py |
-| 午后t=0.8 | session_multiplier patch ✅ | t=1.0 +76pt | **已改为1.0（实施）** | 手动验证 |
-| ME/TC score确认退出 | 独立回测循环 ✅ | +130pt但不稳健 | 前半段-58pt，阈值敏感 | score_confirmed_exit_research.py |
-| 隔夜策略 | 纯统计（样本不足） | 数据不足 | 需要2-3年5分钟数据 | overnight_strategy_research.py |
+| 方向 | 结果 | 原因 | 脚本 |
+|------|------|------|------|
+| VWAP偏离度 | r(M)=0.67 | 与M高度冗余 | vwap_research.py |
+| K线实体占比 | IC -252pt | 品种差异过大 | body_ratio_research.py |
+| 跨品种rank | -350~-598pt | 统计不显著 | cross_rank_research.py |
+| ADX/MACD/CCI/WR | 全部负或冗余 | 与M/V/Q高度共线 | adx_macd_backtest.py |
+| Z-Score极值bonus | IM-12/IC+24pt | 现有层已覆盖 | mean_reversion研究 |
+| 分级冷却 | -136~-335pt | 延长冷却全部亏钱 | afternoon_cooldown |
+| ME/TC score确认退出 | +130pt但不稳健 | 前半段-58pt | score_confirmed_exit |
+| 101 Alphas | 全部无效 | 截面选股因子不适用单品种时序 | factor_research.py |
+| BAND_REVERSAL退出 | -32% | 因子有效但独立exit劣化 | band_reversal研究 |
 
-⚠ = 事后模拟（乘在最终score上），与真实集成可能有偏差，但结论方向可靠。
-✅ = 验证方式正确。
+**核心结论**：5分钟OHLCV因子空间已到信息提取上限。进一步alpha须来自新数据源。
 
-### 核心发现
+### 数据资产盘点
 
-**101 Alphas 的三个高频因子全部验证无效**：
-- VWAP偏离：与M冗余r=0.67（本质是动量的时间积分）
-- K线实体占比：品种差异过大（IM有效IC有害）
-- 跨品种rank：统计不显著（p>0.6），乘数方案-50%PnL
-
-**14个OHLCV因子全面测试完毕（2026-04-02，101 Alphas高频子集）**：
-- 所有常见技术指标（ADX/MACD/CCI/Williams%R/VWAP/K线形态/跨品种rank）全部验证无增量价值
-- 共测试20+方向，全部不实施
-
-**结论**：当前M/V/Q+乘数链的架构已接近5分钟OHLCV数据的信息提取上限。进一步改善需要引入新数据源（期权实时数据、tick数据）或更长的时间积累。
-
-**平仓系统已优化至较优参数（2026-04-04）**：
-- ME narrow_ratio=0.10, MID_BREAK bars=3, IC trailing_scale=2.0x
-- 当前baseline IM+IC +2031pt，breakeven滑点约 5-6pt
-- 进一步改善需等ME/TC score确认方案（100天数据后验证）
+| 资产 | 规模 | 时间范围 | 状态 |
+|------|------|---------|------|
+| index_min (000852) | 258K bars | 2022-07~2026-04 | 回测核心 |
+| index_min (000300/905/016) | 各577K bars | 2018-01~2026-04 | IC/IF/IH回测 |
+| futures_tick (IM) | 24M rows | 2022-07~2026-04 | **未开发** |
+| futures_tick (IC/IF) | 各58-59M rows | 2016-01~2026-04 | **���开发** |
+| options_min (MO/IO/HO) | 24M rows | 2020-02~2026-04 | **未开发** |
+| shadow_trades | 23笔 | 2026-04-01~08 | 实盘刚起步 |
 
 ---
 
-## ~~V2.1：数学重构层~~ → 已完成测试，全部不实施
+## 二、历史版本演进
 
-> 2026-04-02完成全部3项验证。101 Alphas的高频因子在A股5分钟OHLCV上无增量价值。
+### V2.1（2026-04初）✅ 已完成
 
-### ~~1. VWAP偏离度~~ ❌ 已验证不实施
+全部在5分钟OHLCV维度内优化，因子研究+参数调优+bug修复。
 
-**测试结果**（vwap_research.py）：
-- r(VWAP_offset, M_proxy) = **0.67~0.68**，远超0.5独立性阈值
-- VWAP偏离本质是日内价格动量的时间积分，和M高度冗余
-- "便宜处买"WR=48%反而不如"追涨"WR=54%——VWAP是动量延续信号，非逆向
-- lag1_ACF=0.85，半衰期25-30分钟
+```
+✅ 20+因子/指标全面测试（全部不实施，确认OHLCV上限）
+✅ ME narrow_range ratio 0.20→0.10（+393pt）
+✅ MID_BREAK bars 2→3（+76pt）
+✅ IC trailing_stop_scale=2.0x（+186pt）
+✅ 午后session_weight 0.8→1.0（+76pt）
+✅ dm_trend/dm_contrarian 1.2/0.8→1.1/0.9（+691pt差距）
+✅ IM trailing_stop_scale 1.0→1.5x（+259pt）
+✅ 开盘30min振幅<0.4%过滤器
+✅ 15分钟重采样对齐修复 label='left'（关键bug）
+✅ 动量lookback硬编码修复（IF/IH 18→12）
+✅ 研究指标自动记录（ADX/body_ratio/VWAP/style_spread/cross_rank）
+✅ Hurst(60d) + rr_25d 写入daily_model_output
+Baseline: IM+IC +2031pt
+```
 
-**潜在用途**（不作为评分维度，但可用于执行层）：
-- 执行时机优化：信号触发后等价格回到VWAP附近再入场
-- 持仓止盈参考：偏离VWAP±1%时回归风险增加
+### 方案E（2026-04-07~08）✅ 已完成
 
-### ~~2. K线实体占比~~ ❌ 已验证不实施
+动态M分lookback + d_override禁用 + 阈值下调。
 
-**测试结果**（body_ratio_research.py）：
-- IM有效：强阳线做多WR=72% vs 阴线矛盾WR=44%，方案B(3根一致性) +35pt
-- IC有害：阴线矛盾组反而+4.9pt/笔，方案A **-252pt(-33.6%)**
-- 品种差异太大，无法作为通用调节器
-- 方案B合计仅+2pt，不值得增加复杂度
-
-**有价值发现**（供后续研究）：
-- IM做多+下影线大(>0.5)：WR=38.5%（陷阱信号）
-- SHORT+中上影线(0.3~0.5)：均PnL=+13.8pt（最佳信号）
-
-### ~~3. 跨品种相对强弱rank~~ ❌ 已验证不实施
-
-**测试结果**（cross_rank_research.py）：
-- rank与交易结果Pearson相关全部不显著（p>0.6）
-- 方案A(rank乘数)：IM+IC **-598pt(-50%)**
-- 方案B(方向感知)：IM+IC **-350pt(-29%)**
-- rank过滤误杀好信号
-
-**有价值发现**（待数据积累后深入研究）：
-- IM-IH style spread中性区间（-0.09%~+0.04%）：73%WR，均+13.8pt，共+510pt
-- 原因：中性spread=全市场共识移动（非风格轮动），IM信号质量最高
-- 待100+笔样本后验证是否可作为"信号质量过滤器"
+```
+✅ 动态lb=4/12（振幅<1.5%用4，否则12）← Phase 1"低振幅日IC为负"的直接应用
+✅ signal_threshold：IM 60→55，IC 65→60
+✅ d_override禁用（briefing dm累计-19.2%负贡献）
+✅ EOD重构：四库分离 + DataDownloader并行归档
+Baseline: IM+IC +4956pt（+20.2% vs V2.1）
+```
 
 ---
 
-## V2.5：重心与情绪层（需引入衍生数据）
+## 三、Phase 1：Exit系统精细化（1-2周）
 
-> 难度：⭐⭐ | 周期：2周 | 数据需求：期权实时数据、VWAP累计
+**目标**：不改入场逻辑，通过优化平仓参数提升5-10%。方案E提升了entry质量，exit成��新瓶颈。
 
-### 1. 量价相关性（补充Q分，不替代）
+### 1.1 动态Trailing Stop（核心项）
 
-**灵感来源**：Alpha#2, #6, #13, #44频繁使用`correlation(price, volume, N)`。
+**现状**：trailing宽度按持仓时间线性递增（0.5%→1.0%），用`trailing_stop_scale`做品种缩放（IM=1.5x, IC=2.0x）。
 
-**公式**：
-```
-pv_corr = correlation(close_5m[-10:], volume_5m[-10:])  # 10根bar滚动相关性
-```
+**问题**：宽度不随市场波动率调整。
+- 低波动日：0.5%×1.5=0.75%太宽，行情可能只有0.3%就结束
+- 高波动日：0.5%×2.0=1.0%可能仍然太窄，正常回撤就被震出
 
-**系统接入**：作为Q分的惩罚/确认系数：
+**方案**：用开盘30min ATR动态调整trailing宽度基准。
 ```python
-if pv_corr < -0.3 and direction == "LONG":
-    # 缩量上涨（量价背离），M分打折0.8
-elif pv_corr > 0.5 and direction matches price_direction:
-    # 量价齐升/齐跌，Q分额外+5
+atr_30min = 开盘6根bar的ATR
+base_trailing = max(atr_30min * K, 0.003)  # K=1.0~2.5 sweep，下限0.3%
+# 替代当前的 TRAILING_STOP_HIVOL / TRAILING_STOP_NORMAL
+# trailing_stop_scale 保留做品种缩放
 ```
 
-**实施策略**：先作为独立信号跑2周shadow观察，不计入总分。如果发现pv_corr极端负值时原本高分交易的WR显著下降，再接入。
+**验证**：sensitivity_215d.py新增参数，216天全量sweep。
+**稳健性**：ATR乘数K在1.0~2.5范围内单调或高原。
 
-### 2. 期权Skew实时化（升级sentiment_mult）
+### 1.2 动态Stop Loss
 
-**当前问题**：sentiment_mult使用日频数据（ATM IV变化、RR），盘中MO的Skew可能在5分钟内剧变但sentiment_mult不会更新。
+**现状**：固定0.5% stop loss，sensitivity_215d已测0.3-0.7%五个格点。
 
-**升级方案**：
-```python
-# vol_monitor已经每5分钟计算25D RR
-# 接入monitor，作为实时sentiment_mult的补充
-rr_5m = vol_monitor.get_current_25d_rr()  # 当前5分钟的25D RR
+**方案**：stop_loss = max(atr_30min * N, 0.003)，N=2.0~3.0 sweep。
+**验证**：216天sweep，对比固定0.5%。
 
-if rr_5m > 8.0:  # Put skew极端（如今天的+10.3pp）
-    sentiment_mult *= 0.85  # 惩罚做多
-elif rr_5m < 2.0:  # Call skew极端
-    sentiment_mult *= 0.85  # 惩罚做空
+### 1.3 ME × MID_BREAK 联合优化
+
+**现状**：ME narrow_ratio=0.10, MID_BREAK bars=3，分别独立优化过。
+**问题**：两者有交互效应——ME收严→MID_BREAK触发更多，联合最优 ≠ 各自最优。
+
+**方案**：2D grid search，6×4=24组合。
+```
+ME ratio:   [0.05, 0.08, 0.10, 0.12, 0.15, 0.20]
+MID bars:   [2, 3, 4, 5]
+```
+**验证**：216天全量，看2D surface是否有稳健的高原区。
+
+### 1.4 LUNCH_CLOSE策略优化
+
+**现状**：11:25前有浮亏→强制平仓，有浮盈→收紧trailing到0.3%。
+**问题**：11:25时间点和0.3%宽度都是拍脑袋定的。
+
+**方案**：4×4=16组���。
+```
+时间点:       [11:15, 11:20, 11:25, 不关]
+浮盈trailing: [0.2%, 0.3%, 0.4%, 不收紧]
 ```
 
-**数据可用性**：vol_monitor已经在计算，只需要建立monitor→vol_monitor的数据通道。
-
-### 3. Hurst动态权重（等低波动数据积累后）✅ 部分完成
-
-**已完成**（2026-04-02）：
-- Hurst(60d)加入象限监控：A1/A2/B1/B2细分（趋势vs震荡）
-- morning_briefing显示Hurst值和历史分位
-- 当前IM Hurst=0.78（P97，极强趋势期）→ B2象限（禁止卖方）
-
-**30天回测验证**（hurst_research.py）：
-- Hurst对波动率有预测力（p<0.001），对方向无预测力
-- 自相关lag1>0.85，状态切换慢
-- 但30天回测全在H>0.6，**无低Hurst样本**，无法验证震荡期效果
-
-**待做**（需要低Hurst数据积累）：
-- [ ] 至少10天H<0.45数据后验证：低Hurst时逆势信号是否更好
-- [ ] 高Hurst时顺势信号是否可以降低阈值（-5分）
-- [ ] Hurst动态调整dm_trend/dm_contrarian的比例
+### Phase 1 预期与风险
+- 保守：+5%（~+250pt）
+- 乐观：+10%（~+500pt）
+- 风险：exit参数联合优化的参数空间大，过拟合风险高
+- 防护：每项改动独立通过稳健性三检后才联合实施
 
 ---
 
-## V3.0：微观结构层（需引入Tick/L2数据）
+## 四、Phase 2：Tick数据Alpha挖掘（2-4周）
 
-> 难度：⭐⭐⭐⭐ | 周期：1-2月 | 数据需求：Tick级别数据
+**目标**：利用28.5GB tick数据（1.4亿行），构建5分钟OHLCV之外的新信息维度。这是**突破当前信息源瓶颈**的核心一步。
 
-### 1. 订单流不平衡近似（OFI Proxy）
+### 2.1 基础设施：Tick→5min聚合Pipeline
 
-**数据限制**：TQ标准API不提供逐笔成交的买卖方向标记。
+tick数据在`tick_data.db`中，字段：`last_price, bid_price1, bid_volume1, ask_price1, ask_volume1, volume, amount, open_interest`。
 
-**近似方案**：
+**建设内容**：
 ```python
-# 用tick级别的价格变化方向 × 成交量变化近似BSI
-BSI_proxy = sum(ΔVolume * sign(ΔPrice))  # 每5分钟内累计
+# models/factors/tick_aggregator.py
+def aggregate_tick_to_5min(symbol, date) -> pd.DataFrame:
+    """聚合为5分钟级微观结构指标，与index_min时间对齐"""
+    return DataFrame with columns:
+        ofi,              # 订单流不平衡（Cont 2014）
+        obi,              # 盘口不平衡 (bid1_vol - ask1_vol) / total
+        trade_count,      # 成交笔数
+        spread_mean,      # 平均bid-ask spread (bp)
+        large_trade_pct,  # 大单占比（>P95阈值）
+        price_impact,     # 单位成交量的价格变化
+        oi_change,        # 5分钟持仓量变化
 ```
 
-**风险**：噪音很大，信噪比可能不够。必须先确认TQ的tick数据频率和字段，再评估可行性。
+**缓存**：结果写入`tick_features_5m`新表，避免回测重复计算。
+**数据覆盖**：IM从2022-07开始，覆盖216天全部回测日。
 
-**替代方案**：如果TQ有bid1/ask1的快照数据，可以计算盘口不平衡：
+### 2.2 OFI（订单流不平衡）因子
+
+经典OFI定义（Cont, Kukanov & Stoikov, 2014）：
 ```python
-OBI = (bid1_volume - ask1_volume) / (bid1_volume + ask1_volume)
+# 每个tick：
+#   bid_price上升 → bid贡献 = +Δbid_volume
+#   bid_price下降 → bid贡献 = -bid_volume_prev
+#   ask_price下降 → ask贡献 = +Δask_volume
+#   ask_price上升 → ask贡献 = -ask_volume_prev
+# OFI_5min = Σ(bid贡献 - ask贡献)
 ```
 
-### 2. Volume Profile / POC
+**接入方式**：
+- 先跑因子评估（IC/Daily IC/分组收益/regime分组）
+- 和M/V/Q的相关性必须<0.5
+- 通过后作为新的O分（0-15分），或替代/增强Q分
 
-**数据需求**：需要tick级别或1分钟级别的成交分布。用5分钟K线只能做粗略近似。
+### 2.3 盘口不平衡（OBI）因子
 
-**近似方案**：
 ```python
-# 用5分钟K线的typical_price=(H+L+C)/3和volume构建价格-成交量分布
-# POC = 成交量最大的价格区间
-price_bins = np.linspace(day_low, day_high, 20)
-volume_profile = np.histogram(typical_prices, bins=price_bins, weights=volumes)
-poc = price_bins[np.argmax(volume_profile)]
+OBI = mean over 5min of [(bid1_volume - ask1_volume) / (bid1_volume + ask1_volume)]
 ```
 
-**系统接入**：用`(Close - POC) / ATR`作为偏离度指标，补充或替代B分的布林带逻辑。
+更简单的即时买卖压力指标。A股期货盘口深度较浅，噪音可能大，需要验证信噪比。
+
+### 2.4 成交强度（Trade Intensity）
+
+```python
+trade_intensity = count(ticks in 5min) / rolling_mean(count, 48)  # vs 4小时均值
+```
+
+和Q分（成交量）的区别：同样1万手成交，100笔大单 vs 10000笔小单含义不同。
+
+### 2.5 大单占比
+
+```python
+# 先统计P95阈值：SELECT PERCENTILE(volume_delta, 0.95) FROM tick WHERE ...
+large_trade_pct = sum(vol WHERE single_trade_vol > P95) / total_vol
+```
+
+### Phase 2 预期与风险
+- 保守：确认1-2个IC>0.03且独立的新因子
+- 乐观：接入后+5-10%增量
+- 风险：tick噪音大，OFI近似误差可能导致因子无效
+- **关键里程碑**：2.1 Pipeline完成后，2.2-2.5可并行评估
 
 ---
 
-## V4.0：状态机与非线性融合（需大量数据积累）
+## 五、Phase 3：期权微观结构Alpha（2-4周，可与Phase 2并行）
 
-> 难度：⭐⭐⭐⭐⭐ | 周期：6月+ | 前置条件：500+笔交易数据
+**目标**：利用24M行期权5分钟K线（options_min），构建option-implied日内信号。
 
-### 1. HMM环境概率底座（辅助角色，不替代硬过滤）
+**前置风险**：04-04已验证日频期权指标偏相关<0.15，但5分钟频率可能有不同结论。
 
-**定位**：HMM输出市场状态概率（震荡/趋势/恐慌），作为因子权重的动态调节器。
+### 3.1 实时PCR 5分钟版
 
-**关键约束**：
-- ⚠ HMM**不替代**Z-Score硬过滤（Z-Score是确定性安全阀，可解释性100%）
-- HMM只能微调M/V/Q的相对权重（如震荡时降低M权重、提高V权重）
-- 异常状态必须有fallback到确定性规则的机制
-
-**实施**：
 ```python
-# HMM输出
-state_probs = hmm.predict_proba([features])  # [P_震荡, P_趋势, P_恐慌]
-
-# 动态权重调节（不触碰Z-Score安全阀）
-if state_probs[0] > 0.7:  # 高概率震荡
-    m_weight = 0.7  # 降低动量权重
-    v_weight = 1.3  # 提高波动率权重
-elif state_probs[1] > 0.7:  # 高概率趋势
-    m_weight = 1.3
-    v_weight = 0.7
-else:
-    m_weight = 1.0
-    v_weight = 1.0
+# 每5分钟计算当月MO的 Put/Call 成交量比
+pcr_5m = sum(put_volume_5m for all MO puts) / sum(call_volume_5m for all MO calls)
+pcr_change = pcr_5m / ema(pcr_5m, 12)  # vs 1小时均值
 ```
 
-### 2. LightGBM树模型打分（终极进化）
+接入：作为sentiment_mult的实时补充（当前盘中不更新）。
 
-**前置条件**：
-- 至少500笔交易数据（约6个月×4品种）
-- 完整的特征工程pipeline（V2.1-V3.0的所有因子）
-- 独立的训练/验证/测试集划分（时间序列分割，不能随机）
+### 3.2 ATM IV 5分钟变化
 
-**架构**：
 ```python
-# Features: M, V, Q, B, VWAP_offset, body_ratio, cross_rank, pv_corr, skew_5m, hurst, ...
-# Label: 未来15分钟的return > 0 ? 1 : 0
-# 或者回归: 未来15分钟的return
-
-model = LightGBMClassifier(
-    max_depth=4,       # 严格限制防过拟合
-    n_estimators=100,
-    min_child_samples=20,  # 每个叶子至少20个样本
-    subsample=0.8,
-    colsample_bytree=0.7,
-)
+iv_change_5m = (atm_iv_now - atm_iv_30min_ago) / atm_iv_30min_ago
+# IV急升(>5%) → 恐慌 → 惩罚做多
+# IV急降(>5%) → 乐观 → 惩罚做空
 ```
 
-**关键防护**：
-- 树深度限制max_depth=4（防过拟合）
-- Walk-forward验证（不是简单的train/test split）
-- 模型输出的probability score仍需经过Z-Score安全阀
+数据来源：从options_min用ATM合约close反推IV，或从vol_monitor获取。
+
+### 3.3 期权成交量异动
+
+```python
+put_surge = put_vol_5m / ema(put_vol_5m, 12) > 3.0  # Put异常放量
+# → 机构买保险 → 做多信号惩罚
+```
+
+### Phase 3 预期与风险
+- 保守：仍然无增量（MO流动性有限，5min PCR噪音极大）
+- 乐观：+3-5%增量（5min先导性 > 日频）
+- 决策点：Phase 2的tick因子如果已提供足够增量，Phase 3可降优先级
 
 ---
 
-## 实施时间线（2026-04-04更新）
+## 六、Phase 4：跨品���信号增强（1-2周）
 
-```
-2026-04 V2.1  ✅ 已完成测试（VWAP/Body Ratio/Cross Rank/ME-Score全部不实施）
-              ✅ Hurst加入象限监控（A1/A2/B1/B2细分）
-              ✅ 午后session_weight改1.0（+76pt）
-              ✅ ME narrow_range ratio 0.20→0.10（+393pt）
-              ✅ MID_BREAK bars 2→3（+76pt）
-              ✅ IC trailing_stop_scale=2.0x（+186pt）
-              ✅ 15分钟重采样修复 label='left'（关键bug修复）
-              ✅ 动量lookback硬编码修复（IF/IH 18→12）
-              ✅ 研究指标自动记录（ADX/body_ratio/VWAP/style_spread/cross_rank）
-              ✅ hurst_60d + rr_25d写入daily_model_output
-              IM+IC baseline: +2031pt（+68% vs 03-26旧baseline）
-              
-2026-05 V2.5  量价correlation + 期权Skew实时化
-              ↓ 积累低Hurst数据 + style spread样本（100+笔）
-2026-06 V3.0  OFI近似（确认TQ数据后）+ Volume Profile
-              ↓ 积累500+笔交易
-2026-10 V4.0  HMM辅助（需pip install hmmlearn）+ LightGBM打分
+### 4.1 ���种共识度软乘数
+
+之前cross_rank硬过滤亏钱（-350~-598pt），改为软乘数。
+
+```python
+# IM和IC同向动量 → 中小盘共识 → 信号更可靠
+consensus = sign(mom_IM_5m) == sign(mom_IC_5m)
+consensus_mult = 1.05 if consensus else 0.95  # 轻微调节
 ```
 
-### Follow-up（待数据积累后验证）
+### 4.2 style_spread继续积累
+
+IM-IH中性区间73%WR（37笔），但样本不足。等100+笔后重新评估。
+
+### Phase 4 预期
+- +0-2%。关键价值是信号质量辅助判断。
+
+---
+
+## 七、Phase 5：策略品类扩展（长期，4-8周+）
+
+### 5.1 隔夜持仓策略
+
+**方向**：
+- 信号：尾盘14:30-14:55动量方向 + 成交量确认 + 振幅>0.5%
+- 持有至次日09:45（避开开盘噪音），用锁仓实现
+- 止损：前一日ATR × N
+- 信号阈值高于日内（隔夜风险溢价）
+
+**数据验证**：先统计"尾盘趋势延续到次日开盘"的历史频率和幅度。
+**关键风险**：隔夜gap不可控，需单独的风控框架。
+**前提**：index_min从2022-07有3.7年数据，但5分钟归档可能仅近1年，需确认。
+
+### 5.2 波动率日内择时
+
+结合VRP象限和日内信号：
+- 高IV + VRP>0 时：日内动量策略（现有）+ 卖MO虚值期权（日内开平）
+- 前提：MO日内bid-ask spread需可接受
+
+### 5.3 IF实盘接入
+
+shadow验证中（目前仅1笔），继续积累2-4周。
+接入标准：30+笔，avg PnL > +2pt/笔（覆盖slippage+commission）。
+
+---
+
+## 八、实施时间线
+
+```
+2026-04 中旬  Phase 1: Exit系统精细化
+              ├── 1.1 动态trailing（ATR-based）        ← 最高优先级
+              ├── 1.2 动态stop loss（ATR-based）
+              ├─��� 1.3 ME × MID_BREAK 联合优化
+              └── 1.4 LUNCH_CLOSE参数sweep
+              预��：+5-10%（+250~500pt）
+
+2026-04底~05中  Phase 2: Tick数据Alpha
+              ├── 2.1 Tick→5min聚合Pipeline          ← 基础设施优先
+              ├── 2.2 OFI因子评估
+              ├── 2.3 OBI���子评估
+              ├── 2.4 ���交强度因子
+              └── 2.5 大���占比因子
+              预期：确认1-2个新因子，+5-10%
+
+2026-05       Phase 3: 期权微观结构（可��Phase 2并行）
+              ├── 3.1 5min PCR
+              ├── 3.2 ATM IV 5min变化
+              └── 3.3 期权成交量异动
+              预期：+0-5%（可能无增量）
+
+2026-05底     Phase 4: 跨品种增强
+              ├── 4.1 品��共识度软乘数
+              └── 4.2 style_spread继续积累
+              预期��+0-2%
+
+2026-06+      Phase 5: 策略品类扩展
+              ├── 5.1 隔夜持仓策略研究
+              ├── 5.2 波动率日内择时
+              └── 5.3 IF实盘接入评估
+              预期：新收益来源
+
+2026-10+      V4.0: HMM/LightGBM非线性融合（需500+笔交易积累）
+              ├── HMM环境概率底座（辅助角色，不替代Z-Score安全阀）
+              └── LightGBM树模型打分（废除人工线性权重）
+```
+
+---
+
+## 九、过拟合防护协议
+
+### 验证标准
+
+| 检验 | 方法 | 通过标准 |
+|------|------|---------|
+| 时间分半 | 前108天 vs 后108天 | 两半段均为正 |
+| 参数邻域 | 最优参数±20% | 邻域内全正或高原 |
+| 单日贡献 | 最大单日PnL / 总改善 | <30% |
+| 逐月检查 | 12个月各自PnL | 亏损月<2个 |
+| 样本外 | 保留最近30天不参与优化 | 样本���正 |
+
+### 参数预算
+
+- 当前独立参数：~10个
+- 216天/~1100笔交易支撑上限：~15个
+- **剩余预算：~5个**。新增参数必须从此预算扣除
+
+### 新因子/参数引入决策树
+
+```
+因子IC > 0.03 且 vs现有因子相关性 < 0.5？
+  ├── 否 → 放弃
+  └── 是 → 216天回测PnL > baseline？
+        ├── 否 → 放弃
+        └── 是 → 稳健性三检全过？
+              ├── 否 → 记录为"待数据积累"
+              └── 是 → 参数预算够？
+                    ├── 否 → 排队（或替换现有弱参数）
+                    └── 是 → 实施
+```
+
+### 实盘退化判断标准
+
+- 连续4周均PnL < +5pt/天 → 检查市场regime变化
+- 连续2月合计亏损 → 参数重新校准
+- 底线：+3.5pt/天（216天保守基线）
+
+---
+
+## 十、待数据积累后验证（Follow-up）
 
 | 项目 | 需要数据 | 预计可测时间 |
 |------|---------|------------|
-| ADX>35硬过滤 | 100+笔ADX>35样本 | 2026-07（约3个月后） |
-| MACD顺逆势 | IM中MACD>0做空50+笔 | 2026-07 |
-| IM-IH style spread过滤器 | 100+笔中性区间交易 | 2026-07 |
-| Hurst动态dm调整 | 10+天H<0.45数据 | 视市场波动率 |
-| IM body_ratio单品种 | 100+笔IM交易 | 2026-06 |
-| 隔夜策略验证 | index_min 2-3年数据 | 2027+ |
+| ADX>35硬过滤 | 100+笔ADX>35样本 | 2026-07 |
+| IM-IH style spread | 100+笔中性区间 | 2026-07 |
+| Hurst动态dm调整 | 10+天H<0.45 | 视市场波动率 |
+| ts_rank lookback稳健性 | 400+天数据 | 2026-08 |
+| V分增强研究 | 400+天��据 | 2026-08 |
+| 隔夜策略完整验证 | index_min 2+年 | 2027+ |
 
 ---
 
-## 工程方法论
+## 十一、工程方法论
 
 ### 新因子接入检查清单
 
-每个新因子必须通过以下验证才能进入信号系统：
+1. **独立性**：vs M/V/Q Pearson相关性 < 0.5
+2. **预测力**：按因子值分4组，各组WR和avg PnL有显著差异
+3. **单日验证**：用已知受影响日期确认因子值变化符合预期
+4. **Patch正确性**：确认修改的变量是score_all实际调用的
+5. **216天回测**：加入后PnL > baseline
+6. **Sensitivity**：参数±20%结果稳健
 
-1. **独立性检验**：和现有M/V/Q的Pearson相关性 < 0.5
-2. **预测力检验**：按因子值分组（4组），各组WR和avg PnL有显著差异
-3. **单日验证**：用已知受影响的日期确认因子值变化符合预期
-4. **Patch正确性**：确认修改的变量是score_all实际调用的（教训：`_TIME_WEIGHTS` vs `session_multiplier`）
-5. **30天回测**：加入因子后总PnL不低于baseline
-6. **Sensitivity分析**：因子参数在合理范围内（±20%）结果稳健
+### 关键教训
 
-### 过拟合防护
-
-- 35天/100笔交易能支撑的独立参数：5-8个（当前已接近上限）
-- 每新增1个参数，需要额外~15笔交易数据支撑
-- 新因子优先作为乘数/过滤器（0个新参数），其次作为评分维度（1-2个新参数）
-- 所有研究脚本必须验证patch是否对目标函数生效
-
-### 关键教训（2026-04-04更新）
-
-1. 研究脚本monkey-patch了错误的变量（`_TIME_WEIGHTS` vs `session_multiplier`）→ 假阳性结论
-2. 事后模拟（乘在最终score上）≠ 真实集成（加进raw_total）→ 结论方向可能有偏差
+1. monkey-patch了错误变量（`_TIME_WEIGHTS` vs `session_multiplier`）→ 假阳性
+2. 事后模拟（乘在最终score上）≠ 真实集成（加进raw_total）→ 结论方向有偏差
 3. "有益偏差"不应修复（跨日GAP、forming bar Q=0）→ 修复后反而亏钱
 4. 现货/期货价格混用是致命bug → 持仓管理必须统一价格源
-5. 高相关性 ≠ 有预测力，低相关性 ≠ 无预测力 → 必须用回测数据验证
-6. **时间标签对齐影响全部时间相关逻辑**：`resample('15min', label='right')`使15m bar时间偏移15分钟，影响持仓时间/时段权重/exit判断。永远用`label='left', closed='left'`
-7. SYMBOL_PROFILES中的参数只有在代码真正读取时才生效，硬编码会静默覆盖配置 → 修复前需确认读取路径
-8. **稳健性验证三项指标**：时间分段一致性 + 阈值敏感性(±20%) + 单日贡献<30%。三项全过才实施
+5. 时间标签对齐影响全部时间相关逻辑 → 永远用`label='left', closed='left'`
+6. SYMBOL_PROFILES参数只在代码真正读取时才生效 → 修复前确认读取路径
+7. 稳健性三检（时间分段+参数邻域+单日贡献）三项全过才实施
+8. 日频期权指标偏相关<0.15 → 不等于5分钟级别也无效，但要有预期管理
