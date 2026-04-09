@@ -140,6 +140,7 @@ class IntradayStrategy(BaseStrategy):
         is_high_vol: bool = False,
         sentiment=None,
         d_override: Dict[str, float] | None = None,
+        vol_profiles: Dict | None = None,
     ) -> List[Dict]:
         """
         每根5分钟K线调用一次。
@@ -195,12 +196,14 @@ class IntradayStrategy(BaseStrategy):
             if zp and sym in prices and zp.get("std20", 0) > 0:
                 z_val = (prices[sym] - zp["ema20"]) / zp["std20"]
 
+            _vp = vol_profiles.get(sym) if vol_profiles else None
             sig = self.signal_gen.update(
                 sym, bar_data[sym], b15, daily, qd,
                 sentiment=sentiment,
                 zscore=z_val,
                 is_high_vol=is_high_vol,
                 d_override=d_override,
+                vol_profile=_vp,
             )
             if sig:
                 signals.append(sig)

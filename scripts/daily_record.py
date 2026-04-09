@@ -502,7 +502,7 @@ def _eod_archive_minute_bars(api, trade_date: str, db) -> int:
         nonlocal total
         try:
             kl = api.get_kline_serial(tq_sym, duration, data_length=data_length)
-            api.wait_update()  # 确保数据到位
+            api.wait_update(deadline=time.time() + 15)  # 确保数据到位（收盘后15s超时）
             if kl is None or kl.empty:
                 return 0
             # 转换datetime（纳秒→UTC字符串）

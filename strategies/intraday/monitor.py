@@ -1168,7 +1168,7 @@ class IntradayMonitor:
             # 面板辅助显示数据（VWAP, 趋势, 开盘区间, BOLL）
             self._display_data[sym] = self._calc_display_data(b5, b15)
 
-        # 运行策略（传入zscore/is_high_vol/sentiment/d_override参数，和面板评分一致）
+        # 运行策略（传入zscore/is_high_vol/sentiment/d_override/vol_profiles参数，和面板评分一致）
         actions = self.strategy.on_bar(
             bar_data, bar_15m_data, self._daily_data or None, current_time_utc,
             quote_data=quote_dict,
@@ -1176,6 +1176,7 @@ class IntradayMonitor:
             is_high_vol=self._is_high_vol,
             sentiment=self._sentiment,
             d_override=self._d_override,
+            vol_profiles=self._vol_profiles,
         )
 
         # Z-Score过滤actions：策略层不知道Z-Score，这里做最终拦截
@@ -1482,7 +1483,9 @@ class IntradayMonitor:
         b15 = bar_15m_data.get(symbol)
         daily = self._daily_data.get(symbol)
         qd = quote_dict.get(symbol)
-        return self.strategy.signal_gen.update(symbol, bar_data[symbol], b15, daily, qd)
+        _vp = self._vol_profiles.get(symbol)
+        return self.strategy.signal_gen.update(
+            symbol, bar_data[symbol], b15, daily, qd, vol_profile=_vp)
 
     @staticmethod
     def _calc_display_data(

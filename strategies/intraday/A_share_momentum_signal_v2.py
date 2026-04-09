@@ -1024,10 +1024,12 @@ class SignalGeneratorV2:
         zscore: float | None = None,
         is_high_vol: bool = True,
         d_override: Dict[str, float] | None = None,
+        vol_profile: Dict[str, list] | None = None,
     ) -> Optional[IntradaySignal]:
         result = self.score_all(
             symbol, bar_5m, bar_15m, daily_bar, quote_data, sentiment,
             zscore=zscore, is_high_vol=is_high_vol, d_override=d_override,
+            vol_profile=vol_profile,
         )
         if result is None:
             return None
@@ -1415,10 +1417,12 @@ class SignalGeneratorV3:
         zscore: float | None = None,
         is_high_vol: bool = True,
         d_override: Dict[str, float] | None = None,
+        vol_profile: Dict[str, list] | None = None,
     ) -> Optional[IntradaySignal]:
         result = self.score_all(
             symbol, bar_5m, bar_15m, daily_bar, quote_data, sentiment,
             zscore=zscore, is_high_vol=is_high_vol, d_override=d_override,
+            vol_profile=vol_profile,
         )
         if result is None:
             return None
