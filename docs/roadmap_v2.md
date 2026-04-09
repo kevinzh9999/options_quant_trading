@@ -287,7 +287,21 @@ S1-S3 Entry参数：
 
 **发现：IM和IC的最优参数方向完全相反**（IM要松/IC要紧），但三个候选改动全部单日贡献不过。
 
-**Round 1结论：当前所有参数在新Q baseline上已是稳健最优，无需Round 2。**
+**Round 1结论（Q baseline上）：当前参数稳健最优。但15m修复后baseline变化，需重新验证。**
+
+### 1.10 15m bar重采样修复 + vol_profile全链路贯通（2026-04-09）
+
+**15m重采样根因**：回测先排除forming 5m bar再重采样15m，导致15m bar少了一根5m数据。TQ原生15m包含全部已完成5m，close差10+点→15m momentum方向判断不同→M分差0-50。
+**修复**：从完整bar_5m重采样15m，然后排除最后一根forming 15m bar。
+
+**vol_profile全链路贯通**：V2/V3 update() + strategy.on_bar() + monitor._get_latest_signal() 全部传入vol_profile。
+
+**TqBacktest验证**：TQ回放数据和archived完全一致（close/volume逐根匹配）。
+**4/9回测vs shadow**：IM -48pt(2笔) vs -45pt(2笔)，IC -30pt(1笔) vs -22pt(1笔) — 修复前差距巨大，修复后几乎一致。
+
+**最终baseline（含所有修复）：IM+2148 IC+2125 合计+4273pt/219天**
+
+**待重新验证**：在新baseline上���做坐标下降全维度sweep。
 
 ---
 
