@@ -692,7 +692,7 @@ def _patch_threshold(threshold: int):
 
 
 # Module-level threshold (patched by _patch_threshold)
-_SIGNAL_THRESHOLD = 55  # 动态lb方案配套（从60降至55）
+_SIGNAL_THRESHOLD = 60  # Q分改为分位数法后恢复60（方案E曾降至55）
 
 
 def _run_sensitivity(sym: str, dates: List[str], db: DBManager,

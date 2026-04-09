@@ -1012,7 +1012,7 @@ class SignalGeneratorV2:
 
     def __init__(self, config: Dict | None = None):
         cfg = config or {}
-        self.min_signal_score: int = cfg.get("min_signal_score", 55)
+        self.min_signal_score: int = cfg.get("min_signal_score", 60)
         self.debug: bool = cfg.get("debug", False)
         self._opening_bars: int = cfg.get("opening_bars", 6)
 
@@ -1396,7 +1396,7 @@ class SignalGeneratorV3:
 
     def __init__(self, config: Dict | None = None):
         cfg = config or {}
-        self.min_signal_score: int = cfg.get("min_signal_score", 55)
+        self.min_signal_score: int = cfg.get("min_signal_score", 60)
         self.debug: bool = cfg.get("debug", False)
         self._opening_bars: int = cfg.get("opening_bars", 6)
 
