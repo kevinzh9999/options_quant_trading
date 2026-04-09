@@ -602,7 +602,8 @@ def check_exit(
         last3_l = bar_5m["low"].astype(float).iloc[-3:]
         total_range = float(last3_h.max() - last3_l.min())
         boll_width = 4 * b5_std
-        if total_range < boll_width * 0.10:
+        _me_r = _prof.get("me_ratio", 0.10)  # per-symbol ME ratio (IC=0.12)
+        if total_range < boll_width * _me_r:
             # Narrow range — but is price still trending?
             close_change = float(last3_c.iloc[-1]) - float(last3_c.iloc[0])
             still_trending = False
@@ -819,6 +820,7 @@ SYMBOL_PROFILES: Dict[str, Dict] = {
         "dm_contrarian": 0.9,         # 轻度逆势惩罚，避免过度打折逆势交易
         "trailing_stop_scale": 1.5,   # 215天验证：1.5x > 1.0x（IM+259pt）
         "stop_loss_pct": 0.003,       # 217天稳健性三检通过：+366pt，邻域✅分半✅单日18%✅
+        "signal_threshold": 50,       # 新baseline分半✅(+185/+186对称)，+370pt，多次一致最优
         "session_multiplier": {
             "0935-1030": 1.0,
             "1030-1130": 1.1,
@@ -890,6 +892,7 @@ SYMBOL_PROFILES: Dict[str, Dict] = {
         "dm_contrarian": 0.9,
         "signal_threshold": 60,       # 动态lb+th55/60: IC从65降至60（配合lb=4震荡模式）
         "trailing_stop_scale": 2.0,   # IC趋势中震荡大，需要更宽trailing（5/5周稳健验证）
+        "me_ratio": 0.12,             # 新baseline分半✅(+16/+51)，+67pt
         "session_multiplier": {
             "0935-1030": 1.0,
             "1030-1130": 1.1,
