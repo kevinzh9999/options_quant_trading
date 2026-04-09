@@ -74,7 +74,8 @@ def precompute_signals(sym, dates, all_bars, daily_all, gen, per_day, threshold)
 
             signal_price = float(bar_5m_signal.iloc[-1]["close"])
             z_val = (signal_price - ema20) / std20 if std20 > 0 else None
-            bar_15m = _build_15m_from_5m(bar_5m_signal)
+            bar_15m_full = _build_15m_from_5m(bar_5m)
+            bar_15m = bar_15m_full.iloc[:-1] if len(bar_15m_full) > 1 else bar_15m_full
 
             result = gen.score_all(
                 sym, bar_5m_signal, bar_15m, daily_df, None, day["sentiment"],

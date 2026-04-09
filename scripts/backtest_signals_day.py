@@ -261,8 +261,10 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
 
         z_val = (signal_price - ema20) / std20 if std20 > 0 else None
 
-        # Build 15m bars from signal data (not current bar)
-        bar_15m = _build_15m_from_5m(bar_5m_signal)
+        # Build 15m bars from FULL 5m data (含forming bar), 然后排除forming 15m bar
+        # 和TQ原生15m一致：TQ的15m包含已完成的5m bar，最后一根15m是forming的
+        bar_15m_full = _build_15m_from_5m(bar_5m)
+        bar_15m = bar_15m_full.iloc[:-1] if len(bar_15m_full) > 1 else bar_15m_full
 
         # Score using signal bars (excludes current forming bar)
         result = gen.score_all(
