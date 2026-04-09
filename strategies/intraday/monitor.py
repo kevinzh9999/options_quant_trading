@@ -443,6 +443,8 @@ class IntradayMonitor:
         self._sentiment: Optional[SentimentData] = None
         # Morning Briefing d_override（启动时加载）
         self._d_override: Dict[str, float] | None = None
+        # Q分历史同时段volume profile（启动时从index_min加载）
+        self._vol_profiles: Dict[str, Dict[str, list]] = {}
         # 影子交易簿：记录所有信号的完整生命周期，key=symbol
         self._shadow_positions: Dict[str, Dict] = {}
         # 影子交易累计已平仓PnL（点数）和笔数，用于面板显示
@@ -554,6 +556,25 @@ class IntradayMonitor:
             # 纯算法 dm (1.1/0.9) 已是最优，briefing 的激进覆盖(0.5/1.2)过度干预
             # self._d_override 保持 None，score_all 会使用算法 dm
             pass
+
+            # 6. Q分历史同时段volume profile（分位数法）
+            _SPOT_SYM = {"IM": "000852", "IF": "000300", "IH": "000016", "IC": "000905"}
+            from strategies.intraday.A_share_momentum_signal_v2 import compute_volume_profile
+            today_str = datetime.now().strftime("%Y%m%d")
+            for sym in self.symbols:
+                spot_sym = _SPOT_SYM.get(sym)
+                if not spot_sym:
+                    continue
+                bar_all = db.query_df(
+                    f"SELECT datetime, volume FROM index_min "
+                    f"WHERE symbol='{spot_sym}' AND period=300 ORDER BY datetime"
+                )
+                if bar_all is not None and len(bar_all) > 0:
+                    bar_all["volume"] = bar_all["volume"].astype(float)
+                    self._vol_profiles[sym] = compute_volume_profile(
+                        bar_all, before_date=today_str, lookback_days=20)
+                    n_slots = len(self._vol_profiles[sym])
+                    print(f"  Vol profile: {sym} {n_slots} 时段 (过去20天)")
 
         except Exception as e:
             print(f"  [WARNING] daily data load failed: {e}")
@@ -954,8 +975,7 @@ class IntradayMonitor:
             # 订阅现货指数K线（信号计算用）
             spot_klines_5m: Dict[str, pd.DataFrame] = {}
             spot_klines_15m: Dict[str, pd.DataFrame] = {}
-            spot_quotes: Dict = {}  # DEBUG: 现货quote（volume对比用）
-            _prev_spot_cum_vol: Dict[str, float] = {}  # DEBUG: 上一根bar的累计volume
+            spot_quotes: Dict = {}  # DEBUG: 暂未使用
             # 订阅期货K线和行情（下单参考+归档+贴水计算）
             fut_klines_5m: Dict[str, pd.DataFrame] = {}
             fut_quotes: Dict = {}
@@ -966,10 +986,6 @@ class IntradayMonitor:
                 if spot_sym:
                     spot_klines_5m[sym] = api.get_kline_serial(spot_sym, 300, 200)
                     spot_klines_15m[sym] = api.get_kline_serial(spot_sym, 900, 100)
-
-                # 现货quote（用于Q分volume对比debug）
-                if spot_sym:
-                    spot_quotes[sym] = api.get_quote(spot_sym)
 
                 # 期货
                 fut_sym = self._tq_symbols[sym]
@@ -1079,16 +1095,9 @@ class IntradayMonitor:
                         avg20 = float(df["volume"].tail(20).mean())
                         ratio = last_vol / avg20 if avg20 > 0 else 0
                         last_dt = df.index[-1].strftime("%H:%M") if hasattr(df.index[-1], 'strftime') else str(df.index[-1])
-                        # Quote cumulative volume（方案2：用差值算bar volume）
-                        sq = spot_quotes.get(sym)
-                        cum_vol = float(sq.volume) if sq is not None and hasattr(sq, 'volume') else -1
-                        prev_cum = _prev_spot_cum_vol.get(sym, 0)
-                        bar_vol_from_quote = cum_vol - prev_cum if cum_vol > 0 and prev_cum > 0 else -1
-                        _prev_spot_cum_vol[sym] = cum_vol
                         print(f"  [Q-DEBUG] IM {last_dt}"
                               f" kline_vol={last_vol:.0f}"
-                              f" quote_cum={cum_vol:.0f}"
-                              f" quote_bar={bar_vol_from_quote:.0f}"
+                              f" prev_vol={prev_vol:.0f}"
                               f" avg20={avg20:.0f} ratio={ratio:.2f}", flush=True)
 
             k15 = spot_klines_15m.get(sym)
@@ -1140,16 +1149,19 @@ class IntradayMonitor:
             ver = SIGNAL_ROUTING.get(sym, "v2")
             hv = self._is_high_vol
             d_ovr = self._d_override
+            _vp = self._vol_profiles.get(sym)
             if ver == "v3":
                 sc3 = self.signal_v3.score_all(
                     sym, b5, b15, daily, qd, self._sentiment,
-                    zscore=z_val, is_high_vol=hv, d_override=d_ovr)
+                    zscore=z_val, is_high_vol=hv, d_override=d_ovr,
+                    vol_profile=_vp)
                 if sc3:
                     self._latest_scores_v3[sym] = sc3
             else:
                 sc2 = self.signal_v2.score_all(
                     sym, b5, b15, daily, qd, self._sentiment,
-                    zscore=z_val, is_high_vol=hv, d_override=d_ovr)
+                    zscore=z_val, is_high_vol=hv, d_override=d_ovr,
+                    vol_profile=_vp)
                 if sc2:
                     self._latest_scores_v2[sym] = sc2
 
