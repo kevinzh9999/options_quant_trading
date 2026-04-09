@@ -250,10 +250,21 @@ Q = 20 if pct > 0.75 else (10 if pct > 0.25 else 0)
 - V2/V3 score_all新增`vol_profile`参数，有profile时用分位数法，无则fallback旧算法
 - 回测/sensitivity脚本传入profile，monitor待接入（需预加载历史volume）
 
+**后续优化（2026-04-09）**：
+- trend_startup放量条件也改为分位数>60%（消除跨日偏差）
+- boll_breakout放量窗口5→3根（减少跨日影响）
+- 合计影响: IM+86pt IC-118pt 总-32pt（持平但更正确）
+
+**新baseline上阈值sweep（per-symbol）**：
+- IM: 45最优(+438pt)但单日35%❌，55分半❌ → 保持thr=60
+- IC: 50最优(+434pt)但单日48%❌，65分半❌ → 保持thr=60
+- Q-band sweep: 75/25已近最优（各band差距<100pt高原区）
+- **最终baseline: IM+2323 IC+2310 合计+4633pt/218天**
+
 **待办**：
-- 在新baseline上重新优化阈值和参数配合
 - Monitor接入分位数Q（启动时从index_min加载历史volume profile）
 - TQ实时volume debug仍需确认（但分位数法不依赖实时volume的绝对准确性）
+- 坐标下降全维度sweep（M打分档位、V断点、dm等）待数据积累后进行
 
 ---
 
