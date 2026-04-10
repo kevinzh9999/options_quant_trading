@@ -46,6 +46,76 @@ def run_tq_backtest(td: str, symbols: List[str] = None):
     monitor._load_daily_data()
     monitor._load_sentiment()
 
+    # TqBacktest回测历史日期时，覆盖sentiment避免未来数据泄漏
+    # monitor._load_sentiment()用datetime.now()取当天日期，回测过去日期时会包含未来数据
+    from data.storage.db_manager import get_db as _get_db
+    from strategies.intraday.A_share_momentum_signal_v2 import SentimentData
+    _db = _get_db()
+    _sdf = _db.query_df(
+        "SELECT atm_iv, atm_iv_market, vrp, rr_25d, term_structure_shape "
+        f"FROM daily_model_output WHERE underlying='IM' AND trade_date < '{td}' "
+        "ORDER BY trade_date DESC LIMIT 2"
+    )
+    if _sdf is not None and len(_sdf) >= 2:
+        _cur, _prev = _sdf.iloc[0], _sdf.iloc[1]
+        monitor._sentiment = SentimentData(
+            atm_iv=float(_cur.get("atm_iv_market") or _cur.get("atm_iv") or 0),
+            atm_iv_prev=float(_prev.get("atm_iv_market") or _prev.get("atm_iv") or 0),
+            rr_25d=float(_cur.get("rr_25d") or 0),
+            rr_25d_prev=float(_prev.get("rr_25d") or 0),
+            vrp=float(_cur.get("vrp") or 0),
+            term_structure=str(_cur.get("term_structure_shape") or ""),
+        )
+        print(f"  [TqBT] Sentiment覆盖为 trade_date<{td} 的数据")
+
+    # 同样覆盖vol_profile（_load_daily_data里用datetime.now()取today_str）
+    from strategies.intraday.A_share_momentum_signal_v2 import compute_volume_profile
+    _SPOT_SYM = {"IM": "000852", "IF": "000300", "IH": "000016", "IC": "000905"}
+    for _sym in symbols:
+        _spot = _SPOT_SYM.get(_sym)
+        if not _spot:
+            continue
+        _bar_all = _db.query_df(
+            f"SELECT datetime, volume FROM index_min "
+            f"WHERE symbol='{_spot}' AND period=300 ORDER BY datetime"
+        )
+        if _bar_all is not None and len(_bar_all) > 0:
+            _bar_all['volume'] = _bar_all['volume'].astype(float)
+            monitor._vol_profiles[_sym] = compute_volume_profile(
+                _bar_all, before_date=td, lookback_days=20)
+    print(f"  [TqBT] Vol profile覆盖为 before_date={td}")
+
+    # 覆盖daily_data（最关键！影响daily_mult和intraday_filter）
+    _SPOT_IDX = {"IM": "000852.SH", "IF": "000300.SH", "IH": "000016.SH", "IC": "000905.SH"}
+    for _sym in symbols:
+        _idx_code = _SPOT_IDX.get(_sym)
+        if not _idx_code:
+            continue
+        _ddf = _db.query_df(
+            f"SELECT trade_date, close as open, close as high, "
+            f"close as low, close, 0 as volume "
+            f"FROM index_daily WHERE ts_code = '{_idx_code}' "
+            f"AND trade_date < '{td}' "
+            f"ORDER BY trade_date DESC LIMIT 30"
+        )
+        if _ddf is not None and len(_ddf) > 0:
+            _ddf = _ddf.sort_values("trade_date").reset_index(drop=True)
+            _ddf["close"] = _ddf["close"].astype(float)
+            monitor._daily_data[_sym] = _ddf
+
+        # 覆盖zscore
+        _spot_df = _db.query_df(
+            f"SELECT close FROM index_daily WHERE ts_code = '{_idx_code}' "
+            f"AND trade_date < '{td}' ORDER BY trade_date DESC LIMIT 30"
+        )
+        if _spot_df is not None and len(_spot_df) >= 20:
+            _closes = _spot_df["close"].astype(float).iloc[::-1].reset_index(drop=True)
+            _ema20 = float(_closes.ewm(span=20).mean().iloc[-1])
+            _std20 = float(_closes.rolling(20).std().iloc[-1])
+            if _std20 > 0:
+                monitor._zscore_params[_sym] = {"ema20": _ema20, "std20": _std20, "index": _idx_code}
+    print(f"  [TqBT] Daily data + Z-Score覆盖为 trade_date<{td}")
+
     # TqBacktest API
     auth = TqAuth(os.getenv("TQ_ACCOUNT", ""), os.getenv("TQ_PASSWORD", ""))
     api = TqApi(backtest=TqBacktest(
