@@ -1,9 +1,9 @@
 """
-因子化评分框架 — 替代 score_all() 的硬编码逻辑。
+因子化评分框架 — entry和exit都基于原子因子（atomic_factors.py）的组合。
 
-每个评分维度（M/V/Q/B/S）抽象为 ScoringFactor 子类。
-FactorCombiner 负责：因子求和 → 乘数管道 → 过滤器。
-输出格式与旧 score_all() 完全一致，接口零改动。
+Entry: ScoringFactor子类（M/V/Q/B/S），由FactorCombiner组合。
+Exit:  ExitCondition子类（StopLoss/Trailing/TC/ME/MidBreak/TimeStop），由ExitEvaluator评估。
+两者共享同一套原子因子。
 """
 from __future__ import annotations
 
@@ -15,14 +15,16 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from strategies.intraday import atomic_factors as af
 
-# ---------------------------------------------------------------------------
-# 数据容器
-# ---------------------------------------------------------------------------
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Entry 侧
+# ═══════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class ScoringContext:
-    """打包 score_all 的所有输入，传给每个因子。"""
+    """打包 score_all 的所有输入。"""
     symbol: str
     close_5m: np.ndarray
     high_5m: np.ndarray
@@ -32,25 +34,19 @@ class ScoringContext:
     daily_bar: Optional[pd.DataFrame]
     utc_time: Optional[time]
     vol_profile: Optional[Dict[str, list]]
-    profile: Dict               # SYMBOL_PROFILES 条目
+    profile: Dict
     current_close: float
-    bar_5m_df: Optional[pd.DataFrame] = None   # 原始 DataFrame（breakout/startup需要）
+    bar_5m_df: Optional[pd.DataFrame] = None
 
 
 @dataclass
 class FactorResult:
-    """单个因子的输出。"""
     score: int = 0
-    direction: str = ""         # "LONG"/"SHORT"/""（只有 Momentum 设置方向）
+    direction: str = ""
     meta: Dict = field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
-# 因子基类
-# ---------------------------------------------------------------------------
-
 class ScoringFactor(ABC):
-    """评分因子抽象基类。"""
     name: str = ""
     max_score: int = 0
 
@@ -59,62 +55,42 @@ class ScoringFactor(ABC):
         ...
 
 
-# ---------------------------------------------------------------------------
-# 具体因子
-# ---------------------------------------------------------------------------
-
-# 常量（从 A_share_momentum_signal_v2 模块级变量复制，避免循环导入）
-_MOM_15M_LB = 6
+# ── 动态lookback常量 ──
 _DYN_LB_LOW = 4
 _DYN_LB_HIGH = 12
 _DYN_AMP_THR = 0.015
-_ATR_SHORT = 5
-_ATR_LONG = 40
-_VOLUME_SURGE = 1.5
-_VOLUME_LOW = 0.5
+_MOM_15M_LB = 6
 _VOLUME_PCT_HIGH = 0.75
 _VOLUME_PCT_LOW = 0.25
-
-
-def _atr(high, low, close, period):
-    """Average True Range."""
-    n = len(high)
-    if n < period + 1:
-        return 0.0
-    tr = np.maximum(
-        high[1:] - low[1:],
-        np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])),
-    )
-    return float(np.mean(tr[-period:]))
+_VOLUME_SURGE = 1.5
+_VOLUME_LOW = 0.5
 
 
 class MomentumFactor(ScoringFactor):
-    """M维度：动量评分（0-50）+ 方向判定。含动态lookback。"""
+    """M维度（0-50）：基于 af.momentum + af.amplitude 原子因子。"""
     name = "momentum"
     max_score = 50
 
     def score(self, ctx: ScoringContext) -> FactorResult:
         close = ctx.close_5m
-        # 动态 lookback
+        # 动态lookback：基于 af.amplitude
         lb = _DYN_LB_HIGH
         if len(close) >= 6:
-            recent = close[-min(48, len(close)):]
-            amp = (max(recent) - min(recent)) / recent[0] if recent[0] > 0 else 0
+            amp = af.amplitude(close, 48)
             if amp < _DYN_AMP_THR:
                 lb = _DYN_LB_LOW
 
-        if len(close) < lb + 1:
+        # 5m动量
+        mom_5m = af.momentum(close, lb)
+        if mom_5m == 0.0 and len(close) < lb + 1:
             return FactorResult(0, "")
-
-        mom_5m = (close[-1] - close[-lb - 1]) / close[-lb - 1]
-        dir_5m = "LONG" if mom_5m > 0 else "SHORT" if mom_5m < 0 else ""
+        dir_5m = af.momentum_direction(mom_5m)
 
         # 15m确认
         dir_15m = ""
         if ctx.bar_15m is not None and len(ctx.bar_15m) >= _MOM_15M_LB + 1:
-            c15 = ctx.bar_15m["close"].values
-            mom_15m = (c15[-1] - c15[-_MOM_15M_LB - 1]) / c15[-_MOM_15M_LB - 1]
-            dir_15m = "LONG" if mom_15m > 0 else "SHORT" if mom_15m < 0 else ""
+            mom_15m = af.momentum(ctx.bar_15m["close"].values, _MOM_15M_LB)
+            dir_15m = af.momentum_direction(mom_15m)
         if dir_15m and dir_5m != dir_15m:
             return FactorResult(0, "")
 
@@ -134,16 +110,15 @@ class MomentumFactor(ScoringFactor):
 
 
 class VolatilityFactor(ScoringFactor):
-    """V维度：波动率评分（0-30）。ATR短/长比率。"""
+    """V维度（0-30）：基于 af.atr_ratio 原子因子。"""
     name = "volatility"
     max_score = 30
 
     def score(self, ctx: ScoringContext) -> FactorResult:
-        atr_s = _atr(ctx.high_5m, ctx.low_5m, ctx.close_5m, _ATR_SHORT)
-        atr_l = _atr(ctx.high_5m, ctx.low_5m, ctx.close_5m, _ATR_LONG)
-        if atr_l <= 0 or atr_s <= 0:
+        atr_s = af.atr(ctx.high_5m, ctx.low_5m, ctx.close_5m, 5)
+        ratio = af.atr_ratio(ctx.high_5m, ctx.low_5m, ctx.close_5m, 5, 40)
+        if atr_s <= 0:
             return FactorResult(15, meta={"atr_short": atr_s})
-        ratio = atr_s / atr_l
         if ratio < 0.7:
             s = 30
         elif ratio < 0.9:
@@ -158,33 +133,26 @@ class VolatilityFactor(ScoringFactor):
 
 
 class VolumeFactor(ScoringFactor):
-    """Q维度：成交量评分（0-20）。优先用历史分位，fallback到rolling。"""
+    """Q维度（0-20）：基于 af.volume_percentile / af.volume_ratio 原子因子。"""
     name = "volume"
     max_score = 20
 
     def score(self, ctx: ScoringContext) -> FactorResult:
         volume = ctx.volume_5m
-        # 优先用历史同时段分位
         if ctx.vol_profile and ctx.utc_time:
             slot = ctx.utc_time.strftime("%H:%M")
             hist_vols = ctx.vol_profile.get(slot)
             if hist_vols and len(hist_vols) >= 5:
-                cur_vol = float(volume[-1])
-                pct = sum(1 for v in hist_vols if v <= cur_vol) / len(hist_vols)
-                if pct > _VOLUME_PCT_HIGH:      # 严格大于（与旧volume_percentile_q一致）
+                pct = af.volume_percentile(float(volume[-1]), hist_vols)
+                if pct > _VOLUME_PCT_HIGH:
                     return FactorResult(20, meta={"method": "percentile", "pct": pct})
-                elif pct > _VOLUME_PCT_LOW:    # 严格大于
+                elif pct > _VOLUME_PCT_LOW:
                     return FactorResult(10, meta={"method": "percentile", "pct": pct})
                 return FactorResult(0, meta={"method": "percentile", "pct": pct})
-
-        # fallback: rolling均值
+        # fallback
         if len(volume) < 20:
             return FactorResult(10, meta={"method": "fallback_short"})
-        recent_vol = float(volume[-1])
-        avg_vol = float(np.mean(volume[-20:]))
-        if avg_vol <= 0:
-            return FactorResult(10, meta={"method": "fallback_zero"})
-        ratio = recent_vol / avg_vol
+        ratio = af.volume_ratio(float(volume[-1]), float(np.mean(volume[-20:])))
         if ratio > _VOLUME_SURGE:
             return FactorResult(20, meta={"method": "rolling", "ratio": ratio})
         elif ratio > _VOLUME_LOW:
@@ -193,7 +161,7 @@ class VolumeFactor(ScoringFactor):
 
 
 class BreakoutFactor(ScoringFactor):
-    """B维度：布林带突破加分（0-20）。需要先有动量方向。"""
+    """B维度（0-20）：布林带突破。需要先有动量方向。"""
     name = "breakout"
     max_score = 20
 
@@ -201,7 +169,6 @@ class BreakoutFactor(ScoringFactor):
               s_mom: int = 0) -> FactorResult:
         if s_mom <= 0 or not mom_dir:
             return FactorResult(0)
-        # 调用模块级函数（逻辑不变）
         from strategies.intraday.A_share_momentum_signal_v2 import _score_boll_breakout
         s, note = _score_boll_breakout(ctx.close_5m, ctx.bar_15m,
                                         mom_dir, ctx.volume_5m)
@@ -209,21 +176,19 @@ class BreakoutFactor(ScoringFactor):
 
 
 class StartupFactor(ScoringFactor):
-    """S维度：趋势启动检测（0-15）。需要先有动量方向。"""
+    """S维度（0-15）：趋势启动。需要先有动量方向。"""
     name = "startup"
     max_score = 15
 
     def score(self, ctx: ScoringContext, mom_dir: str = "") -> FactorResult:
         if not mom_dir:
             return FactorResult(0)
-        # 计算volume分位
         vol_pct = -1.0
         if ctx.vol_profile and ctx.utc_time:
             slot = ctx.utc_time.strftime("%H:%M")
             hv = ctx.vol_profile.get(slot)
             if hv and len(hv) >= 5:
-                cur_v = float(ctx.volume_5m[-1])
-                vol_pct = sum(1 for v in hv if v <= cur_v) / len(hv)
+                vol_pct = af.volume_percentile(float(ctx.volume_5m[-1]), hv)
         from strategies.intraday.A_share_momentum_signal_v2 import _score_trend_startup
         s, note = _score_trend_startup(ctx.close_5m, ctx.high_5m, ctx.low_5m,
                                         ctx.volume_5m, mom_dir,
@@ -231,51 +196,36 @@ class StartupFactor(ScoringFactor):
         return FactorResult(s, meta={"note": note})
 
 
-# ---------------------------------------------------------------------------
-# 因子组合器
-# ---------------------------------------------------------------------------
+# ── Entry组合器 ──
 
 class FactorCombiner:
-    """替代 score_all() 方法体。
-
-    流程：因子求和 → 乘数管道（dm/f/tw/sent）→ 硬过滤（zscore/rsi）。
-    输出 dict 格式与旧 score_all() 完全一致。
-    """
+    """Entry侧：因子求和 → 乘数管道 → 硬过滤。输出与旧score_all()格式一致。"""
 
     def __init__(self, factors: List[ScoringFactor],
                  weights: Optional[Dict[str, float]] = None):
         self.factors = factors
-        self.weights = weights or {}       # factor_name -> weight, default 1.0
+        self.weights = weights or {}
 
     def combine(self, ctx: ScoringContext,
-                # 乘数管道参数（当前中性化，未来可恢复）
-                daily_bar: Optional[pd.DataFrame] = None,
-                sentiment=None,
-                zscore: Optional[float] = None,
-                is_high_vol: bool = True,
-                d_override: Optional[Dict[str, float]] = None,
-                ) -> Dict:
-        """运行所有因子，合成最终得分。返回与旧 score_all() 格式一致的 dict。"""
+                daily_bar=None, sentiment=None, zscore=None,
+                is_high_vol: bool = True, d_override=None) -> Dict:
 
-        # ── Phase 1: 计算各因子 ──
-        mom_result = None
-        vol_result = None
-        qty_result = None
-        brk_result = FactorResult(0)
-        stp_result = FactorResult(0)
-
+        # Phase 1: 因子计算
         mom_dir = ""
         s_mom = 0
+        vol_result = FactorResult(0)
+        qty_result = FactorResult(0)
+        brk_result = FactorResult(0)
+        stp_result = FactorResult(0)
 
         for f in self.factors:
             w = self.weights.get(f.name, 1.0)
             if w == 0:
                 continue
-
             if f.name == "momentum":
-                mom_result = f.score(ctx)
-                mom_dir = mom_result.direction
-                s_mom = int(round(mom_result.score * w))
+                r = f.score(ctx)
+                mom_dir = r.direction
+                s_mom = int(round(r.score * w))
             elif f.name == "volatility":
                 vol_result = f.score(ctx)
             elif f.name == "volume":
@@ -285,44 +235,37 @@ class FactorCombiner:
             elif f.name == "startup":
                 stp_result = f.score(ctx, mom_dir=mom_dir)
 
-        # 应用权重
-        s_vol = int(round((vol_result.score if vol_result else 0) * self.weights.get("volatility", 1.0)))
-        s_qty = int(round((qty_result.score if qty_result else 0) * self.weights.get("volume", 1.0)))
+        s_vol = int(round(vol_result.score * self.weights.get("volatility", 1.0)))
+        s_qty = int(round(qty_result.score * self.weights.get("volume", 1.0)))
         s_breakout = int(round(brk_result.score * self.weights.get("breakout", 1.0)))
         s_startup = int(round(stp_result.score * self.weights.get("startup", 1.0)))
+        atr_short = vol_result.meta.get("atr_short", 0.0)
 
-        atr_short = vol_result.meta.get("atr_short", 0.0) if vol_result else 0.0
-
-        # 合成breakout_note
         brk_note = brk_result.meta.get("note", "")
         stp_note = stp_result.meta.get("note", "")
         breakout_note = brk_note
         if stp_note:
             breakout_note = (brk_note + "+" + stp_note) if brk_note else stp_note
 
-        # ── Phase 2: 乘数管道 ──
+        # Phase 2: 乘数管道
         from strategies.intraday.A_share_momentum_signal_v2 import (
             _get_session_weight, calc_sentiment_multiplier,
             _apply_zscore_filter, _rsi_reversal_bonus, _calc_rsi,
-            _extract_today_bars, SYMBOL_PROFILES, _DEFAULT_PROFILE,
-            INTRADAY_REVERSAL_THRESHOLD, MOM_DAILY_LOOKBACK,
-            SignalGeneratorV2,
+            _extract_today_bars, MOM_DAILY_LOOKBACK, SignalGeneratorV2,
         )
 
         prof = ctx.profile
-
-        # daily_mult
         daily_mult = 1.0
         if daily_bar is not None and len(daily_bar) >= MOM_DAILY_LOOKBACK + 1:
             closes = daily_bar["close"].values
-            daily_mom = (closes[-1] - closes[-MOM_DAILY_LOOKBACK - 1]) / closes[-MOM_DAILY_LOOKBACK - 1]
+            daily_mom = af.momentum(closes, MOM_DAILY_LOOKBACK)
             if abs(daily_mom) >= 0.002:
                 dm_trend = prof.get("dm_trend", 1.1)
                 dm_contra = prof.get("dm_contrarian", 0.9)
-                daily_dir = "LONG" if daily_mom > 0 else "SHORT"
+                daily_dir = af.momentum_direction(daily_mom)
                 if daily_dir == mom_dir:
                     daily_mult = dm_trend
-                elif mom_dir and daily_dir != mom_dir:
+                elif mom_dir:
                     daily_mult = dm_contra
         if d_override and mom_dir:
             daily_mult = d_override.get(mom_dir, daily_mult)
@@ -354,7 +297,6 @@ class FactorCombiner:
             today_bars = _extract_today_bars(ctx.bar_5m_df)
             if len(today_bars) > 0:
                 prev_close = float(today_bars.iloc[0]["open"])
-
         if prev_close > 0:
             intraday_return = (ctx.current_close - prev_close) / prev_close
             if is_high_vol:
@@ -363,17 +305,15 @@ class FactorCombiner:
                 intraday_filter = SignalGeneratorV2._intraday_filter_mild(intraday_return, mom_dir)
             adjusted *= intraday_filter
 
-        # time_weight
         tw = _get_session_weight(ctx.utc_time, prof.get("session_multiplier", {})) if ctx.utc_time else 1.0
         adjusted *= tw
 
-        # sentiment_mult
         sent_mult, sent_reason = calc_sentiment_multiplier(mom_dir, sentiment)
         adjusted *= sent_mult
 
         total = max(0, min(100, int(round(adjusted))))
 
-        # ── Phase 3: 硬过滤 ──
+        # Phase 3: 硬过滤
         pre_z_total = total
         total, z_filter = _apply_zscore_filter(total, mom_dir, zscore, is_high_vol)
 
@@ -383,7 +323,7 @@ class FactorCombiner:
             rsi_bonus, rsi_note = _rsi_reversal_bonus(ctx.close_5m, zscore, mom_dir)
             total = min(100, total + rsi_bonus)
 
-        rsi_val = _calc_rsi(ctx.close_5m) if len(ctx.close_5m) >= 15 else 50.0
+        rsi_val = af.rsi(ctx.close_5m) if len(ctx.close_5m) >= 15 else 50.0
 
         return {
             "total": total, "direction": mom_dir,
@@ -398,24 +338,329 @@ class FactorCombiner:
         }
 
 
-# 避免循环导入：在 combine() 内部才 import SignalGeneratorV2
-# 这里提前声明以便类型引用
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from strategies.intraday.A_share_momentum_signal_v2 import SignalGeneratorV2
+# ═══════════════════════════════════════════════════════════════════════════
+# Exit 侧
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class ExitContext:
+    """打包 check_exit 的所有输入。"""
+    position: dict          # entry_price, direction, entry_time_utc, highest_since, lowest_since, volume, bars_below_mid
+    current_price: float
+    bar_5m: Optional[pd.DataFrame]
+    bar_15m: Optional[pd.DataFrame]
+    current_time_utc: str
+    symbol: str
+    profile: Dict
+    # 预计算的原子因子值（由ExitEvaluator填充）
+    hold_minutes: int = 0
+    loss_pct: float = 0.0
+    pnl_pct_val: float = 0.0
+    zone_5m: str = ""
+    zone_15m: str = ""
+    b5_mid: float = 0.0
+    b5_std: float = 0.0
+    b15_mid: float = 0.0
+    b15_std: float = 0.0
+    boll_price: float = 0.0
 
 
-# ---------------------------------------------------------------------------
+class ExitCondition(ABC):
+    """Exit条件抽象基类。"""
+    name: str = ""
+    priority: int = 99     # 数字越小优先级越高
+    urgency: str = "NORMAL"
+
+    @abstractmethod
+    def check(self, ctx: ExitContext) -> Optional[dict]:
+        """返回exit dict或None。"""
+        ...
+
+
+class StopLossCondition(ExitCondition):
+    """基于 af.pnl_pct 原子因子。"""
+    name = "STOP_LOSS"
+    priority = 10
+    urgency = "URGENT"
+
+    def check(self, ctx: ExitContext) -> Optional[dict]:
+        sl_pct = ctx.profile.get("stop_loss_pct", 0.005)
+        if ctx.loss_pct > sl_pct:
+            return {"should_exit": True, "exit_volume": ctx.position.get("volume", 1),
+                    "exit_reason": "STOP_LOSS", "exit_urgency": "URGENT"}
+        return None
+
+
+class LunchCloseCondition(ExitCondition):
+    """午休平仓：亏损→LUNCH_CLOSE，盈利→紧trailing→LUNCH_TRAIL。"""
+    name = "LUNCH_CLOSE"
+    priority = 15  # 在STOP_LOSS(10)之后，TRAILING(30)之前
+    urgency = "URGENT"
+
+    def check(self, ctx: ExitContext) -> Optional[dict]:
+        from strategies.intraday.A_share_momentum_signal_v2 import LUNCH_CLOSE_UTC, TRAILING_STOP_LUNCH
+        if ctx.current_time_utc < LUNCH_CLOSE_UTC or ctx.current_time_utc >= "05:00":
+            return None
+        pos = ctx.position
+        direction = pos["direction"]
+        entry_price = pos["entry_price"]
+        volume = pos.get("volume", 1)
+        profitable = ctx.pnl_pct_val > 0
+        if not profitable:
+            return {"should_exit": True, "exit_volume": volume,
+                    "exit_reason": "LUNCH_CLOSE", "exit_urgency": "URGENT"}
+        # 盈利：紧trailing
+        highest = pos.get("highest_since", entry_price)
+        lowest = pos.get("lowest_since", entry_price)
+        if direction == "LONG" and highest > entry_price:
+            dd = af.trailing_drawdown(ctx.current_price, highest, "LONG")
+            if dd > TRAILING_STOP_LUNCH:
+                return {"should_exit": True, "exit_volume": volume,
+                        "exit_reason": "LUNCH_TRAIL", "exit_urgency": "NORMAL"}
+        elif direction == "SHORT" and lowest < entry_price:
+            du = af.trailing_drawdown(ctx.current_price, lowest, "SHORT")
+            if du > TRAILING_STOP_LUNCH:
+                return {"should_exit": True, "exit_volume": volume,
+                        "exit_reason": "LUNCH_TRAIL", "exit_urgency": "NORMAL"}
+        return None
+
+
+class TrailingStopCondition(ExitCondition):
+    """基于 af.trailing_drawdown + af.hold_time + af.boll_zone 原子因子。"""
+    name = "TRAILING_STOP"
+    priority = 30
+    urgency = "NORMAL"
+
+    def check(self, ctx: ExitContext) -> Optional[dict]:
+        if not ctx.profile.get("trailing_stop_enabled", True):
+            return None
+        pos = ctx.position
+        direction = pos["direction"]
+        entry_price = pos["entry_price"]
+        highest = pos.get("highest_since", entry_price)
+        lowest = pos.get("lowest_since", entry_price)
+
+        # 持仓时间→trail宽度
+        if ctx.hold_minutes < 15:
+            trail_pct = 0.005
+        elif ctx.hold_minutes < 30:
+            trail_pct = 0.006
+        elif ctx.hold_minutes < 60:
+            trail_pct = 0.008
+        else:
+            trail_pct = 0.010
+
+        # 15m趋势确认加宽
+        if ctx.zone_15m:
+            if direction == "LONG":
+                fifteen_ok = ctx.zone_15m in ("MID_UPPER", "UPPER_ZONE", "ABOVE_UPPER")
+            else:
+                fifteen_ok = ctx.zone_15m in ("MID_LOWER", "LOWER_ZONE", "BELOW_LOWER")
+            if ctx.pnl_pct_val > 0.005 and fifteen_ok:
+                trail_pct += 0.002
+
+        trail_pct *= ctx.profile.get("trailing_stop_scale", 1.0)
+
+        dd = af.trailing_drawdown(ctx.current_price,
+                                   highest if direction == "LONG" else lowest,
+                                   direction)
+        if dd > trail_pct:
+            profitable = (ctx.current_price > entry_price) if direction == "LONG" \
+                else (ctx.current_price < entry_price)
+            if profitable:
+                return {"should_exit": True, "exit_volume": pos.get("volume", 1),
+                        "exit_reason": "TRAILING_STOP", "exit_urgency": "NORMAL"}
+        return None
+
+
+class TrendCompleteCondition(ExitCondition):
+    """基于 af.boll_zone（5m+15m双极端）原子因子。"""
+    name = "TREND_COMPLETE"
+    priority = 40
+    urgency = "NORMAL"
+
+    def check(self, ctx: ExitContext) -> Optional[dict]:
+        if not ctx.zone_5m or not ctx.zone_15m:
+            return None
+        direction = ctx.position["direction"]
+        if direction == "LONG":
+            if ctx.zone_5m == "ABOVE_UPPER" and ctx.zone_15m == "ABOVE_UPPER":
+                return {"should_exit": True, "exit_volume": ctx.position.get("volume", 1),
+                        "exit_reason": "TREND_COMPLETE", "exit_urgency": "NORMAL"}
+        else:
+            if ctx.zone_5m == "BELOW_LOWER" and ctx.zone_15m == "BELOW_LOWER":
+                return {"should_exit": True, "exit_volume": ctx.position.get("volume", 1),
+                        "exit_reason": "TREND_COMPLETE", "exit_urgency": "NORMAL"}
+        return None
+
+
+class MomentumExhaustedCondition(ExitCondition):
+    """基于 af.narrow_range + af.boll_zone + af.price_trending + af.hold_time 原子因子。"""
+    name = "MOMENTUM_EXHAUSTED"
+    priority = 50
+    urgency = "NORMAL"
+
+    def check(self, ctx: ExitContext) -> Optional[dict]:
+        min_hold = ctx.profile.get("me_min_hold", 20)
+        if ctx.hold_minutes < min_hold:
+            return None
+        if ctx.bar_5m is None or len(ctx.bar_5m) < 23 or ctx.b5_std <= 0:
+            return None
+        direction = ctx.position["direction"]
+        me_ratio = ctx.profile.get("me_ratio", 0.10)
+        nr = af.narrow_range(ctx.bar_5m, 3, ctx.b5_std)
+        if nr < 0 or nr >= me_ratio:
+            return None
+        trending = af.price_trending(ctx.bar_5m, 3, ctx.b5_std, direction)
+        if trending:
+            return None
+        if direction == "LONG" and ctx.zone_15m in ("ABOVE_UPPER", "UPPER_ZONE"):
+            return {"should_exit": True, "exit_volume": ctx.position.get("volume", 1),
+                    "exit_reason": "MOMENTUM_EXHAUSTED", "exit_urgency": "NORMAL"}
+        elif direction == "SHORT" and ctx.zone_15m in ("BELOW_LOWER", "LOWER_ZONE"):
+            return {"should_exit": True, "exit_volume": ctx.position.get("volume", 1),
+                    "exit_reason": "MOMENTUM_EXHAUSTED", "exit_urgency": "NORMAL"}
+        return None
+
+
+class MidBreakCondition(ExitCondition):
+    """基于 af.boll_zone（5m破中轨）+ 15m确认 + 连续计数。"""
+    name = "MID_BREAK"
+    priority = 60
+    urgency = "NORMAL"
+
+    def check(self, ctx: ExitContext) -> Optional[dict]:
+        if not ctx.zone_5m or np.isnan(ctx.b5_mid):
+            return None
+        direction = ctx.position["direction"]
+        boll_price = ctx.boll_price
+
+        if direction == "LONG":
+            five_below = boll_price < ctx.b5_mid
+            fifteen_below = ctx.zone_15m in ("MID_LOWER", "LOWER_ZONE", "BELOW_LOWER") if ctx.zone_15m else False
+        else:
+            five_below = boll_price > ctx.b5_mid
+            fifteen_below = ctx.zone_15m in ("MID_UPPER", "UPPER_ZONE", "ABOVE_UPPER") if ctx.zone_15m else False
+
+        bars_count = ctx.profile.get("mid_break_bars", 3)
+        if five_below:
+            bm = ctx.position.get("bars_below_mid", 0) + 1
+            ctx.position["bars_below_mid"] = bm
+            if bm >= bars_count and fifteen_below:
+                return {"should_exit": True, "exit_volume": ctx.position.get("volume", 1),
+                        "exit_reason": "MID_BREAK", "exit_urgency": "NORMAL"}
+        else:
+            ctx.position["bars_below_mid"] = 0
+        return None
+
+
+class TimeStopCondition(ExitCondition):
+    """基于 af.hold_time + af.pnl_pct 原子因子。"""
+    name = "TIME_STOP"
+    priority = 70
+    urgency = "NORMAL"
+
+    def check(self, ctx: ExitContext) -> Optional[dict]:
+        max_hold = ctx.profile.get("time_stop_minutes", 60)
+        if ctx.hold_minutes > max_hold and ctx.pnl_pct_val <= 0:
+            return {"should_exit": True, "exit_volume": ctx.position.get("volume", 1),
+                    "exit_reason": "TIME_STOP", "exit_urgency": "NORMAL"}
+        return None
+
+
+class ExitEvaluator:
+    """Exit侧组合器：预计算原子因子，按优先级评估exit条件。"""
+
+    def __init__(self, conditions: List[ExitCondition],
+                 weights: Optional[Dict[str, float]] = None):
+        self.conditions = sorted(conditions, key=lambda c: c.priority)
+        self.weights = weights or {}  # name -> weight, 0=禁用
+
+    def evaluate(self, position: dict, current_price: float,
+                 bar_5m: Optional[pd.DataFrame], bar_15m: Optional[pd.DataFrame],
+                 current_time_utc: str, symbol: str = "",
+                 spot_price: float = 0.0, is_high_vol: bool = True) -> dict:
+        """评估所有exit条件，返回最高优先级的结果。与旧check_exit输出格式一致。"""
+        from strategies.intraday.A_share_momentum_signal_v2 import (
+            SYMBOL_PROFILES, _DEFAULT_PROFILE, EOD_CLOSE_UTC,
+            LUNCH_CLOSE_UTC, TRAILING_STOP_LUNCH,
+        )
+
+        prof = SYMBOL_PROFILES.get(symbol, _DEFAULT_PROFILE) if symbol else _DEFAULT_PROFILE
+        direction = position["direction"]
+        entry_price = position["entry_price"]
+        volume = position.get("volume", 1)
+        boll_price = spot_price if spot_price > 0 else current_price
+
+        NO_EXIT = {"should_exit": False, "exit_volume": 0,
+                   "exit_reason": "", "exit_urgency": "NORMAL"}
+
+        # ── 硬约束（不因子化）──
+        # P1: EOD
+        if current_time_utc >= EOD_CLOSE_UTC:
+            return {"should_exit": True, "exit_volume": volume,
+                    "exit_reason": "EOD_CLOSE", "exit_urgency": "URGENT"}
+
+        # P2: Lunch — 移到因子化条件中（优先级在STOP_LOSS之后），不在硬约束里
+
+        # ── 预计算原子因子 ──
+        hold_min = af.hold_time(position.get("entry_time_utc", ""), current_time_utc)
+        loss_pct = -af.pnl_pct(current_price, entry_price, direction)  # 正值=亏损
+        pnl_val = af.pnl_pct(current_price, entry_price, direction)
+
+        zone_5m = zone_15m = ""
+        b5_mid = b5_std = b15_mid = b15_std = float("nan")
+        if bar_5m is not None and len(bar_5m) >= 20:
+            c5 = bar_5m["close"].astype(float)
+            b5_mid, b5_std = af.boll_params(c5)
+            if not np.isnan(b5_mid) and b5_std > 0:
+                zone_5m = af.boll_zone(boll_price, b5_mid, b5_std)
+        if bar_15m is not None and len(bar_15m) >= 20:
+            c15 = bar_15m["close"].astype(float)
+            b15_mid, b15_std = af.boll_params(c15)
+            if not np.isnan(b15_mid) and b15_std > 0:
+                zone_15m = af.boll_zone(boll_price, b15_mid, b15_std)
+
+        ectx = ExitContext(
+            position=position, current_price=current_price,
+            bar_5m=bar_5m, bar_15m=bar_15m,
+            current_time_utc=current_time_utc, symbol=symbol, profile=prof,
+            hold_minutes=hold_min, loss_pct=loss_pct, pnl_pct_val=pnl_val,
+            zone_5m=zone_5m, zone_15m=zone_15m,
+            b5_mid=b5_mid, b5_std=b5_std, b15_mid=b15_mid, b15_std=b15_std,
+            boll_price=boll_price,
+        )
+
+        # ── 按优先级评估因子化条件 ──
+        for cond in self.conditions:
+            w = self.weights.get(cond.name, 1.0)
+            if w == 0:
+                continue  # 禁用
+            result = cond.check(ectx)
+            if result is not None:
+                return result
+
+        return NO_EXIT
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 工厂函数
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
 
 def create_default_combiner(weights: Optional[Dict[str, float]] = None) -> FactorCombiner:
-    """创建默认的5因子组合器（与旧 score_all 行为一致）。"""
-    factors = [
-        MomentumFactor(),
-        VolatilityFactor(),
-        VolumeFactor(),
-        BreakoutFactor(),
-        StartupFactor(),
-    ]
+    factors = [MomentumFactor(), VolatilityFactor(), VolumeFactor(),
+               BreakoutFactor(), StartupFactor()]
     return FactorCombiner(factors, weights)
+
+
+def create_default_exit_evaluator(weights: Optional[Dict[str, float]] = None) -> ExitEvaluator:
+    conditions = [
+        StopLossCondition(),
+        LunchCloseCondition(),
+        TrailingStopCondition(),
+        TrendCompleteCondition(),
+        MomentumExhaustedCondition(),
+        MidBreakCondition(),
+        TimeStopCondition(),
+    ]
+    return ExitEvaluator(conditions, weights)

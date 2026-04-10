@@ -444,16 +444,33 @@ def check_exit(
     symbol: str = "",
     spot_price: float = 0.0,
 ) -> dict:
-    """
-    Multi-timeframe Bollinger exit system.
+    """因子化exit入口。通过ExitEvaluator评估，输出格式不变。"""
+    from strategies.intraday.factors import create_default_exit_evaluator
+    prof = SYMBOL_PROFILES.get(symbol, _DEFAULT_PROFILE) if symbol else _DEFAULT_PROFILE
+    ew = prof.get("exit_weights")
+    evaluator = create_default_exit_evaluator(ew)
+    return evaluator.evaluate(
+        position, current_price, bar_5m, bar_15m,
+        current_time_utc, symbol=symbol, spot_price=spot_price,
+        is_high_vol=is_high_vol,
+    )
+
+
+def _check_exit_legacy(
+    position: dict,
+    current_price: float,
+    bar_5m: pd.DataFrame,
+    bar_15m: pd.DataFrame | None,
+    current_time_utc: str,
+    reverse_signal_score: int = 0,
+    is_high_vol: bool = True,
+    symbol: str = "",
+    spot_price: float = 0.0,
+) -> dict:
+    """旧check_exit方法体（供双路径验证）。
 
     Priority: EOD > StopLoss > Lunch > TrailingStop > TrendComplete >
               MomentumExhausted > MidBreak > TimeStop
-
-    Price convention (live monitor):
-      - current_price / highest / lowest / entry_price: 期货价格（止损/跟踪止盈/PnL）
-      - spot_price: 现货价格（Bollinger zone判断，与bar_5m/bar_15m同源）
-      - 回测时 spot_price=0 → fallback 到 current_price（回测全用现货）
     """
     entry_price = position["entry_price"]
     direction = position["direction"]
