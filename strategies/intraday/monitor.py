@@ -797,37 +797,22 @@ class IntradayMonitor:
             print(f"  [WARN] shadow_trades/order_log恢复失败: {e}")
 
     def _load_sentiment(self) -> None:
-        """从 vol_monitor_snapshots 或 daily_model_output 加载情绪数据。"""
+        """从 daily_model_output 加载情绪数据（与backtest统一数据源）。
+
+        使用daily_model_output而非vol_monitor_snapshots，原因：
+        1. 与backtest使用完全相同的数据源和字段（atm_iv_market）
+        2. 按trade_date过滤，避免取到错误日期的数据
+        3. vol_monitor_snapshots无trade_date字段，盘前启动可能取到旧数据
+        """
         try:
-            from data.storage.db_manager import DBManager, get_db
-            from config.config_loader import ConfigLoader
+            from data.storage.db_manager import get_db
             db = get_db()
 
-            # 优先用 vol_monitor_snapshots（盘中最新）
-            snap = db.query_df(
-                "SELECT atm_iv, vrp, rr_25d, term_structure_shape "
-                "FROM vol_monitor_snapshots ORDER BY datetime DESC LIMIT 2"
-            )
-            if snap is not None and len(snap) >= 1:
-                cur = snap.iloc[0]
-                prev = snap.iloc[1] if len(snap) >= 2 else cur
-                self._sentiment = SentimentData(
-                    atm_iv=float(cur.get("atm_iv") or 0),
-                    atm_iv_prev=float(prev.get("atm_iv") or 0),
-                    rr_25d=float(cur.get("rr_25d") or 0),
-                    rr_25d_prev=float(prev.get("rr_25d") or 0),
-                    vrp=float(cur.get("vrp") or 0),
-                    term_structure=str(cur.get("term_structure_shape") or ""),
-                )
-                print(f"  情绪数据: IV={self._sentiment.atm_iv*100:.1f}%"
-                      f"  RR={self._sentiment.rr_25d*100:+.1f}pp"
-                      f"  VRP={self._sentiment.vrp*100:+.1f}%")
-                return
-
-            # Fallback: daily_model_output（昨日+前日）
+            today_str = datetime.now().strftime("%Y%m%d")
             dmo = db.query_df(
                 "SELECT atm_iv, atm_iv_market, vrp, rr_25d, term_structure_shape "
                 "FROM daily_model_output WHERE underlying='IM' "
+                f"AND trade_date < '{today_str}' "
                 "ORDER BY trade_date DESC LIMIT 2"
             )
             if dmo is not None and len(dmo) >= 1:
@@ -843,7 +828,8 @@ class IntradayMonitor:
                     vrp=float(cur.get("vrp") or 0),
                     term_structure=str(cur.get("term_structure_shape") or ""),
                 )
-                print(f"  情绪数据(EOD): IV={iv_cur*100:.1f}%"
+                print(f"  情绪数据: IV={iv_cur*100:.1f}%"
+                      f"  RR={self._sentiment.rr_25d*100:+.1f}pp"
                       f"  VRP={self._sentiment.vrp*100:+.1f}%")
         except Exception as e:
             print(f"  [警告] 情绪数据加载失败: {e}")
