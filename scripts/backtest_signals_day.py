@@ -241,7 +241,7 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
         print(f"---------+---------+-------+-----+-----+----------+------+------+-----+-----+---------+--------")
 
     for idx in today_indices:
-        bar_5m = all_bars.loc[:idx].tail(200).copy()
+        bar_5m = all_bars.loc[:idx].tail(199).copy()  # 199=TQ get_kline_serial(200)的completed bars数量
         if len(bar_5m) < 15:
             continue
 
@@ -438,12 +438,8 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                             "entry_zscore": position.get("entry_zscore"),
                         })
 
-        # Check entry (no position, score >= threshold, time allowed, cooldown passed)
-        in_cooldown = False
-        if last_exit_utc and direction == last_exit_dir:
-            cd_elapsed = _calc_minutes(last_exit_utc, utc_hm)
-            if 0 < cd_elapsed < COOLDOWN_MINUTES:
-                in_cooldown = True
+        # Check entry (no position, score >= threshold, time allowed)
+        # 注：无cooldown（monitor没有实现cooldown，保持一致）
 
         # 开盘振幅过滤：10:00(UTC 02:00)后判断前6根bar
         if _low_amplitude is None and utc_hm >= "02:00":
@@ -456,7 +452,7 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
             else:
                 _low_amplitude = False
 
-        if (position is None and not action_str and sig is not None and not in_cooldown
+        if (position is None and not action_str and sig is not None
                 and sig.score >= effective_threshold
                 and not _low_amplitude):
             # 用sig的direction（与monitor一致，update()返回的方向）
@@ -858,7 +854,7 @@ def run_day_multi(symbols: List[str], td: str, db: DBManager,
                 continue
             bars = all_bars_map[sym]
             mask = bars["datetime"] <= dt_str
-            bar_5m = bars[mask].tail(200).copy()
+            bar_5m = bars[mask].tail(199).copy()  # 199=TQ get_kline_serial(200)的completed bars数量
             if len(bar_5m) < 2:
                 continue
             bar_5m.index = pd.to_datetime(bar_5m["datetime"])
@@ -947,7 +943,7 @@ def run_day_multi(symbols: List[str], td: str, db: DBManager,
                 continue
             bars = all_bars_map[sym]
             mask = bars["datetime"] <= dt_str
-            bar_5m = bars[mask].tail(200).copy()
+            bar_5m = bars[mask].tail(199).copy()  # 199=TQ get_kline_serial(200)的completed bars数量
             if len(bar_5m) < 16:
                 continue
             bar_5m.index = pd.to_datetime(bar_5m["datetime"])
@@ -956,13 +952,6 @@ def run_day_multi(symbols: List[str], td: str, db: DBManager,
 
             if not is_open_allowed(utc_hm):
                 continue
-
-            # Cooldown
-            if last_exit_utc[sym] and last_exit_dir[sym]:
-                cd_elapsed = _calc_minutes(last_exit_utc[sym], utc_hm)
-                if 0 < cd_elapsed < COOLDOWN_MINUTES:
-                    # 检查方向
-                    pass  # need to know direction first, check after scoring
 
             # 振幅过滤
             if utc_hm >= "02:00" and low_amplitude[sym] is None:
@@ -996,13 +985,7 @@ def run_day_multi(symbols: List[str], td: str, db: DBManager,
                     "signal_threshold", _SIGNAL_THRESHOLD):
                 continue
 
-            # Cooldown check (now we know direction)
-            # >=0: 同bar退出后也算cooldown（防止TREND_COMPLETE后立即重入）
-            if last_exit_utc[sym] and last_exit_dir[sym] == direction:
-                cd_elapsed = _calc_minutes(last_exit_utc[sym], utc_hm)
-                if 0 <= cd_elapsed < COOLDOWN_MINUTES:
-                    continue
-
+            # 无cooldown（与monitor一致）
             candidates.append({
                 "sym": sym, "score": score, "direction": direction,
                 "price": price, "result": result, "bar_5m": bar_5m,

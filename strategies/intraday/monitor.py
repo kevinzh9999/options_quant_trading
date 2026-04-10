@@ -1095,13 +1095,16 @@ class IntradayMonitor:
                 if len(df) > 0:
                     bar_data[sym] = df
 
-            k15 = spot_klines_15m.get(sym)
-            if k15 is not None and len(k15) > 1:
-                completed = k15.iloc[:-1]
-                df = completed[["open", "high", "low", "close", "volume"]].copy()
-                df.index = pd.to_datetime(completed["datetime"], unit="ns")
-                if len(df) > 0:
-                    bar_15m_data[sym] = df
+            # 15m从5m重采样（不用TQ原生15m）
+            # TQ原生15m的partial更新行为不确定，从5m重采样是确定性的
+            # 与backtest使用完全相同的_build_15m_from_5m逻辑
+            if sym in bar_data and len(bar_data[sym]) >= 3:
+                from scripts.backtest_signals_day import _build_15m_from_5m
+                b15_full = _build_15m_from_5m(bar_data[sym])
+                if len(b15_full) > 1:
+                    bar_15m_data[sym] = b15_full.iloc[:-1]
+                elif len(b15_full) > 0:
+                    bar_15m_data[sym] = b15_full
 
         # 构建盘口数据（期货行情，用于下单参考和盘口记录）
         quote_dict: Dict[str, Dict] = {}
@@ -1269,18 +1272,20 @@ class IntradayMonitor:
                         fut_price = fp
                 except Exception:
                     pass
-            cur_price = fut_price if fut_price > 0 else spot_price
+            # exit信号判断全部用现货价格（与backtest一致，确保exit时点对齐）
+            # 期货价格只用于PnL计算
+            cur_price = spot_price
 
             b15 = bar_15m_data.get(sym)
             b15_arg = b15 if (b15 is not None and len(b15) > 0) else None
-            # Update extremes — 用期货价格（与entry_price同源）
+            # Update extremes — 用现货价格（与信号数据同源）
             if sp["direction"] == "LONG":
                 sp["highest_since"] = max(sp.get("highest_since", sp["entry_price"]), cur_price)
             else:
                 sp["lowest_since"] = min(sp.get("lowest_since", sp["entry_price"]), cur_price)
             exit_info = check_exit(
                 sp, cur_price, b5, b15_arg,
-                utc_hm, reverse_signal_score=0, is_high_vol=self._is_high_vol,
+                utc_hm, reverse_signal_score=0, is_high_vol=True,
                 symbol=sym, spot_price=spot_price,
             )
             if exit_info["should_exit"]:
@@ -1421,8 +1426,11 @@ class IntradayMonitor:
                     pass
 
                 # 注册shadow持仓（所有信号自动进入）
-                entry_price = (ask1 or last or 0) if direction == "LONG" \
-                    else (bid1 or last or 0)
+                # entry_price用现货close（与exit判断同源，确保backtest/monitor信号一致）
+                # 期货bid/ask只用于executor下单和PnL计算
+                b = bar_data.get(sym)
+                spot_entry = float(b.iloc[-1]["close"]) if (b is not None and len(b) > 0) else 0
+                entry_price = spot_entry if spot_entry > 0 else (ask1 or last or 0)
                 sc = self._get_routed_score(sym) or {}
                 self._shadow_positions[sym] = {
                     "direction": direction,

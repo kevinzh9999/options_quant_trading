@@ -212,8 +212,13 @@ class IntradayStrategy(BaseStrategy):
         signals.sort(key=lambda s: s.score, reverse=True)
 
         # 4. 逐信号处理（只有tradeable品种进入position_mgr开仓）
+        from strategies.intraday.A_share_momentum_signal_v2 import SYMBOL_PROFILES, _DEFAULT_PROFILE
         for sig in signals:
             if sig.symbol not in self.tradeable:
+                continue
+            # Per-symbol threshold（与backtest一致）
+            _thr = SYMBOL_PROFILES.get(sig.symbol, _DEFAULT_PROFILE).get("signal_threshold", 60)
+            if sig.score < _thr:
                 continue
             allowed, reason = self.risk_mgr.check_pre_trade(
                 sig, self.position_mgr

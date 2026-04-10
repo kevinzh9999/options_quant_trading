@@ -90,7 +90,7 @@ def run_compare(td: str, sym: str = 'IM'):
     gen_bt = SignalGeneratorV2({'min_signal_score': 60})
     bt_scores = {}
     for idx in today_indices:
-        bar_5m = all_bars.loc[:idx].tail(200).copy()
+        bar_5m = all_bars.loc[:idx].tail(199).copy()  # 199=TQ completed bars
         bar_5m.index = pd.to_datetime(bar_5m['datetime'])
         if len(bar_5m) < 16:
             continue
@@ -152,6 +152,7 @@ def run_compare(td: str, sym: str = 'IM'):
     monitor._bars_since_start = 0
 
     tq_scores = {}
+    tq_bar_dump = {}  # 记录每根bar的close用于对比
 
     # Monkey-patch score recording
     orig_score_all = monitor.signal_v2.score_all
@@ -169,6 +170,11 @@ def run_compare(td: str, sym: str = 'IM'):
                 'sent': result.get('sentiment_mult', 1.0),
                 'n_bars': len(bar_5m),
             }
+            # 记录bar数据用于对比
+            tq_bar_dump[bj] = [float(c) for c in bar_5m['close'].tail(20)]
+            # 记录15m数据
+            if bar_15m is not None and len(bar_15m) > 0:
+                tq_bar_dump[f"{bj}_15m"] = [float(c) for c in bar_15m['close'].tail(3)]
         return result
     monitor.signal_v2.score_all = _patched_score_all
 
@@ -209,6 +215,26 @@ def run_compare(td: str, sym: str = 'IM'):
         flag = ' ⚠' if delta != 0 else ''
         if delta != 0:
             diff_count += 1
+            # 有差异时打印最后20根bar close对比
+            bt_bar = all_bars.loc[:today_indices[all_times.index(t)]].tail(199)
+            bt_closes = [float(c) for c in bt_bar['close'].tail(20)]
+            tq_closes = tq_bar_dump.get(t, [])
+            if bt_closes and tq_closes and len(bt_closes) == len(tq_closes):
+                bar_diffs = [(i, bc, tc) for i, (bc, tc) in enumerate(zip(bt_closes, tq_closes)) if abs(bc-tc) > 0.01]
+                if bar_diffs:
+                    print(f"    ↳ bar close差异（最近20根中）: {len(bar_diffs)}根不同")
+                    for bi, bc, tc in bar_diffs[:3]:
+                        print(f"      [{bi-20}] BT={bc:.1f} TQ={tc:.1f} Δ={tc-bc:+.1f}")
+                else:
+                    # 5m close一致，检查15m
+                    bt_15m = _build_15m_from_5m(bt_bar)
+                    bt_15m = bt_15m.iloc[:-1] if len(bt_15m) > 1 else bt_15m
+                    tq_15m = tq_bar_dump.get(f"{t}_15m", [])
+                    bt_15m_c = [f'{float(c):.1f}' for c in bt_15m['close'].tail(3)]
+                    tq_15m_c = [f'{c:.1f}' for c in tq_15m] if tq_15m else ['?']
+                    match_15m = bt_15m_c == tq_15m_c
+                    flag_15m = "✓" if match_15m else "✗ 15m不同!"
+                    print(f"    ↳ 5m一致。15m: BT={bt_15m_c} TQ={tq_15m_c} {flag_15m}")
         bt_str = f"{bs:>8d} {bt.get('M',0):>4d} {bt.get('V',0):>4d} {bt.get('Q',0):>4d} {bt.get('sent',1.0):>5.2f} {bt.get('n_bars',0):>4d}" if bt else f"{'(无)':>31s}"
         tq_str = f"{ts_:>8d} {tq.get('M',0):>4d} {tq.get('V',0):>4d} {tq.get('Q',0):>4d} {tq.get('sent',1.0):>5.2f} {tq.get('n_bars',0):>4d}" if tq else f"{'(无)':>31s}"
         print(f"  {t:>6s} | {bt_str} | {tq_str} | {delta:>+3d}{flag}")
