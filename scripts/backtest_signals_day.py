@@ -172,9 +172,9 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
     # Select signal generator version
     _ver = version if version != "auto" else SIGNAL_ROUTING.get(sym, "v2")
     if _ver == "v3":
-        gen = SignalGeneratorV3({"min_signal_score": 55})
+        gen = SignalGeneratorV3({"min_signal_score": 60})
     else:
-        gen = SignalGeneratorV2({"min_signal_score": 55})
+        gen = SignalGeneratorV2({"min_signal_score": 60})
 
     # Per-symbol threshold（IC=65等，从SYMBOL_PROFILES读取）
     from strategies.intraday.A_share_momentum_signal_v2 import SYMBOL_PROFILES, _DEFAULT_PROFILE
@@ -245,30 +245,32 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
         if len(bar_5m) < 15:
             continue
 
-        # Lookahead fix: 信号评分用上一根完成bar的数据（和实盘monitor一致）
-        # 当前bar的close/high/low只用于执行价格和极值追踪
-        bar_5m_signal = bar_5m.iloc[:-1]  # 排除当前bar（实盘中此时还在forming）
-        if len(bar_5m_signal) < 15:
+        # 信号/执行对齐（与实盘monitor一致，2026-04-10修正）：
+        # Monitor: bar T完成后，信号数据包含bar T，entry在bar T+5min的市场价
+        # Backtest等价: 信号从bar_5m（含当前bar），entry用当前bar close
+        # 注：当前bar close ≈ bar完成时的市场价，这是最合理的近似
+        # 旧版排除当前bar (bar_5m=bar_5m[:-1])导致信号滞后1根bar
+        if len(bar_5m) < 16:  # 需要至少16根bar (15根历史 + 1根当前)
             continue
 
-        price = float(bar_5m.iloc[-1]["close"])      # 执行价格（当前bar收盘）
+        price = float(bar_5m.iloc[-1]["close"])      # 执行价格 = 当前bar收盘
         high = float(bar_5m.iloc[-1]["high"])
         low = float(bar_5m.iloc[-1]["low"])
-        signal_price = float(bar_5m_signal.iloc[-1]["close"])  # 信号价格（上一根完成bar）
+        signal_price = float(bar_5m.iloc[-1]["close"])  # 信号价 = 当前bar收盘（同源）
         dt_str = str(all_bars.loc[idx, "datetime"])
         utc_hm = dt_str[11:16]
         bj_time = _utc_to_bj(utc_hm)
 
         z_val = (signal_price - ema20) / std20 if std20 > 0 else None
 
-        # Build 15m bars from FULL 5m data (含forming bar), 然后排除forming 15m bar
-        # 和TQ原生15m一致：TQ的15m包含已完成的5m bar，最后一根15m是forming的
+        # Build 15m bars from 5m data, 排除最后一根forming 15m bar
+        # 和TQ原生15m一致
         bar_15m_full = _build_15m_from_5m(bar_5m)
         bar_15m = bar_15m_full.iloc[:-1] if len(bar_15m_full) > 1 else bar_15m_full
 
-        # Score using signal bars (excludes current forming bar)
+        # Score using all completed bars (including current bar, matching monitor)
         result = gen.score_all(
-            sym, bar_5m_signal, bar_15m, daily_df, None, sentiment,
+            sym, bar_5m, bar_15m, daily_df, None, sentiment,
             zscore=z_val, is_high_vol=is_high_vol, d_override=d_override,
             vol_profile=vol_profile,
         )
@@ -343,7 +345,7 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                     reverse_score = score
 
                 exit_info = check_exit(
-                    position, price, bar_5m_signal,
+                    position, price, bar_5m,
                     bar_15m if not bar_15m.empty else None,
                     utc_hm, reverse_score, is_high_vol=is_high_vol,
                     symbol=sym,
@@ -444,7 +446,7 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
             # Apply slippage adversely on entry
             entry_p = price + slippage if direction == "LONG" else price - slippage
             # Compute rebound/pullback from recent 20-bar extreme (use signal bars)
-            recent_20 = bar_5m_signal.tail(20)
+            recent_20 = bar_5m.tail(20)
             min_20 = float(recent_20["low"].min())
             max_20 = float(recent_20["high"].max())
             if direction == "SHORT" and min_20 > 0:
