@@ -300,15 +300,10 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
         # Check exit first (if we have a position)
         action_str = ""
         if position is not None:
-            # P0: Bar high/low 止损检查（优先级最高，在更新极值之前）
-            # 实盘中止损单挂在stop_price，bar内触及即成交
-            stop_price = position.get("stop_loss", 0)
+            # P0: Bar high/low 止损检查 — 暂时禁用，与monitor对齐
+            # monitor的check_exit用cur_price(close)判断止损，不用bar high/low
+            # TODO: monitor也加P0后恢复
             bar_stopped = False
-            if stop_price > 0:
-                if position["direction"] == "LONG" and low <= stop_price:
-                    bar_stopped = True
-                elif position["direction"] == "SHORT" and high >= stop_price:
-                    bar_stopped = True
 
             if bar_stopped:
                 # 止损触发：exit_price = stop_price（不是bar close）
