@@ -1081,8 +1081,18 @@ class IntradayMonitor:
                 print(f"  [WARMUP] First aligned bar received, starting signals")
                 self._warmup_done = True
 
-        now = datetime.now()
-        current_time_utc = now.strftime("%Y-%m-%d %H:%M:%S")
+        # 从bar数据推导当前时间（实盘和TqBacktest通用）
+        # 不依赖datetime.now()，避免TqBacktest模式下系统时间与模拟时间不一致
+        _ref_k5 = spot_klines_5m.get(changed_syms[0])
+        if _ref_k5 is not None and len(_ref_k5) >= 2:
+            _bar_utc = pd.Timestamp(int(_ref_k5.iloc[-2]["datetime"]), unit="ns")
+            # bar时间是K线开始时间，+5min = K线结束 ≈ 当前时刻
+            _now_utc = _bar_utc + pd.Timedelta(minutes=5)
+            _now_bj = _now_utc + pd.Timedelta(hours=8)
+        else:
+            _now_utc = pd.Timestamp(datetime.utcnow())
+            _now_bj = pd.Timestamp(datetime.now())
+        current_time_utc = _now_utc.strftime("%Y-%m-%d %H:%M:%S")
 
         # 构建现货bar数据（用于信号计算）
         bar_data: Dict[str, pd.DataFrame] = {}
@@ -1254,8 +1264,8 @@ class IntradayMonitor:
         # 更新影子持仓（每根K线用与回测相同的exit逻辑检查）
         # 注意：shadow entry_price是期货价格，所以check_exit也必须用期货价格
         # 否则贴水导致现货-期货价差 > 0.5%，SHORT持仓一开仓就假触发STOP_LOSS
-        utc_hm = datetime.utcnow().strftime("%H:%M")
-        trade_date = datetime.now().strftime("%Y%m%d")
+        utc_hm = _now_utc.strftime("%H:%M")
+        trade_date = _now_bj.strftime("%Y%m%d")
         for sym in list(self._shadow_positions.keys()):
             sp = self._shadow_positions[sym]
             b5 = bar_data.get(sym)
@@ -1320,7 +1330,7 @@ class IntradayMonitor:
                     "entry_m": sp.get("entry_m", 0),
                     "entry_v": sp.get("entry_v", 0),
                     "entry_q": sp.get("entry_q", 0),
-                    "exit_time": datetime.now().strftime("%H:%M"),
+                    "exit_time": _now_bj.strftime("%H:%M"),
                     "exit_price": fut_exit,
                     "exit_reason": reason,
                     "pnl_pts": round(pnl_pts, 1),
@@ -1345,7 +1355,7 @@ class IntradayMonitor:
                     except Exception:
                         pass
                 close_signal = {
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "timestamp": _now_bj.strftime("%Y-%m-%d %H:%M:%S"),
                     "symbol": sym,
                     "contract": self._tq_symbols.get(sym, ""),
                     "direction": d_s,
@@ -1429,8 +1439,8 @@ class IntradayMonitor:
                 sc = self._get_routed_score(sym) or {}
                 self._shadow_positions[sym] = {
                     "direction": direction,
-                    "entry_time_utc": datetime.utcnow().strftime("%H:%M"),
-                    "entry_time_bj": datetime.now().strftime("%H:%M"),
+                    "entry_time_utc": _now_utc.strftime("%H:%M"),
+                    "entry_time_bj": _now_bj.strftime("%H:%M"),
                     "entry_price": float(entry_price),
                     "highest_since": float(entry_price),
                     "lowest_since": float(entry_price),
