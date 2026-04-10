@@ -257,8 +257,16 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
         high = float(bar_5m.iloc[-1]["high"])
         low = float(bar_5m.iloc[-1]["low"])
         signal_price = float(bar_5m.iloc[-1]["close"])  # 信号价 = 当前bar收盘（同源）
+        # 时间标签：bar_start + 5min = 执行时间（与monitor的_now_utc一致）
+        # monitor: _now_utc = completed_bar_datetime + 5min
         dt_str = str(all_bars.loc[idx, "datetime"])
-        utc_hm = dt_str[11:16]
+        bar_utc_hm = dt_str[11:16]  # bar开始时间
+        # +5min得到执行时间
+        _h, _m = int(bar_utc_hm[:2]), int(bar_utc_hm[3:5])
+        _m += 5
+        if _m >= 60:
+            _h += 1; _m -= 60
+        utc_hm = f"{_h:02d}:{_m:02d}"
         bj_time = _utc_to_bj(utc_hm)
 
         # 外部数据固定为中性值（消除backtest/monitor差异源，只保留vol_profile）
@@ -269,13 +277,20 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
         bar_15m_full = _build_15m_from_5m(bar_5m)
         bar_15m = bar_15m_full.iloc[:-1] if len(bar_15m_full) > 1 else bar_15m_full
 
-        # Score: daily=None, sentiment=None, zscore=None, is_high_vol=True
+        # 用update()代替score_all()——与monitor完全相同的代码路径
+        # update()内部调score_all + is_open_allowed + min_signal_score过滤
+        sig = gen.update(
+            sym, bar_5m, bar_15m, None, None,
+            sentiment=None, zscore=None, is_high_vol=True,
+            d_override=None, vol_profile=vol_profile,
+        )
+
+        # 同时获取score用于display（score_all不受is_open_allowed影响，面板始终显示）
         result = gen.score_all(
             sym, bar_5m, bar_15m, None, None, None,
             zscore=None, is_high_vol=True, d_override=None,
             vol_profile=vol_profile,
         )
-
         score = result["total"] if result else 0
         direction = result["direction"] if result else ""
         pre_z = result.get("pre_z_total", score) if result else 0
@@ -441,9 +456,12 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
             else:
                 _low_amplitude = False
 
-        if (position is None and not action_str and result and not in_cooldown
-                and score >= effective_threshold and direction and is_open_allowed(utc_hm)
+        if (position is None and not action_str and sig is not None and not in_cooldown
+                and sig.score >= effective_threshold
                 and not _low_amplitude):
+            # 用sig的direction（与monitor一致，update()返回的方向）
+            direction = sig.direction
+            score = sig.score
             # Apply slippage adversely on entry
             entry_p = price + slippage if direction == "LONG" else price - slippage
             # Compute rebound/pullback from recent 20-bar extreme (use signal bars)
@@ -791,7 +809,11 @@ def run_day_multi(symbols: List[str], td: str, db: DBManager,
 
     # ── 逐bar回放 ──
     for dt_str in sorted_times:
-        utc_hm = dt_str[11:16]
+        # 时间标签 +5min（与monitor _now_utc一致）
+        _bh, _bm = int(dt_str[11:13]), int(dt_str[14:16])
+        _bm += 5
+        if _bm >= 60: _bh += 1; _bm -= 60
+        utc_hm = f"{_bh:02d}:{_bm:02d}"
         bj_time = _utc_to_bj(utc_hm)
 
         # 0. 执行上一根bar产生的pending signals（用当前bar close做entry_price）
