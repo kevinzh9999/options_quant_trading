@@ -1019,15 +1019,25 @@ class IntradayMonitor:
                     continue
 
                 # 检查是否有新K线（用现货指数触发信号）
-                bar_updated = False
+                # 重要：先收集所有变化的品种，再统一处理一次
+                # 避免每个品种变化都触发全品种处理，导致同一根bar的逻辑重复执行
+                changed_syms = []
                 for sym in self.symbols:
                     sk = spot_klines_5m.get(sym)
                     if sk is not None and api.is_changing(sk):
-                        bar_updated = True
-                        self._on_new_bar(
-                            sym, spot_klines_5m, spot_klines_15m,
-                            fut_quotes, fut_klines_5m,
-                        )
+                        # per-symbol去重：用倒数第二根bar的datetime
+                        if len(sk) >= 2:
+                            completed_dt = int(sk.iloc[-2]["datetime"])
+                            prev_dt = self._last_bar_time.get(sym)
+                            if prev_dt != completed_dt:
+                                self._last_bar_time[sym] = completed_dt
+                                changed_syms.append(sym)
+                bar_updated = len(changed_syms) > 0
+                if bar_updated:
+                    self._on_new_bar(
+                        changed_syms, spot_klines_5m, spot_klines_15m,
+                        fut_quotes, fut_klines_5m,
+                    )
 
                 # 每次有新bar时刷新期货持仓（跟随5分钟频率）
                 if bar_updated:
@@ -1040,34 +1050,34 @@ class IntradayMonitor:
 
     def _on_new_bar(
         self,
-        updated_sym: str,
+        changed_syms: list,
         spot_klines_5m: Dict,
         spot_klines_15m: Dict,
         fut_quotes: Dict,
         fut_klines_5m: Dict = None,
     ) -> None:
-        """新K线到达时的处理——用现货K线驱动信号计算。"""
-        k5 = spot_klines_5m.get(updated_sym)
-        if k5 is None or len(k5) < 2:
-            return
-        # 去重：用倒数第二根bar的datetime
-        completed_dt = int(k5.iloc[-2]["datetime"])
-        prev_dt = self._last_bar_time.get(updated_sym)
-        if prev_dt == completed_dt:
-            return
-        self._last_bar_time[updated_sym] = completed_dt
+        """新K线到达时的处理——用现货K线驱动信号计算。
 
-        # Warmup: skip first bar
+        changed_syms: 本次有新bar的品种列表（去重已在调用方完成）。
+        全品种信号计算和shadow检查只执行一次。
+        """
+        if not changed_syms:
+            return
+
+        # Warmup: skip first bar（用第一个变化品种的时间戳判断）
         if not getattr(self, "_warmup_done", True):
             self._bars_since_start = getattr(self, "_bars_since_start", 0) + 1
             if self._bars_since_start <= 1:
-                try:
-                    ts = pd.Timestamp(completed_dt, unit="ns")
-                    if ts.minute % 5 != 0:
-                        print(f"  [WARMUP] Skipping misaligned bar {ts}")
-                        return
-                except Exception:
-                    pass
+                k5 = spot_klines_5m.get(changed_syms[0])
+                if k5 is not None and len(k5) >= 2:
+                    completed_dt = int(k5.iloc[-2]["datetime"])
+                    try:
+                        ts = pd.Timestamp(completed_dt, unit="ns")
+                        if ts.minute % 5 != 0:
+                            print(f"  [WARMUP] Skipping misaligned bar {ts}")
+                            return
+                    except Exception:
+                        pass
                 print(f"  [WARMUP] First aligned bar received, starting signals")
                 self._warmup_done = True
 
@@ -1088,17 +1098,6 @@ class IntradayMonitor:
                 df.index = pd.to_datetime(completed["datetime"], unit="ns")
                 if len(df) > 0:
                     bar_data[sym] = df
-                    # DEBUG: 检查TQ现货volume是否正常（Q分偏差排查，确认后删除）
-                    if sym == "IM" and len(df) >= 2:
-                        last_vol = float(df["volume"].iloc[-1])
-                        prev_vol = float(df["volume"].iloc[-2])
-                        avg20 = float(df["volume"].tail(20).mean())
-                        ratio = last_vol / avg20 if avg20 > 0 else 0
-                        last_dt = df.index[-1].strftime("%H:%M") if hasattr(df.index[-1], 'strftime') else str(df.index[-1])
-                        print(f"  [Q-DEBUG] IM {last_dt}"
-                              f" kline_vol={last_vol:.0f}"
-                              f" prev_vol={prev_vol:.0f}"
-                              f" avg20={avg20:.0f} ratio={ratio:.2f}", flush=True)
 
             k15 = spot_klines_15m.get(sym)
             if k15 is not None and len(k15) > 1:
