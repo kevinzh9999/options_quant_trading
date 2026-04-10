@@ -44,7 +44,7 @@ class IntradayConfig(StrategyConfig):
     volume_surge_ratio: float = 1.5
     trend_fast_period: int = 10
     trend_slow_period: int = 30
-    min_signal_score: int = 60
+    min_signal_score: int = 50
 
     # 仓位参数
     max_lots_per_symbol: int = 1

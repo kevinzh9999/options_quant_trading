@@ -1140,22 +1140,22 @@ class IntradayMonitor:
             if zp and cur_price > 0 and zp["std20"] > 0:
                 z_val = (cur_price - zp["ema20"]) / zp["std20"]
 
-            # 路由版本评分（含情绪乘数 + Z-Score过滤 + 波动率区间 + briefing d_override）
+            # 路由版本评分
+            # 外部数据固定为中性值（消除backtest/monitor差异源，只保留vol_profile）
+            # TODO: 验证对齐后恢复动态值
             ver = SIGNAL_ROUTING.get(sym, "v2")
-            hv = self._is_high_vol
-            d_ovr = self._d_override
             _vp = self._vol_profiles.get(sym)
             if ver == "v3":
                 sc3 = self.signal_v3.score_all(
-                    sym, b5, b15, daily, qd, self._sentiment,
-                    zscore=z_val, is_high_vol=hv, d_override=d_ovr,
+                    sym, b5, b15, None, qd, None,
+                    zscore=None, is_high_vol=True, d_override=None,
                     vol_profile=_vp)
                 if sc3:
                     self._latest_scores_v3[sym] = sc3
             else:
                 sc2 = self.signal_v2.score_all(
-                    sym, b5, b15, daily, qd, self._sentiment,
-                    zscore=z_val, is_high_vol=hv, d_override=d_ovr,
+                    sym, b5, b15, None, qd, None,
+                    zscore=None, is_high_vol=True, d_override=None,
                     vol_profile=_vp)
                 if sc2:
                     self._latest_scores_v2[sym] = sc2
@@ -1163,14 +1163,15 @@ class IntradayMonitor:
             # 面板辅助显示数据（VWAP, 趋势, 开盘区间, BOLL）
             self._display_data[sym] = self._calc_display_data(b5, b15)
 
-        # 运行策略（传入zscore/is_high_vol/sentiment/d_override/vol_profiles参数，和面板评分一致）
+        # 运行策略（外部数据固定为中性值，与score_all调用一致）
+        # TODO: 验证对齐后恢复动态值
         actions = self.strategy.on_bar(
-            bar_data, bar_15m_data, self._daily_data or None, current_time_utc,
+            bar_data, bar_15m_data, None, current_time_utc,
             quote_data=quote_dict,
-            zscore_params=self._zscore_params,
-            is_high_vol=self._is_high_vol,
-            sentiment=self._sentiment,
-            d_override=self._d_override,
+            zscore_params={},
+            is_high_vol=True,
+            sentiment=None,
+            d_override=None,
             vol_profiles=self._vol_profiles,
         )
 

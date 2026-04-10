@@ -172,9 +172,9 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
     # Select signal generator version
     _ver = version if version != "auto" else SIGNAL_ROUTING.get(sym, "v2")
     if _ver == "v3":
-        gen = SignalGeneratorV3({"min_signal_score": 60})
+        gen = SignalGeneratorV3({"min_signal_score": 50})
     else:
-        gen = SignalGeneratorV2({"min_signal_score": 60})
+        gen = SignalGeneratorV2({"min_signal_score": 50})
 
     # Per-symbol threshold（IC=65等，从SYMBOL_PROFILES读取）
     from strategies.intraday.A_share_momentum_signal_v2 import SYMBOL_PROFILES, _DEFAULT_PROFILE
@@ -261,17 +261,18 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
         utc_hm = dt_str[11:16]
         bj_time = _utc_to_bj(utc_hm)
 
-        z_val = (signal_price - ema20) / std20 if std20 > 0 else None
+        # 外部数据固定为中性值（消除backtest/monitor差异源，只保留vol_profile）
+        # TODO: 验证对齐后恢复动态值
+        z_val = None  # zscore固定
 
         # Build 15m bars from 5m data, 排除最后一根forming 15m bar
-        # 和TQ原生15m一致
         bar_15m_full = _build_15m_from_5m(bar_5m)
         bar_15m = bar_15m_full.iloc[:-1] if len(bar_15m_full) > 1 else bar_15m_full
 
-        # Score using all completed bars (including current bar, matching monitor)
+        # Score: daily=None, sentiment=None, zscore=None, is_high_vol=True
         result = gen.score_all(
-            sym, bar_5m, bar_15m, daily_df, None, sentiment,
-            zscore=z_val, is_high_vol=is_high_vol, d_override=d_override,
+            sym, bar_5m, bar_15m, None, None, None,
+            zscore=None, is_high_vol=True, d_override=None,
             vol_profile=vol_profile,
         )
 
@@ -347,7 +348,7 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                 exit_info = check_exit(
                     position, price, bar_5m,
                     bar_15m if not bar_15m.empty else None,
-                    utc_hm, reverse_score, is_high_vol=is_high_vol,
+                    utc_hm, reverse_score, is_high_vol=True,
                     symbol=sym,
                 )
 
@@ -690,7 +691,7 @@ def run_day_multi(symbols: List[str], td: str, db: DBManager,
         today_indices_map[sym] = today_idx
         vol_profile_map[sym] = compute_volume_profile(
             bars[["datetime", "volume"]], before_date=td, lookback_days=20)
-        gen_map[sym] = SignalGeneratorV2({"min_signal_score": 60})
+        gen_map[sym] = SignalGeneratorV2({"min_signal_score": 50})
 
     if not all_bars_map:
         return {sym: [] for sym in symbols}
@@ -765,8 +766,6 @@ def run_day_multi(symbols: List[str], td: str, db: DBManager,
     last_exit_utc: Dict[str, str] = {sym: "" for sym in symbols}
     last_exit_dir: Dict[str, str] = {sym: "" for sym in symbols}
     low_amplitude: Dict[str, Optional[bool]] = {sym: None for sym in symbols}
-    # Pending signal: 信号在bar T触发，entry在bar T+1执行（与monitor一致）
-    pending_signals: Dict[str, Optional[Dict]] = {sym: None for sym in symbols}
     prev_close: Dict[str, float] = {}
     gap_pct: Dict[str, float] = {}
     today_open: Dict[str, float] = {}
@@ -883,10 +882,10 @@ def run_day_multi(symbols: List[str], td: str, db: DBManager,
             bar_15m_full = _build_15m_from_5m(bar_5m)
             bar_15m = bar_15m_full.iloc[:-1] if len(bar_15m_full) > 1 else bar_15m_full
 
-            # Reverse score for check_exit
+            # Reverse score for check_exit（外部数据固定中性值）
             result = gen_map[sym].score_all(
-                sym, bar_5m, bar_15m, daily_map.get(sym), None, sentiment,
-                zscore=None, is_high_vol=is_high_vol, d_override=None,
+                sym, bar_5m, bar_15m, None, None, None,
+                zscore=None, is_high_vol=True, d_override=None,
                 vol_profile=vol_profile_map.get(sym),
             )
             score = result["total"] if result else 0
@@ -899,7 +898,7 @@ def run_day_multi(symbols: List[str], td: str, db: DBManager,
 
             exit_info = check_exit(
                 position, price, bar_5m, bar_15m if not bar_15m.empty else None,
-                utc_hm, reverse_score, is_high_vol=is_high_vol, symbol=sym,
+                utc_hm, reverse_score, is_high_vol=True, symbol=sym,
             )
             if exit_info["should_exit"]:
                 entry_p = position["entry_price"]
@@ -961,12 +960,10 @@ def run_day_multi(symbols: List[str], td: str, db: DBManager,
             bar_15m_full = _build_15m_from_5m(bar_5m)
             bar_15m = bar_15m_full.iloc[:-1] if len(bar_15m_full) > 1 else bar_15m_full
 
-            ema20, std20 = zscore_map.get(sym, (0, 0))
-            z_val = (price - ema20) / std20 if std20 > 0 else None
-
+            # 外部数据固定中性值
             result = gen_map[sym].score_all(
-                sym, bar_5m, bar_15m, daily_map.get(sym), None, sentiment,
-                zscore=z_val, is_high_vol=is_high_vol, d_override=None,
+                sym, bar_5m, bar_15m, None, None, None,
+                zscore=None, is_high_vol=True, d_override=None,
                 vol_profile=vol_profile_map.get(sym),
             )
             if result is None:

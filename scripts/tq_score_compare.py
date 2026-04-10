@@ -97,10 +97,10 @@ def run_compare(td: str, sym: str = 'IM'):
         bar_15m_full = _build_15m_from_5m(bar_5m)
         bar_15m = bar_15m_full.iloc[:-1] if len(bar_15m_full) > 1 else bar_15m_full
         price = float(bar_5m.iloc[-1]['close'])
-        z_val = (price - ema20) / std20 if std20 > 0 else None
+        # 外部数据固定中性值（与monitor/backtest一致）
         result = gen_bt.score_all(
-            sym, bar_5m, bar_15m, daily_df, None, sentiment,
-            zscore=z_val, is_high_vol=is_high_vol, d_override=None,
+            sym, bar_5m, bar_15m, None, None, None,
+            zscore=None, is_high_vol=True, d_override=None,
             vol_profile=vol_profile,
         )
         dt_str = str(all_bars.loc[idx, 'datetime'])
