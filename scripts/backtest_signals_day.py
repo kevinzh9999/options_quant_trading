@@ -641,6 +641,408 @@ def _calc_minutes(t1: str, t2: str) -> int:
         return 0
 
 
+def run_day_multi(symbols: List[str], td: str, db: DBManager,
+                  verbose: bool = True, slippage: float = 0,
+                  max_total_lots: int = 2) -> Dict[str, List[Dict]]:
+    """多品种联合回测：共享position_mgr，与monitor行为一致。
+
+    Args:
+        symbols: 品种列表 e.g. ["IM", "IC"]
+        td: 日期 YYYYMMDD
+        max_total_lots: 全品种最大同时持仓数（monitor默认=2）
+
+    Returns:
+        {symbol: [trades]} dict
+    """
+    from strategies.intraday.A_share_momentum_signal_v2 import (
+        SignalGeneratorV2, SentimentData, check_exit, is_open_allowed,
+        SIGNAL_ROUTING, compute_volume_profile, check_low_amplitude,
+        SYMBOL_PROFILES, _DEFAULT_PROFILE,
+    )
+
+    date_dash = f"{td[:4]}-{td[4:6]}-{td[6:]}"
+    _SPOT_SYM = {"IM": "000852", "IF": "000300", "IH": "000016", "IC": "000905"}
+    _SPOT_IDX = {"IM": "000852.SH", "IF": "000300.SH", "IH": "000016.SH", "IC": "000905.SH"}
+    COOLDOWN_MINUTES = 15
+
+    # ── 加载所有品种的bar数据 ──
+    all_bars_map: Dict[str, pd.DataFrame] = {}
+    today_indices_map: Dict[str, list] = {}
+    vol_profile_map: Dict[str, dict] = {}
+    gen_map: Dict[str, SignalGeneratorV2] = {}
+
+    for sym in symbols:
+        spot_sym = _SPOT_SYM.get(sym)
+        bars = db.query_df(
+            f"SELECT datetime, open, high, low, close, volume "
+            f"FROM index_min WHERE symbol='{spot_sym}' AND period=300 "
+            f"ORDER BY datetime"
+        )
+        if bars is None or bars.empty:
+            continue
+        for c in ["open", "high", "low", "close", "volume"]:
+            bars[c] = bars[c].astype(float)
+        today_mask = bars["datetime"].str.startswith(date_dash)
+        today_idx = bars.index[today_mask].tolist()
+        if not today_idx:
+            continue
+        all_bars_map[sym] = bars
+        today_indices_map[sym] = today_idx
+        vol_profile_map[sym] = compute_volume_profile(
+            bars[["datetime", "volume"]], before_date=td, lookback_days=20)
+        gen_map[sym] = SignalGeneratorV2({"min_signal_score": 60})
+
+    if not all_bars_map:
+        return {sym: [] for sym in symbols}
+
+    # ── 共享数据加载（日线、zscore、sentiment、GARCH regime）──
+    daily_map: Dict[str, pd.DataFrame] = {}
+    zscore_map: Dict[str, tuple] = {}  # (ema20, std20)
+    for sym in symbols:
+        idx_code = _SPOT_IDX.get(sym)
+        if not idx_code:
+            continue
+        daily_all = db.query_df(
+            f"SELECT trade_date, close as open, close as high, close as low, close, 0 as volume "
+            f"FROM index_daily WHERE ts_code='{idx_code}' ORDER BY trade_date"
+        )
+        if daily_all is not None and not daily_all.empty:
+            daily_all["close"] = daily_all["close"].astype(float)
+            daily_map[sym] = daily_all[daily_all["trade_date"] < td].tail(30).reset_index(drop=True)
+        spot_all = db.query_df(
+            f"SELECT close FROM index_daily WHERE ts_code='{idx_code}' "
+            f"AND trade_date < '{td}' ORDER BY trade_date DESC LIMIT 30"
+        )
+        if spot_all is not None and len(spot_all) >= 20:
+            closes = spot_all["close"].astype(float).iloc[::-1].reset_index(drop=True)
+            ema20 = float(closes.ewm(span=20).mean().iloc[-1])
+            std20 = float(closes.rolling(20).std().iloc[-1])
+            zscore_map[sym] = (ema20, std20)
+
+    # Sentiment（与monitor统一）
+    sentiment = None
+    try:
+        sdf = db.query_df(
+            "SELECT atm_iv, atm_iv_market, vrp, term_structure_shape, rr_25d "
+            f"FROM daily_model_output WHERE underlying='IM' AND trade_date < '{td}' "
+            "ORDER BY trade_date DESC LIMIT 2"
+        )
+        if sdf is not None and len(sdf) >= 1:
+            cur, prev = sdf.iloc[0], (sdf.iloc[1] if len(sdf) >= 2 else sdf.iloc[0])
+            sentiment = SentimentData(
+                atm_iv=float(cur.get("atm_iv_market") or cur.get("atm_iv") or 0),
+                atm_iv_prev=float(prev.get("atm_iv_market") or prev.get("atm_iv") or 0),
+                rr_25d=float(cur.get("rr_25d") or 0),
+                rr_25d_prev=float(prev.get("rr_25d") or 0),
+                vrp=float(cur.get("vrp") or 0),
+                term_structure=str(cur.get("term_structure_shape") or ""),
+            )
+    except Exception:
+        pass
+
+    # GARCH regime
+    is_high_vol = True
+    dmo = db.query_df(
+        "SELECT garch_forecast_vol FROM daily_model_output "
+        f"WHERE underlying='IM' AND garch_forecast_vol > 0 AND trade_date < '{td}' "
+        "ORDER BY trade_date DESC LIMIT 1"
+    )
+    if dmo is not None and not dmo.empty:
+        is_high_vol = (float(dmo.iloc[0].iloc[0]) * 100 / 24.9) > 1.2
+
+    # ── 建立统一时间轴 ──
+    # 取所有品种today_indices的并集，按时间排序
+    all_times = set()
+    for sym in symbols:
+        if sym in all_bars_map:
+            for idx in today_indices_map[sym]:
+                all_times.add(str(all_bars_map[sym].loc[idx, "datetime"]))
+    sorted_times = sorted(all_times)
+
+    # ── Per-symbol状态 ──
+    positions: Dict[str, Optional[Dict]] = {sym: None for sym in symbols}
+    completed_trades: Dict[str, List[Dict]] = {sym: [] for sym in symbols}
+    last_exit_utc: Dict[str, str] = {sym: "" for sym in symbols}
+    last_exit_dir: Dict[str, str] = {sym: "" for sym in symbols}
+    low_amplitude: Dict[str, Optional[bool]] = {sym: None for sym in symbols}
+    # Pending signal: 信号在bar T触发，entry在bar T+1执行（与monitor一致）
+    pending_signals: Dict[str, Optional[Dict]] = {sym: None for sym in symbols}
+    prev_close: Dict[str, float] = {}
+    gap_pct: Dict[str, float] = {}
+    today_open: Dict[str, float] = {}
+
+    # Precompute prev_close and gap
+    for sym in symbols:
+        ddf = daily_map.get(sym)
+        if ddf is not None and len(ddf) > 0:
+            prev_close[sym] = float(ddf.iloc[-1]["close"])
+        else:
+            prev_close[sym] = 0.0
+        if sym in today_indices_map and prev_close[sym] > 0:
+            first_idx = today_indices_map[sym][0]
+            _open = float(all_bars_map[sym].loc[first_idx, "open"])
+            today_open[sym] = _open
+            gap_pct[sym] = (_open - prev_close[sym]) / prev_close[sym]
+        else:
+            today_open[sym] = 0.0
+            gap_pct[sym] = 0.0
+
+    def _total_positions() -> int:
+        return sum(1 for p in positions.values() if p is not None)
+
+    # ── 逐bar回放 ──
+    for dt_str in sorted_times:
+        utc_hm = dt_str[11:16]
+        bj_time = _utc_to_bj(utc_hm)
+
+        # 0. 执行上一根bar产生的pending signals（用当前bar close做entry_price）
+        # 在exit check之前执行：与monitor一致（开仓当bar可能被同bar exit）
+        for sym in symbols:
+            ps = pending_signals[sym]
+            if ps is None:
+                continue
+            pending_signals[sym] = None
+            if sym not in all_bars_map:
+                continue
+            if _total_positions() >= max_total_lots:
+                continue
+            if positions[sym] is not None:
+                continue
+            bars = all_bars_map[sym]
+            mask = bars["datetime"] <= dt_str
+            cur_bars = bars[mask]
+            if cur_bars.empty:
+                continue
+            exec_price = float(cur_bars.iloc[-1]["close"])
+            exec_high = float(cur_bars.iloc[-1]["high"])
+            exec_low = float(cur_bars.iloc[-1]["low"])
+
+            entry_p = exec_price + slippage if ps["direction"] == "LONG" else exec_price - slippage
+            _sl_pct = SYMBOL_PROFILES.get(sym, _DEFAULT_PROFILE).get("stop_loss_pct", STOP_LOSS_PCT)
+            stop = entry_p * (1 - _sl_pct) if ps["direction"] == "LONG" else entry_p * (1 + _sl_pct)
+            positions[sym] = {
+                "entry_price": entry_p, "direction": ps["direction"],
+                "entry_time_utc": utc_hm,
+                "highest_since": exec_high,
+                "lowest_since": exec_low,
+                "stop_loss": stop, "volume": 1, "half_closed": False,
+                "bars_below_mid": 0, "entry_score": ps["score"],
+            }
+
+        # 1. 对所有有持仓的品种检查exit
+        for sym in symbols:
+            if positions[sym] is None:
+                continue
+            if sym not in all_bars_map:
+                continue
+            bars = all_bars_map[sym]
+            mask = bars["datetime"] <= dt_str
+            bar_5m = bars[mask].tail(200).copy()
+            if len(bar_5m) < 2:
+                continue
+            bar_5m.index = pd.to_datetime(bar_5m["datetime"])
+
+            price = float(bar_5m.iloc[-1]["close"])
+            high = float(bar_5m.iloc[-1]["high"])
+            low = float(bar_5m.iloc[-1]["low"])
+            position = positions[sym]
+
+            # P0: Bar high/low 止损检查
+            stop_price = position.get("stop_loss", 0)
+            bar_stopped = False
+            if stop_price > 0:
+                if position["direction"] == "LONG" and low <= stop_price:
+                    bar_stopped = True
+                elif position["direction"] == "SHORT" and high >= stop_price:
+                    bar_stopped = True
+
+            if bar_stopped:
+                entry_p = position["entry_price"]
+                exit_p = stop_price - slippage if position["direction"] == "LONG" else stop_price + slippage
+                pnl_pts = (exit_p - entry_p) if position["direction"] == "LONG" else (entry_p - exit_p)
+                elapsed = _calc_minutes(position["entry_time_utc"], utc_hm)
+                completed_trades[sym].append({
+                    "entry_time": _utc_to_bj(position["entry_time_utc"]),
+                    "entry_price": entry_p, "exit_time": bj_time, "exit_price": exit_p,
+                    "direction": position["direction"], "pnl_pts": pnl_pts,
+                    "reason": "STOP_LOSS", "minutes": elapsed,
+                    "entry_score": position.get("entry_score", 0),
+                })
+                last_exit_utc[sym] = utc_hm
+                last_exit_dir[sym] = position["direction"]
+                positions[sym] = None
+                continue
+
+            # Update extremes
+            if position["direction"] == "LONG":
+                position["highest_since"] = max(position.get("highest_since", price), high)
+            else:
+                position["lowest_since"] = min(position.get("lowest_since", price), low)
+
+            # check_exit
+            bar_15m_full = _build_15m_from_5m(bar_5m)
+            bar_15m = bar_15m_full.iloc[:-1] if len(bar_15m_full) > 1 else bar_15m_full
+
+            # Reverse score for check_exit
+            result = gen_map[sym].score_all(
+                sym, bar_5m, bar_15m, daily_map.get(sym), None, sentiment,
+                zscore=None, is_high_vol=is_high_vol, d_override=None,
+                vol_profile=vol_profile_map.get(sym),
+            )
+            score = result["total"] if result else 0
+            direction = result["direction"] if result else ""
+            reverse_score = 0
+            if result and direction:
+                if (direction == "SHORT" and position["direction"] == "LONG") or \
+                   (direction == "LONG" and position["direction"] == "SHORT"):
+                    reverse_score = score
+
+            exit_info = check_exit(
+                position, price, bar_5m, bar_15m if not bar_15m.empty else None,
+                utc_hm, reverse_score, is_high_vol=is_high_vol, symbol=sym,
+            )
+            if exit_info["should_exit"]:
+                entry_p = position["entry_price"]
+                exit_p = price - slippage if position["direction"] == "LONG" else price + slippage
+                pnl_pts = (exit_p - entry_p) if position["direction"] == "LONG" else (entry_p - exit_p)
+                elapsed = _calc_minutes(position["entry_time_utc"], utc_hm)
+                completed_trades[sym].append({
+                    "entry_time": _utc_to_bj(position["entry_time_utc"]),
+                    "entry_price": entry_p, "exit_time": bj_time, "exit_price": exit_p,
+                    "direction": position["direction"], "pnl_pts": pnl_pts,
+                    "reason": exit_info["exit_reason"], "minutes": elapsed,
+                    "entry_score": position.get("entry_score", 0),
+                })
+                last_exit_utc[sym] = utc_hm
+                last_exit_dir[sym] = position["direction"]
+                positions[sym] = None
+
+        # 2. 生成所有品种的信号，按score排序
+        candidates = []
+        for sym in symbols:
+            if positions[sym] is not None:
+                continue
+            if sym not in all_bars_map:
+                continue
+            bars = all_bars_map[sym]
+            mask = bars["datetime"] <= dt_str
+            bar_5m = bars[mask].tail(200).copy()
+            if len(bar_5m) < 16:
+                continue
+            bar_5m.index = pd.to_datetime(bar_5m["datetime"])
+
+            price = float(bar_5m.iloc[-1]["close"])
+
+            if not is_open_allowed(utc_hm):
+                continue
+
+            # Cooldown
+            if last_exit_utc[sym] and last_exit_dir[sym]:
+                cd_elapsed = _calc_minutes(last_exit_utc[sym], utc_hm)
+                if 0 < cd_elapsed < COOLDOWN_MINUTES:
+                    # 检查方向
+                    pass  # need to know direction first, check after scoring
+
+            # 振幅过滤
+            if utc_hm >= "02:00" and low_amplitude[sym] is None:
+                today_idx = today_indices_map[sym]
+                bar_idx_in_day = 0
+                for i, tidx in enumerate(today_idx):
+                    if str(bars.loc[tidx, "datetime"]) <= dt_str:
+                        bar_idx_in_day = i
+                if bar_idx_in_day >= 6:
+                    today_first6 = bars.loc[today_idx[:6]]
+                    low_amplitude[sym] = check_low_amplitude(today_first6)
+                else:
+                    low_amplitude[sym] = False
+            if low_amplitude.get(sym, False):
+                continue
+
+            bar_15m_full = _build_15m_from_5m(bar_5m)
+            bar_15m = bar_15m_full.iloc[:-1] if len(bar_15m_full) > 1 else bar_15m_full
+
+            ema20, std20 = zscore_map.get(sym, (0, 0))
+            z_val = (price - ema20) / std20 if std20 > 0 else None
+
+            result = gen_map[sym].score_all(
+                sym, bar_5m, bar_15m, daily_map.get(sym), None, sentiment,
+                zscore=z_val, is_high_vol=is_high_vol, d_override=None,
+                vol_profile=vol_profile_map.get(sym),
+            )
+            if result is None:
+                continue
+            score = result["total"]
+            direction = result["direction"]
+            if not direction or score < SYMBOL_PROFILES.get(sym, _DEFAULT_PROFILE).get(
+                    "signal_threshold", _SIGNAL_THRESHOLD):
+                continue
+
+            # Cooldown check (now we know direction)
+            # >=0: 同bar退出后也算cooldown（防止TREND_COMPLETE后立即重入）
+            if last_exit_utc[sym] and last_exit_dir[sym] == direction:
+                cd_elapsed = _calc_minutes(last_exit_utc[sym], utc_hm)
+                if 0 <= cd_elapsed < COOLDOWN_MINUTES:
+                    continue
+
+            candidates.append({
+                "sym": sym, "score": score, "direction": direction,
+                "price": price, "result": result, "bar_5m": bar_5m,
+                "z_val": z_val,
+            })
+
+        # 3. 按score排序，创建pending signal（下一根bar执行，与monitor一致）
+        candidates.sort(key=lambda x: -x["score"])
+        for cand in candidates:
+            # 检查下一bar能否开仓（当前持仓+已有pending）
+            n_pending = sum(1 for p in pending_signals.values() if p is not None)
+            if _total_positions() + n_pending >= max_total_lots:
+                break
+            sym = cand["sym"]
+            if positions[sym] is not None or pending_signals[sym] is not None:
+                continue
+            pending_signals[sym] = {
+                "direction": cand["direction"],
+                "score": cand["score"],
+                "signal_time_utc": utc_hm,
+            }
+
+    # ── EOD强制平仓 ──
+    for sym in symbols:
+        if positions[sym] is None:
+            continue
+        if sym not in all_bars_map:
+            continue
+        bars = all_bars_map[sym]
+        last_idx = today_indices_map[sym][-1] if today_indices_map.get(sym) else None
+        if last_idx is None:
+            continue
+        price = float(bars.loc[last_idx, "close"])
+        position = positions[sym]
+        entry_p = position["entry_price"]
+        pnl_pts = (price - entry_p) if position["direction"] == "LONG" else (entry_p - price)
+        elapsed = _calc_minutes(position["entry_time_utc"],
+                                str(bars.loc[last_idx, "datetime"])[11:16])
+        completed_trades[sym].append({
+            "entry_time": _utc_to_bj(position["entry_time_utc"]),
+            "entry_price": entry_p, "exit_time": "15:00", "exit_price": price,
+            "direction": position["direction"], "pnl_pts": pnl_pts,
+            "reason": "EOD_CLOSE", "minutes": elapsed,
+            "entry_score": position.get("entry_score", 0),
+        })
+        positions[sym] = None
+
+    # ── 输出 ──
+    if verbose:
+        for sym in symbols:
+            trades = completed_trades[sym]
+            pnl = sum(t["pnl_pts"] for t in trades)
+            print(f"  {sym}: {len(trades)}笔 {pnl:+.1f}pt  "
+                  + "  ".join(f"{t['entry_time']}→{t['exit_time']} {t['pnl_pts']:+.1f}"
+                             for t in trades))
+
+    return completed_trades
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", default="IM")
