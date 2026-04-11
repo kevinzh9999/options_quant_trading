@@ -187,6 +187,13 @@ def enrich_trades(trades_df, ohlcv_df, n_bars_list=[12, 24, 48], amp_threshold=0
             'entry_score': score,
             'pnl_pts': trade.get('pnl_pts', 0),
             'exit_reason': trade.get('reason', ''),
+            # M/V/Q/B/S分量（向后兼容：旧数据没有这些字段时默认0）
+            'entry_m': trade.get('entry_m_score', 0),
+            'entry_v': trade.get('entry_v_score', 0),
+            'entry_q': trade.get('entry_q_score', 0),
+            'entry_b': trade.get('entry_b_score', 0),
+            'entry_s': trade.get('entry_s_score', 0),
+            'entry_raw': trade.get('entry_raw_total', 0),
         }
 
         # Regime
