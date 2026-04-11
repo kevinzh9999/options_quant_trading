@@ -29,8 +29,10 @@ logger = logging.getLogger(__name__)
 # ts_code 含 % 时使用 LIKE，否则使用 =
 _LIKE_OPERATORS = {True: "LIKE", False: "="}
 
-# 期权相关表名集合，用于路由到 options DB
+# 表名→库路由（主库以外的表）
 _OPTIONS_TABLE_NAMES = {"options_daily", "options_contracts", "options_min"}
+_TICK_TABLE_NAMES = {"futures_tick"}
+_ETF_TABLE_NAMES = {"etf_min"}
 
 
 def _open_conn(db_path: str) -> sqlite3.Connection:
@@ -46,23 +48,37 @@ def _open_conn(db_path: str) -> sqlite3.Connection:
 
 class DBManager:
     """
-    SQLite 数据库管理器（双库模式）。
+    SQLite 数据库管理器（四库模式）。
 
     Parameters
     ----------
     db_path : str
         主数据库文件路径（trading.db）。
     options_db_path : str | None
-        期权数据库路径（options_data.db）。为 None 时退化为单库模式（向后兼容）。
+        期权数据库路径（options_data.db）。
+    tick_db_path : str | None
+        Tick数据库路径（tick_data.db）。
+    etf_db_path : str | None
+        ETF数据库路径（etf_data.db）。
     """
 
-    def __init__(self, db_path: str, options_db_path: str | None = None) -> None:
+    def __init__(self, db_path: str, options_db_path: str | None = None,
+                 tick_db_path: str | None = None,
+                 etf_db_path: str | None = None) -> None:
         self.db_path = db_path
         self.options_db_path = options_db_path
+        self.tick_db_path = tick_db_path
+        self.etf_db_path = etf_db_path
         self._conn = _open_conn(db_path)
         self._options_conn: sqlite3.Connection | None = None
+        self._tick_conn: sqlite3.Connection | None = None
+        self._etf_conn: sqlite3.Connection | None = None
         if options_db_path:
             self._options_conn = _open_conn(options_db_path)
+        if tick_db_path:
+            self._tick_conn = _open_conn(tick_db_path)
+        if etf_db_path:
+            self._etf_conn = _open_conn(etf_db_path)
         self.initialize_tables()
 
     # ------------------------------------------------------------------
@@ -70,20 +86,35 @@ class DBManager:
     # ------------------------------------------------------------------
 
     def _conn_for_table(self, table_name: str) -> sqlite3.Connection:
-        """根据表名路由到主库或期权库。"""
+        """根据表名路由到对应数据库。"""
         if self._options_conn and table_name in _OPTIONS_TABLE_NAMES:
             return self._options_conn
+        if self._tick_conn and table_name in _TICK_TABLE_NAMES:
+            return self._tick_conn
+        if self._etf_conn and table_name in _ETF_TABLE_NAMES:
+            return self._etf_conn
         return self._conn
 
     def initialize_tables(self) -> None:
         """执行所有 CREATE TABLE IF NOT EXISTS 语句（幂等）。"""
+        from data.storage.schemas import TICK_TABLES, ETF_TABLES
         for ddl in ALL_TABLES:
             self._conn.executescript(ddl)
-        # 期权表只建在 options DB（不建在主库，防止路由混淆）
+        # 期权表只建在 options DB
         if self._options_conn:
             for ddl in OPTIONS_TABLES:
                 self._options_conn.executescript(ddl)
             self._options_conn.commit()
+        # Tick表建在 tick DB
+        if self._tick_conn:
+            for ddl in TICK_TABLES:
+                self._tick_conn.executescript(ddl)
+            self._tick_conn.commit()
+        # ETF表建在 etf DB
+        if self._etf_conn:
+            for ddl in ETF_TABLES:
+                self._etf_conn.executescript(ddl)
+            self._etf_conn.commit()
         # 增量 ALTER TABLE（新增列，列已存在时静默忽略）
         for alter_sql in DAILY_MODEL_OUTPUT_ALTER_SQLS + SIGNAL_LOG_ALTER_SQLS:
             try:
@@ -133,11 +164,19 @@ class DBManager:
 
     def _conn_for_sql(self, sql: str) -> sqlite3.Connection:
         """根据 SQL 语句中的表名路由到合适的连接。"""
+        sql_lower = sql.lower()
         if self._options_conn:
-            sql_lower = sql.lower()
             for tbl in _OPTIONS_TABLE_NAMES:
                 if tbl in sql_lower:
                     return self._options_conn
+        if self._tick_conn:
+            for tbl in _TICK_TABLE_NAMES:
+                if tbl in sql_lower:
+                    return self._tick_conn
+        if self._etf_conn:
+            for tbl in _ETF_TABLE_NAMES:
+                if tbl in sql_lower:
+                    return self._etf_conn
         return self._conn
 
     def query(self, sql: str, params: Optional[tuple] = None) -> pd.DataFrame:
@@ -415,10 +454,14 @@ class DBManager:
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """关闭数据库连接，释放资源。"""
+        """关闭��据库连接，释放资源。"""
         self._conn.close()
         if self._options_conn:
             self._options_conn.close()
+        if self._tick_conn:
+            self._tick_conn.close()
+        if self._etf_conn:
+            self._etf_conn.close()
         logger.debug("数据库连接已关闭: %s", self.db_path)
 
     def __enter__(self) -> "DBManager":
@@ -466,15 +509,20 @@ class DBManager:
 
 def get_db(config=None) -> DBManager:
     """
-    创建标准的双库 DBManager（推荐入口）。
+    创建标准的四库 DBManager（推荐入口）���
 
-    自动从 ConfigLoader 获取 trading.db 和 options_data.db 路径。
-    所有代码统一用此函数创建 DBManager，确保期权表路由正确。
+    自动从 ConfigLoader 获取 trading.db / options_data.db / tick_data.db / etf_data.db 路径。
+    所有代码统一用此函数创建 DBManager，确保表路由正确。
     """
     if config is None:
         from config.config_loader import ConfigLoader
         config = ConfigLoader()
-    return DBManager(config.get_db_path(), config.get_options_db_path())
+    return DBManager(
+        config.get_db_path(),
+        config.get_options_db_path(),
+        config.get_tick_db_path(),
+        config.get_etf_db_path(),
+    )
 
 
 # ======================================================================

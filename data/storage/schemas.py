@@ -850,6 +850,14 @@ OPTIONS_TABLES: list[str] = [
     OPTIONS_MIN_SQL,
 ]
 
+TICK_TABLES: list[str] = [
+    FUTURES_TICK_SQL,
+]
+
+ETF_TABLES: list[str] = [
+    ETF_MIN_SQL,
+]
+
 # ---------------------------------------------------------------------------
 # 主库表（trading.db）— 不含期权表
 # ---------------------------------------------------------------------------

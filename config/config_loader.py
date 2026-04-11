@@ -195,6 +195,22 @@ class ConfigLoader:
             p = _PROJECT_ROOT / p
         return str(p)
 
+    def get_tick_db_path(self) -> str:
+        """Tick数据库路径（tick_data.db）。"""
+        raw_path: str = self.get("database.tick_path", "data/storage/tick_data.db")
+        p = Path(raw_path)
+        if not p.is_absolute():
+            p = _PROJECT_ROOT / p
+        return str(p)
+
+    def get_etf_db_path(self) -> str:
+        """ETF数据库路径（etf_data.db）。"""
+        raw_path: str = self.get("database.etf_path", "data/storage/etf_data.db")
+        p = Path(raw_path)
+        if not p.is_absolute():
+            p = _PROJECT_ROOT / p
+        return str(p)
+
     def get_tmp_dir(self) -> str:
         """项目级 tmp 目录，所有运行时临时文件放这里。"""
         tmp_dir = _PROJECT_ROOT / "tmp"
