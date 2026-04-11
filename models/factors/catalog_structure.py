@@ -143,6 +143,50 @@ class HorizontalReversalFactor(Factor):
         return reversal_strength
 
 
+class HorizontalReversalSimple(Factor):
+    """简化版横盘反转因子。完全忠于主观观察，没有额外条件。
+
+    逻辑：
+    1. 过去K根bar的前置动量判断趋势方向
+    2. 最近N根bar没有创出趋势方向的新极值→停滞
+    3. 停滞→预测反转
+
+    输出：+1=下跌后横盘预测反转上涨, -1=上涨后横盘预测反转下跌, 0=无信号
+    """
+    category = "structure"
+
+    def __init__(self, K=12, N=3):
+        self.K = K
+        self.N = N
+
+    @property
+    def name(self):
+        return f"hr_simple_K{self.K}_N{self.N}"
+
+    @property
+    def params(self):
+        return {"K": self.K, "N": self.N}
+
+    def compute_series(self, bar_5m, **kwargs):
+        close = bar_5m['close']
+        high = bar_5m['high']
+        low = bar_5m['low']
+
+        prior_mom = close - close.shift(self.K)
+        recent_high = ts_max(high, self.N)
+        recent_low = ts_min(low, self.N)
+        ref_high = high.shift(self.N)
+        ref_low = low.shift(self.N)
+
+        up_stall = (prior_mom > 0) & (recent_high <= ref_high)
+        down_stall = (prior_mom < 0) & (recent_low >= ref_low)
+
+        signal = pd.Series(0.0, index=close.index)
+        signal[up_stall] = -1.0
+        signal[down_stall] = 1.0
+        return signal
+
+
 class RSIFactor(Factor):
     """RSI指标。"""
     category = "structure"
