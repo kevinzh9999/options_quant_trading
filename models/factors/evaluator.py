@@ -172,7 +172,7 @@ class FactorEvaluator:
             ('mid_range(1-2%)', (dr >= 1.0) & (dr < 2.0)),
             ('high_range(>=2%)', dr >= 2.0),
         ]:
-            for n in [3, 5]:  # only key periods
+            for n in self.forward_periods[:2]:  # top 2 periods
                 target = self.targets[n].reindex(values.index)
                 valid = pd.concat([
                     values.rename('f'), target.rename('t'), mask.rename('m')

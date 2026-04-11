@@ -9,7 +9,7 @@ import pandas as pd
 
 from models.factors.base import Factor
 from models.factors.operators import (
-    bollinger_band, body_ratio, ts_max, ts_min, rsi,
+    bollinger_band, body_ratio, ts_max, ts_min, ts_mean, ts_stddev, rsi,
 )
 
 
@@ -64,6 +64,14 @@ class PricePosition(Factor):
 
 class HorizontalReversalFactor(Factor):
     """横盘反转因子：趋势运行后出现连续横盘，预示反向行情。
+
+    【评估结论：归档不上线 — 2026-04-11】
+    全局Daily IC强(IM=0.111, IC=0.089)，但分组验证后实用强度不足：
+    - 高振幅日Pos-Neg均值差: IM=-3.2bps IC=-5.3bps（<10bps实用门槛）
+    - 两品种在高振幅日都是趋势延续模式，不是反转
+    - ME对照：exit后反向MFE/MAE=0.66-0.78，反向胜率35-45%，不支持反转假设
+    - 结论：Daily IC数值被全局drift高估，因子无实盘价值
+    保留代码作为研究记录，避免未来重复评估。
 
     reversal_strength = prior_trend × horizontal_score × low_vol_score × (-trend_sign)
     正值=看多反转，负值=看空反转，绝对值=信号强度。

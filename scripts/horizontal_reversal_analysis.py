@@ -10,7 +10,7 @@ from pathlib import Path
 from data.storage.db_manager import get_db
 from models.factors.catalog_structure import HorizontalReversalFactor, BollBreakout
 from models.factors.catalog_price import MomSimple
-from models.factors.catalog_volume import VolRatio
+from models.factors.catalog_volume import QtyRatio
 from models.factors.evaluator import FactorEvaluator
 
 SPOT_MAP = {"IM": "000852", "IC": "000905"}
@@ -153,7 +153,7 @@ def main():
         # 对照因子（现有M/V/B）
         mom_factor = MomSimple(12)
         boll_factor = BollBreakout(20)
-        vol_factor = VolRatio(5, 40)
+        vol_factor = QtyRatio(20)
 
         # 批量评估
         all_factors = [hr_factor, mom_factor, boll_factor, vol_factor]
