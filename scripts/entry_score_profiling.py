@@ -267,7 +267,7 @@ def aggregate_stats(df, group_col='score_bin'):
         trade_count=('entry_score', 'count'),
         mean_mfe_fixed_24=('mfe_fixed_24', 'mean'),
         median_mfe_fixed_24=('mfe_fixed_24', 'median'),
-        p75_mfe_fixed_24=('mfe_fixed_24', lambda x: np.percentile(x, 75)),
+        p75_mfe_fixed_24=('mfe_fixed_24', lambda x: np.percentile(x, 75) if len(x) > 0 else 0),
         mean_mae_fixed_24=('mae_fixed_24', 'mean'),
         median_mae_fixed_24=('mae_fixed_24', 'median'),
         mean_mfe_actual=('mfe_actual', 'mean'),
@@ -280,6 +280,8 @@ def aggregate_stats(df, group_col='score_bin'):
     ).reset_index()
 
     agg['mfe_mae_ratio'] = agg['median_mfe_fixed_24'] / agg['median_mae_fixed_24'].replace(0, np.nan)
+    # 去掉空分箱
+    agg = agg[agg['trade_count'] > 0].reset_index(drop=True)
     return agg
 
 
@@ -527,6 +529,9 @@ def main():
     parser.add_argument('--start', default='20250516', help='YYYYMMDD')
     parser.add_argument('--end', default='20260409', help='YYYYMMDD')
     parser.add_argument('--bins', default='fixed', choices=['fixed', 'qcut'])
+    parser.add_argument('--bin-width', type=int, default=None,
+                        help='细分箱宽度，如5表示[50,55),[55,60),...')
+    parser.add_argument('--bin-min', type=int, default=50, help='细分箱起始值')
     parser.add_argument('--amp-threshold', type=float, default=0.004)
     parser.add_argument('--output-dir', default='tmp/entry_score_profile')
     args = parser.parse_args()
@@ -563,7 +568,21 @@ def main():
         return
 
     # Bin
-    if args.bins == 'qcut':
+    if args.bin_width:
+        # 细分箱模式
+        bins = list(range(args.bin_min, 101, args.bin_width))
+        if bins[-1] != 100:
+            bins.append(100)
+        labels = [f'[{bins[i]},{bins[i+1]})' for i in range(len(bins)-2)]
+        labels.append(f'[{bins[-2]},{bins[-1]}]')
+        enriched['score_bin'] = pd.cut(enriched['entry_score'], bins=bins, labels=labels,
+                                        right=False, include_lowest=True)
+        # 细分箱模式：仅警告，不自动合并
+        for bl in labels:
+            n = (enriched['score_bin'] == bl).sum()
+            if n < 20:
+                print(f"  ⚠ {bl}: {n} 笔 (< 20)")
+    elif args.bins == 'qcut':
         enriched['score_bin'] = pd.qcut(enriched['entry_score'], 4, duplicates='drop')
     else:
         enriched, _, _ = auto_adjust_bins(enriched)
