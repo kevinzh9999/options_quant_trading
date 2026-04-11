@@ -540,7 +540,7 @@ def _eod_archive_minute_bars(api, trade_date: str, db) -> int:
         nonlocal total
         try:
             tk = api.get_tick_serial(tq_sym, data_length=10000)
-            api.wait_update()
+            api.wait_update(deadline=time.time() + 15)  # 15s超时，防止盘后卡住
             if tk is None or tk.empty:
                 return 0
             df = tk[tk["last_price"] > 0].copy()
