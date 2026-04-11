@@ -1209,6 +1209,8 @@ def _calc_market_regime(db, model: dict | None) -> dict | None:
     """
     从 IM.CFX 日线数据计算市场状态评估指标。
 
+    model=None 时安全返回 None（不抛异常）。
+
     Returns dict with keys:
         garch_cond_vol, garch_long_vol, garch_ratio, garch_state
         rv5, rv20, rv60, rv_trend
@@ -1217,6 +1219,8 @@ def _calc_market_regime(db, model: dict | None) -> dict | None:
         vrp_percentile
         summary
     """
+    if model is None:
+        return None
     try:
         df = db.query_df(
             "SELECT trade_date, close FROM futures_daily "
@@ -1534,11 +1538,17 @@ def _print_eod_summary(
     print(sep)
     print()
 
-    # 生成 Markdown 报告并持久化
+    # 生成 Markdown 报告并持久化（即使model=None也保存，记录账户和持仓）
     try:
+        regime = None
+        if db and model:
+            try:
+                regime = _calc_market_regime(db, model)
+            except Exception as e:
+                logger.warning("市场状态评估失败（不影响报告保存）: %s", e)
         md = _generate_eod_markdown(
             trade_date, account, positions, n_trades, model,
-            regime=_calc_market_regime(db, model) if db else None,
+            regime=regime,
             backfill=backfill,
             db=db,
         )
