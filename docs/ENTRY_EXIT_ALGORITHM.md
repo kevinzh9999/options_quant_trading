@@ -3,6 +3,12 @@
 > 代码入口: `strategies/intraday/A_share_momentum_signal_v2.py`
 > 因子组合: `strategies/intraday/factors.py`
 > 原子因子: `strategies/intraday/atomic_factors.py`
+>
+> **时间标准: 全部UTC**（数据库、bar时间戳、is_open_allowed常量、check_exit时间判断）
+> BJ时间仅用于面板显示（`_utc_to_bj()`转换）
+>
+> **Baseline: IM +2112  IC +2137 = +4249pt/219天**（中性外部数据，thr IM=50 IC=60）
+> Threshold验证中: IM 50→55（+14% PnL, Sharpe 2.85→3.25），全量900天OOS验证进行中
 
 ---
 
@@ -92,12 +98,12 @@ score_all() 返回 {total, direction, ...}
 
 ### Entry时间约束
 
-| 约束 | 时间 (BJ) | UTC | 检查位置 |
-|------|----------|-----|---------|
-| 开盘静默 | < 09:45 | < 01:45 | `is_open_allowed()` in `update()` |
-| 午休禁开 | 11:20 ~ 13:05 | 03:20 ~ 05:05 | `is_open_allowed()` in `update()` |
-| 尾盘禁开 | > 14:30 | > 06:30 | `is_open_allowed()` in `update()` |
-| 低振幅日 | 10:00后判断 | 02:00 | `monitor._on_new_bar()` |
+| 约束 | UTC常量 | BJ等价 | 检查位置 |
+|------|---------|--------|---------|
+| 开盘静默 | < 01:45 | < 09:45 | `is_open_allowed()` in `update()` |
+| 午休禁开 | 03:20 ~ 05:05 | 11:20 ~ 13:05 | `is_open_allowed()` in `update()` |
+| 尾盘禁开 | > 06:30 | > 14:30 | `is_open_allowed()` in `update()` |
+| 低振幅日 | 02:00后判断 | 10:00 | `monitor._on_new_bar()` |
 | 单品种上限 | 全天 | — | `risk_mgr`: ≤5笔/品种/天 |
 | 连续亏损 | 全天 | — | `risk_mgr`: 连亏≥3笔暂停 |
 | 日亏损限额 | 全天 | — | `risk_mgr`: 超限暂停 |
@@ -190,11 +196,11 @@ Step 3: 按优先级评估（每个条件可通过exit_weights禁用）
 
 ### Exit时间约束
 
-| 约束 | 时间 (BJ) | UTC | 行为 | 可配置 |
-|------|----------|-----|------|--------|
-| 午休平仓（亏损） | 11:25 | 03:25 | LUNCH_CLOSE 强平 | exit_weights可禁用 |
-| 午休紧trailing（盈利） | 11:25~13:00 | 03:25~05:00 | 回撤>0.3% → LUNCH_TRAIL | exit_weights可禁用 |
-| 尾盘强制平仓 | 14:45 | 06:45 | EOD_CLOSE 强平 | **不可禁用** |
+| 约束 | UTC常量 | BJ等价 | 行为 | 可配置 |
+|------|---------|--------|------|--------|
+| 午休平仓（亏损） | 03:25 | 11:25 | LUNCH_CLOSE 强平 | exit_weights可禁用 |
+| 午休紧trailing（盈利） | 03:25~05:00 | 11:25~13:00 | 回撤>0.3% → LUNCH_TRAIL | exit_weights可禁用 |
+| 尾盘强制平仓 | 06:45 | 14:45 | EOD_CLOSE 强平 | **不可禁用** |
 
 ---
 

@@ -2,6 +2,9 @@
 
 > 代码: `strategies/intraday/atomic_factors.py`
 > 所有因子为纯计算函数，无交易逻辑。Entry和Exit策略共享。
+>
+> **时间标准: 全部UTC**（所有数据库表已统一为UTC，BJ时间仅用于面板显示）
+> **Baseline: IM +2112  IC +2137 = +4249pt/219天**（中性外部数据）
 
 ## 原子因子
 
@@ -122,7 +125,7 @@ BELOW_LOWER  : price < mid - 2σ
 |------|------|-----|-----|------|
 | `factor_weights` | dict | 全1.0 | 全1.0 | Entry因子权重 {momentum:1.0, ...} |
 | `exit_weights` | dict | — | — | Exit条件开关 {STOP_LOSS:1.0, MID_BREAK:0, ...} |
-| `signal_threshold` | int | 50 | 60 | 开仓最低分 |
+| `signal_threshold` | int | 50 (验证中→55) | 60 | 开仓最低分 |
 | `stop_loss_pct` | float | 0.003 | 0.005 | 止损百分比 |
 | `trailing_stop_scale` | float | 1.5 | 2.0 | trailing宽度倍数 |
 | `me_ratio` | float | 0.10 | 0.12 | ME收窄判定阈值 |
