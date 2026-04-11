@@ -146,6 +146,12 @@ class HorizontalReversalFactor(Factor):
 class HorizontalReversalSimple(Factor):
     """简化版横盘反转因子。完全忠于主观观察，没有额外条件。
 
+    【评估结论：归档不上线 — 2026-04-11】
+    219天数据：IM低振幅日forward=5-15有稳定高原(+12~+19bps)
+    900天数据：**完全消失**，最大spread=9.6bps，无一达标
+    跟[75,80)陷阱区同一模式：小样本噪音，大数据消失
+    方法论教训：见docs/factor_research_lessons.md原则1和2
+
     逻辑：
     1. 过去K根bar的前置动量判断趋势方向
     2. 最近N根bar没有创出趋势方向的新极值→停滞
