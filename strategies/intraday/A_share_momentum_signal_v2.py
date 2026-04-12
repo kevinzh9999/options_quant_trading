@@ -837,7 +837,7 @@ SYMBOL_PROFILES: Dict[str, Dict] = {
         "dm_contrarian": 0.9,         # 轻度逆势惩罚，避免过度打折逆势交易
         "trailing_stop_scale": 1.5,   # 215天验证：1.5x > 1.0x（IM+259pt）
         "stop_loss_pct": 0.003,       # 217天稳健性三检通过：+366pt，邻域✅分半✅单日18%✅
-        "signal_threshold": 55,       # 900天IS/OOS验证: OOS +367pt(+16%) Sharpe+0.41; 旧baseline分半✅(+185/+186对称)，+370pt，多次一致最优
+        "signal_threshold": 60,       # 681/219双窗口验证: OOS最优(60,0.3%)=+5571 > 旧(55)=+5045(+526pt); IS -272pt但比值1.17更鲁棒
         "session_multiplier": {
             "0935-1030": 1.0,
             "1030-1130": 1.1,
@@ -907,8 +907,9 @@ SYMBOL_PROFILES: Dict[str, Dict] = {
         "daily_conflict_penalty": 0.7,
         "dm_trend": 1.1,              # 215天验证：1.1/0.9 > 1.2/0.8
         "dm_contrarian": 0.9,
-        "signal_threshold": 60,       # 动态lb+th55/60: IC从65降至60（配合lb=4震荡模式）
+        "signal_threshold": 55,       # 681/219双窗口验证: OOS最优(55,0.3%)=+2575 > 旧(60,0.5%)=+1663(+912pt,+55%); IS无损失
         "trailing_stop_scale": 2.0,   # IC趋势中震荡大，需要更宽trailing（5/5周稳健验证）
+        "stop_loss_pct": 0.003,       # 681/219双窗口验证: 0.3%在OOS上优于0.5%(+912pt含thr+sl); 与IM趋同
         "me_ratio": 0.12,             # 新baseline分半✅(+16/+51)，+67pt
         "session_multiplier": {
             "0935-1030": 1.0,
