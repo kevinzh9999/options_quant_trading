@@ -63,7 +63,7 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
 
     Args:
         slippage: points of slippage per trade (applied adversely on entry and exit)
-        version: "v2", "v3", or "auto" (use SIGNAL_ROUTING)
+        version: "v1", "v2", "v3", or "auto" (use SIGNAL_ROUTING)
     """
     date_dash = f"{td[:4]}-{td[4:6]}-{td[6:]}"
 

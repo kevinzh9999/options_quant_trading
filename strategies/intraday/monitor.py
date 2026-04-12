@@ -1209,7 +1209,10 @@ class IntradayMonitor:
                 if b5 is not None and not self._low_amplitude.get(sym, False):
                     # 首次检查（只做一次/天）
                     if sym not in self._low_amplitude:
-                        is_low = check_low_amplitude(b5)
+                        # 必须提取当天bar再判断振幅，b5包含多天历史
+                        # check_low_amplitude取iloc[:6]，如果传全量历史会取到前几天的bar
+                        today_b5 = self._extract_today_bars(b5)
+                        is_low = check_low_amplitude(today_b5)
                         self._low_amplitude[sym] = is_low
                         if is_low:
                             print(f"  [AMP-FILTER] {sym} 开盘30min振幅<0.4%，今日不开新仓")
@@ -1491,6 +1494,19 @@ class IntradayMonitor:
         _vp = self._vol_profiles.get(symbol)
         return self.strategy.signal_gen.update(
             symbol, bar_data[symbol], b15, daily, qd, vol_profile=_vp)
+
+    @staticmethod
+    def _extract_today_bars(bar_5m: pd.DataFrame) -> pd.DataFrame:
+        """提取当天的bar（通过检测>30分钟的gap识别日间分界）。"""
+        if len(bar_5m) < 2:
+            return bar_5m
+        idx = bar_5m.index
+        diffs = idx.to_series().diff()
+        gaps = diffs[diffs > pd.Timedelta(minutes=30)]
+        if len(gaps) > 0:
+            pos = bar_5m.index.get_loc(gaps.index[-1])
+            return bar_5m.iloc[pos:]
+        return bar_5m
 
     @staticmethod
     def _calc_display_data(

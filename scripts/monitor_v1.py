@@ -80,8 +80,13 @@ class MonitorV1:
         if utc_time < NO_TRADE_BEFORE or utc_time > NO_TRADE_AFTER:
             return
 
-        utc_hm = utc_time.strftime("%H:%M")
-        bj_h = (utc_time.hour + 8) % 24
+        # bar_start + 5min = 执行时间（与v2 monitor/backtest一致）
+        _h, _m = utc_time.hour, utc_time.minute
+        _m += 5
+        if _m >= 60:
+            _h += 1; _m -= 60
+        utc_hm = f"{_h:02d}:{_m:02d}"
+        bj_h = (_h + 8) % 24
 
         # 开盘振幅过滤
         if sym not in self._low_amp:
@@ -176,7 +181,7 @@ class MonitorV1:
             'entry_session': f"{bj_h:02d}:00-{bj_h+1:02d}:00",
         }
 
-        entry_bj = f"{(utc_time.hour+8)%24:02d}:{utc_time.minute:02d}"
+        entry_bj = f"{bj_h:02d}:{_m:02d}"
         print(f"  [V1] {sym} OPEN {direction} @{entry_price:.0f} score={v1_score} [{version}] {entry_bj}")
 
     def _check_exit(self, sym: str, b5: pd.DataFrame, b15, utc_hm: str):

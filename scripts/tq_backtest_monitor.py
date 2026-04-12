@@ -166,9 +166,12 @@ def run_tq_backtest(td: str, symbols: List[str] = None):
                             changed_syms.append(sym)
 
             if changed_syms:
+                # fut_quotes传空dict：shadow PnL用spot price（与自研backtest一致）
+                # 实盘monitor用期货价算PnL，但TqBacktest验证目的是对齐自研backtest
+                # 期货贴水3-4%会导致混合价源PnL偏差数十点/笔
                 monitor._on_new_bar(
                     changed_syms, spot_klines_5m, spot_klines_15m,
-                    fut_quotes, None,
+                    {}, None,
                 )
 
     except BacktestFinished:
