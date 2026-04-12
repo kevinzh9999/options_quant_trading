@@ -454,14 +454,7 @@ class IntradayMonitor:
         from config.config_loader import ConfigLoader
         self._tmp_dir: str = ConfigLoader().get_tmp_dir()
         self._signal_file: str = os.path.join(self._tmp_dir, "signal_pending.json")
-        # v1 overlay（shadow trade并行评分系统）
-        self._v1_overlay = None
-        try:
-            from strategies.intraday.experimental.monitor_v1_overlay import MonitorV1Overlay
-            self._v1_overlay = MonitorV1Overlay(self.recorder._db, self._tmp_dir)
-            print("  [V1] overlay初始化成功")
-        except Exception as e:
-            print(f"  [V1] overlay初始化失败(忽略): {e}")
+        # v1独立进程运行，不在v2 monitor里嵌入
 
     def _load_daily_data(self) -> None:
         """从数据库加载日线数据 + 解析近月合约 + 用现货指数算Z-Score。"""
@@ -1481,14 +1474,6 @@ class IntradayMonitor:
                 signal_version=ver,
                 score_detail=detail,
             )
-
-        # v1 overlay: 在v2处理完后，用v1评分做shadow trade
-        if self._v1_overlay:
-            try:
-                self._v1_overlay.set_vol_profiles(self._vol_profiles)
-                self._v1_overlay.on_bar(bar_data, bar_15m_data, current_time_utc)
-            except Exception as e:
-                print(f"  [V1-OVERLAY] error: {e}")
 
     def _get_latest_signal(
         self,
