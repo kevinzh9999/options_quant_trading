@@ -744,6 +744,51 @@ CREATE TABLE IF NOT EXISTS shadow_trades (
 CREATE INDEX IF NOT EXISTS idx_shadow_date ON shadow_trades (trade_date);
 """
 
+SHADOW_TRADES_NEW_MAPPING_SQL = """
+CREATE TABLE IF NOT EXISTS shadow_trades_new_mapping (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_date       TEXT,
+    symbol           TEXT,
+    direction        TEXT,
+    entry_time       TEXT,
+    entry_price      REAL,
+    entry_score      INT,
+    entry_dm         REAL,
+    entry_f          REAL,
+    entry_t          REAL,
+    entry_s          REAL,
+    entry_m          INT,
+    entry_v          INT,
+    entry_q          INT,
+    exit_time        TEXT,
+    exit_price       REAL,
+    exit_reason      TEXT,
+    pnl_pts          REAL,
+    hold_minutes     INT,
+    operator_action  TEXT,
+    is_executed      INT DEFAULT 0,
+    -- v1 新增字段
+    raw_mom_5m       REAL,
+    raw_atr_ratio    REAL,
+    raw_vol_pct      REAL,
+    entry_session    TEXT,
+    session_bonus    INT,
+    gap_aligned      INT,
+    gap_bonus        INT,
+    signal_version   TEXT NOT NULL  -- 'v1_im' or 'v1_ic'
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_nm_date ON shadow_trades_new_mapping (trade_date);
+CREATE INDEX IF NOT EXISTS idx_shadow_nm_version ON shadow_trades_new_mapping (signal_version);
+"""
+
+SHADOW_TRADES_ALTER_V1 = [
+    "ALTER TABLE shadow_trades ADD COLUMN raw_mom_5m REAL",
+    "ALTER TABLE shadow_trades ADD COLUMN raw_atr_ratio REAL",
+    "ALTER TABLE shadow_trades ADD COLUMN raw_vol_pct REAL",
+    "ALTER TABLE shadow_trades ADD COLUMN entry_session TEXT",
+    "ALTER TABLE shadow_trades ADD COLUMN gap_aligned INT",
+]
+
 EXECUTOR_LOG_SQL = """
 CREATE TABLE IF NOT EXISTS executor_log (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,

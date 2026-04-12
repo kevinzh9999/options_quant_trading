@@ -115,6 +115,14 @@ class DBManager:
             for ddl in ETF_TABLES:
                 self._etf_conn.executescript(ddl)
             self._etf_conn.commit()
+        # v1 新映射表
+        from data.storage.schemas import SHADOW_TRADES_NEW_MAPPING_SQL, SHADOW_TRADES_ALTER_V1
+        self._conn.executescript(SHADOW_TRADES_NEW_MAPPING_SQL)
+        for alter_sql in SHADOW_TRADES_ALTER_V1:
+            try:
+                self._conn.execute(alter_sql)
+            except Exception:
+                pass
         # 增量 ALTER TABLE（新增列，列已存在时静默忽略）
         for alter_sql in DAILY_MODEL_OUTPUT_ALTER_SQLS + SIGNAL_LOG_ALTER_SQLS:
             try:
