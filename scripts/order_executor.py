@@ -926,6 +926,8 @@ def main():
     parser = argparse.ArgumentParser(description="半自动下单")
     parser.add_argument("--dry-run", action="store_true",
                         help="只显示不下单")
+    parser.add_argument("--signal-source", choices=["v2", "v1"], default="v2",
+                        help="信号源: v2(现有) 或 v1(new_mapping_v1)")
     args = parser.parse_args()
 
     db_path = ConfigLoader().get_db_path()
