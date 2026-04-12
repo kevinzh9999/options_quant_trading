@@ -218,14 +218,15 @@ class FactorCombiner:
         brk_result = FactorResult(0)
         stp_result = FactorResult(0)
 
+        mom_result = FactorResult(0)
         for f in self.factors:
             w = self.weights.get(f.name, 1.0)
             if w == 0:
                 continue
             if f.name == "momentum":
-                r = f.score(ctx)
-                mom_dir = r.direction
-                s_mom = int(round(r.score * w))
+                mom_result = f.score(ctx)
+                mom_dir = mom_result.direction
+                s_mom = int(round(mom_result.score * w))
             elif f.name == "volatility":
                 vol_result = f.score(ctx)
             elif f.name == "volume":
@@ -335,6 +336,12 @@ class FactorCombiner:
             "pre_z_total": pre_z_total, "z_filter": z_filter,
             "rsi": rsi_val, "rsi_bonus": rsi_bonus, "rsi_note": rsi_note,
             "is_high_vol": is_high_vol,
+            # 原始连续数值（诊断用）
+            "raw_mom_5m": mom_result.meta.get("mom_5m", 0.0) if mom_result.meta else 0.0,
+            "raw_atr_ratio": vol_result.meta.get("atr_ratio", 0.0) if vol_result.meta else 0.0,
+            "raw_vol_pct": qty_result.meta.get("pct", -1.0) if qty_result.meta else -1.0,
+            "raw_vol_ratio": qty_result.meta.get("ratio", -1.0) if qty_result.meta else -1.0,
+            "raw_vol_method": qty_result.meta.get("method", "") if qty_result.meta else "",
         }
 
 

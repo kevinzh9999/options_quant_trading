@@ -910,7 +910,7 @@ SYMBOL_PROFILES: Dict[str, Dict] = {
         "signal_threshold": 55,       # 681/219双窗口验证: OOS最优(55,0.3%)=+2575 > 旧(60,0.5%)=+1663(+912pt,+55%); IS无损失
         "trailing_stop_scale": 2.0,   # IC趋势中震荡大，需要更宽trailing（5/5周稳健验证）
         "stop_loss_pct": 0.003,       # 681/219双窗口验证: 0.3%在OOS上优于0.5%(+912pt含thr+sl); 与IM趋同
-        "me_ratio": 0.12,             # 新baseline分半✅(+16/+51)，+67pt
+        "me_ratio": 0.10,             # 681/219双窗口验证: 0.10 OOS=+2929 > 旧0.12 OOS=+2575(+354pt,+14%); 与IM趋同
         "session_multiplier": {
             "0935-1030": 1.0,
             "1030-1130": 1.1,
