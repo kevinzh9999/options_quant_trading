@@ -618,8 +618,6 @@ class IntradayMonitor:
             "suggested_lots": self._calc_suggested_lots(last, sym),
             "limit_price": bid1 if direction == "SHORT" else ask1,
             "reason": action.get("reason", ""),
-            "v1_score": action.get("v1_score", 0),
-            "v1_confidence": action.get("v1_confidence", "LOW"),
         }
         self._append_signal(signal)
 
@@ -1409,44 +1407,8 @@ class IntradayMonitor:
                 last = act.get("last", 0)
                 sugg_lots = self._calc_suggested_lots(last, sym)
 
-                # v1置信度评分（per-symbol数据驱动映射）
-                v1_score, v1_conf = 0, "LOW"
-                try:
-                    sc = self._get_routed_score(sym) or {}
-                    raw_mom = sc.get("raw_mom_5m", 0.0)
-                    raw_atr = sc.get("raw_atr_ratio", 0.0)
-                    raw_vpct = sc.get("raw_vol_pct", -1.0)
-                    raw_vratio = sc.get("raw_vol_ratio", -1.0)
-                    bj_h = _now_bj.hour
-                    # gap计算
-                    b5_for_gap = bar_data.get(sym)
-                    _gap_aligned = False
-                    if b5_for_gap is not None and len(b5_for_gap) > 0:
-                        today_b = self._extract_today_bars(b5_for_gap)
-                        if len(today_b) > 0 and len(b5_for_gap) > len(today_b):
-                            t_open = float(today_b.iloc[0]["open"])
-                            p_close = float(b5_for_gap.iloc[-(len(today_b) + 1)]["close"])
-                            if p_close > 0:
-                                gp = (t_open - p_close) / p_close
-                                _gap_aligned = (gp > 0 and direction == "LONG") or \
-                                               (gp < 0 and direction == "SHORT")
-                    if sym == "IM":
-                        from strategies.intraday.experimental.signal_new_mapping_v1_im import score as _v1_score_fn, THRESHOLD as _v1_thr
-                    elif sym == "IC":
-                        from strategies.intraday.experimental.signal_new_mapping_v1_ic import score as _v1_score_fn, THRESHOLD as _v1_thr
-                    else:
-                        _v1_score_fn, _v1_thr = None, 60
-                    if _v1_score_fn:
-                        v1r = _v1_score_fn(raw_mom, raw_atr, raw_vpct, raw_vratio, bj_h, _gap_aligned)
-                        v1_score = v1r["total_score"]
-                        v1_conf = "HIGH" if v1_score >= _v1_thr else "LOW"
-                except Exception:
-                    pass
-
                 # 写信号JSON供executor（只有实盘品种）
                 if sym in self.strategy.tradeable:
-                    act["v1_score"] = v1_score
-                    act["v1_confidence"] = v1_conf
                     self._write_signal_file(act, current_time_utc)
 
                 # 面板打印信号（不等确认）
@@ -1455,8 +1417,7 @@ class IntradayMonitor:
                     limit_s = f"排队{ask1:.1f}/吃{ask1 + 0.2:.1f}" if ask1 > 0 else ""
                 else:
                     limit_s = f"排队{bid1:.1f}/吃{bid1 - 0.2:.1f}" if bid1 > 0 else ""
-                conf_tag = f"[{v1_conf}]" if v1_conf == "HIGH" else f"[{v1_conf}]"
-                print(f"\n *** SIGNAL: {sym} {d_cn} score={act.get('score', 0)} v1={v1_score} {conf_tag} ***")
+                print(f"\n *** SIGNAL: {sym} {d_cn} score={act.get('score', 0)} ***")
                 print(f"     盘口: {limit_s}  建议{sugg_lots}手")
                 print(f"     → 已写入signal_pending.json，等待executor确认")
 
