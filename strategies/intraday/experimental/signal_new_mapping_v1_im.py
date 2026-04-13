@@ -1,64 +1,91 @@
-"""v1_im评分模块：IM专用的数据驱动映射。
+"""v1_im评分模块：IM专用的per-symbol数据驱动映射。
 
-基于IM 900天PnL数据驱动设计（Phase C）。
-M/V分用10桶按PnL排序分配分数，时段加分基于IM实际时段PnL。
-Q分和Gap保持统一逻辑。
+基于IM 220天v2 trade数据（20250516-20260413），10桶PnL-ranked M/V映射。
+Q分反直觉：低成交量百分位更好（IC/IM一致）。
+Session: 14点最好(+10)，11点最差(-10)。
+Gap: IM premium仅+0.51pt，不给bonus。
+
+用途：v2的高置信度过滤器（Intersection信号加仓，V2\V1信号减仓/不交易）。
 """
-from strategies.intraday.experimental.score_components_new import (
-    compute_q_score, compute_gap_bonus,
-)
 
-# IM v1 最优 threshold
 THRESHOLD = 60
 SIGNAL_VERSION = "v1_im"
 
-# IM专属M分映射（10桶，按PnL从低到高分配0-50分）
+# IM per-symbol M映射（10桶，按PnL排序分配0-50分）
+# 最佳: bucket4 (0.0032-0.0038) +9.97pt → 50分
+# 最差: bucket2 (0.0017-0.0026) -3.26pt → 0分
 _IM_M_THRESHOLDS = [
-    (0.0, 0.00122, 0), (0.00122, 0.00191, 17), (0.00191, 0.00247, 11),
-    (0.00247, 0.00319, 33), (0.00319, 0.00393, 28), (0.00393, 0.00497, 6),
-    (0.00497, 0.00632, 22), (0.00632, 0.00872, 50), (0.00872, 0.0128, 39),
-    (0.0128, 1.0, 44),
+    (0.0, 0.0017, 23),
+    (0.0017, 0.0026, 0),
+    (0.0026, 0.0032, 19),
+    (0.0032, 0.0038, 50),
+    (0.0038, 0.0047, 16),
+    (0.0047, 0.0055, 13),
+    (0.0055, 0.0072, 35),
+    (0.0072, 0.0097, 40),
+    (0.0097, 0.0139, 11),
+    (0.0139, 1.0, 37),
 ]
 
-# IM专属V分映射（10桶，不规则多峰）
+# IM per-symbol V映射（7桶，非单调）
+# 最佳: bucket6 ATR 1.55-2.02 +8.91pt → 30分
+# 最差: bucket5 ATR 1.25-1.55 -2.12pt → 0分
 _IM_V_THRESHOLDS = [
-    (0.0, 0.666, 30), (0.666, 0.776, 20), (0.776, 0.864, 3),
-    (0.864, 0.958, 13), (0.958, 1.065, 10), (1.065, 1.215, 17),
-    (1.215, 1.424, 0), (1.424, 1.655, 27), (1.655, 1.987, 7),
-    (1.987, 100.0, 23),
+    (0.0, 0.7527, 5),
+    (0.7527, 0.9031, 12),
+    (0.9031, 1.0400, 25),
+    (1.0400, 1.2434, 16),
+    (1.2434, 1.5461, 0),
+    (1.5461, 2.0152, 30),
+    (2.0152, 100.0, 15),
 ]
 
-# IM专属时段加分
-_IM_SESSION = {9: 10, 10: -10, 11: 4, 13: 0, 14: 8}
+# IM per-symbol Q映射（3档，反直觉：低量最好）
+# 低量(0-0.60) +4.24pt → 15分, 中量(0.60-0.90) +3.92pt → 13分, 高量(0.90-1.0) +1.60pt → 0分
+_IM_Q_TIERS = [
+    (0.0, 0.60, 15),
+    (0.60, 0.90, 13),
+    (0.90, 1.01, 0),
+]
+
+# IM per-symbol Session bonus
+# 14点最好(+5.95pt→+10), 9点次好(+5.29pt→+8), 11点最差(-0.14pt→-10)
+_IM_SESSION = {9: 8, 10: -2, 11: -10, 13: -2, 14: 10}
+
+# IM gap bonus: premium仅+0.51pt，不给bonus
+_IM_GAP_BONUS = 0
 
 
-def _im_m_score(abs_mom: float) -> int:
-    for lo, hi, s in _IM_M_THRESHOLDS:
-        if lo <= abs_mom < hi:
+def _lookup(value: float, thresholds: list) -> int:
+    for lo, hi, s in thresholds:
+        if lo <= value < hi:
             return s
-    return _IM_M_THRESHOLDS[-1][2]
-
-
-def _im_v_score(atr_ratio: float) -> int:
-    for lo, hi, s in _IM_V_THRESHOLDS:
-        if lo <= atr_ratio < hi:
-            return s
-    return _IM_V_THRESHOLDS[-1][2]
-
-
-def _im_session_bonus(hour_bj: int) -> int:
-    return _IM_SESSION.get(hour_bj, 0)
+    return thresholds[-1][2]
 
 
 def score(raw_mom_5m: float, raw_atr_ratio: float,
           raw_vol_pct: float = -1.0, raw_vol_ratio: float = -1.0,
           entry_hour_bj: int = 13, gap_aligned: bool = False) -> dict:
-    """计算v1_im评分。返回包含所有子分量的dict。"""
-    m = _im_m_score(abs(raw_mom_5m))
-    v = _im_v_score(raw_atr_ratio)
-    q = compute_q_score(raw_vol_pct, raw_vol_ratio)
-    session = _im_session_bonus(entry_hour_bj)
-    gap = compute_gap_bonus(gap_aligned)
+    """计算v1_im per-symbol评分。返回包含所有子分量的dict。"""
+    m = _lookup(abs(raw_mom_5m), _IM_M_THRESHOLDS)
+    v = _lookup(raw_atr_ratio, _IM_V_THRESHOLDS)
+
+    # Q分：per-symbol反直觉映射（低量好）
+    if raw_vol_pct >= 0:
+        q = _lookup(raw_vol_pct, _IM_Q_TIERS)
+    elif raw_vol_ratio > 0:
+        # ratio fallback（保持旧逻辑兼容）
+        if raw_vol_ratio > 1.5:
+            q = 0   # 高量 = 差
+        elif raw_vol_ratio > 0.5:
+            q = 13
+        else:
+            q = 15  # 低量 = 好
+    else:
+        q = 13  # 不可用时中性
+
+    session = _IM_SESSION.get(entry_hour_bj, 0)
+    gap = _IM_GAP_BONUS if gap_aligned else 0
 
     return {
         'total_score': m + v + q + session + gap,
