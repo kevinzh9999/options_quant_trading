@@ -1294,9 +1294,9 @@ class IntradayMonitor:
             )
             if exit_info["should_exit"]:
                 reason = exit_info["exit_reason"]
-                entry_p = sp["entry_price"]
-                # 用期货价格计算PnL（entry是期货价，exit也用期货）
-                fut_exit = cur_price  # fallback
+                # PnL全部用期货价格（entry_price_fut vs 期货当前价）
+                entry_p_fut = sp.get("entry_price_fut", sp["entry_price"])
+                fut_exit = cur_price  # fallback到现货
                 fq = fut_quotes.get(sym)
                 if fq is not None:
                     try:
@@ -1305,7 +1305,7 @@ class IntradayMonitor:
                             fut_exit = fp
                     except Exception:
                         pass
-                pnl_pts = (fut_exit - entry_p) if sp["direction"] == "LONG" else (entry_p - fut_exit)
+                pnl_pts = (fut_exit - entry_p_fut) if sp["direction"] == "LONG" else (entry_p_fut - fut_exit)
                 try:
                     e_h, e_m = int(sp["entry_time_utc"][:2]), int(sp["entry_time_utc"][3:5])
                     c_h, c_m = int(utc_hm[:2]), int(utc_hm[3:5])
@@ -1317,7 +1317,7 @@ class IntradayMonitor:
                     "symbol": sym,
                     "direction": sp["direction"],
                     "entry_time": sp["entry_time_bj"],
-                    "entry_price": entry_p,
+                    "entry_price": entry_p_fut,
                     "entry_score": sp.get("entry_score", 0),
                     "entry_dm": sp.get("entry_dm", 0),
                     "entry_f": sp.get("entry_f", 0),
@@ -1360,7 +1360,7 @@ class IntradayMonitor:
                     "bid1": exit_bid,
                     "ask1": exit_ask,
                     "last": exit_last,
-                    "suggested_lots": self._calc_suggested_lots(entry_p, sym),
+                    "suggested_lots": self._calc_suggested_lots(entry_p_fut, sym),
                     "limit_price": exit_bid if d_cn == "LONG" else exit_ask,
                     "pnl_pts": round(pnl_pts, 1),
                 }
@@ -1429,18 +1429,24 @@ class IntradayMonitor:
                 except Exception:
                     pass
 
-                # 注册shadow持仓（所有信号自动进入）
-                # entry_price用现货close（与exit判断同源，确保backtest/monitor信号一致）
-                # 期货bid/ask只用于executor下单和PnL计算
+                # 注册shadow持仓
+                # entry_price = 现货close（check_exit止损/trailing用，与backtest一致）
+                # entry_price_fut = 期货价格（PnL计算和shadow记录用，反映实际交易）
                 b = bar_data.get(sym)
                 spot_entry = float(b.iloc[-1]["close"]) if (b is not None and len(b) > 0) else 0
                 entry_price = spot_entry if spot_entry > 0 else (ask1 or last or 0)
+                # 期货entry：做空用bid1，做多用ask1（与executor下单方向一致）
+                if direction == "LONG":
+                    fut_entry = ask1 if ask1 > 0 else (last if last > 0 else entry_price)
+                else:
+                    fut_entry = bid1 if bid1 > 0 else (last if last > 0 else entry_price)
                 sc = self._get_routed_score(sym) or {}
                 self._shadow_positions[sym] = {
                     "direction": direction,
                     "entry_time_utc": _now_utc.strftime("%H:%M"),
                     "entry_time_bj": _now_bj.strftime("%H:%M"),
                     "entry_price": float(entry_price),
+                    "entry_price_fut": float(fut_entry),
                     "highest_since": float(entry_price),
                     "lowest_since": float(entry_price),
                     "volume": 1,
@@ -1741,13 +1747,14 @@ class IntradayMonitor:
                         pass
                 if cur <= 0:
                     cur = float(b5.iloc[-1]["close"])
-                pnl = (cur - sp["entry_price"]) if sp["direction"] == "LONG" \
-                    else (sp["entry_price"] - cur)
+                ep_fut = sp.get("entry_price_fut", sp["entry_price"])
+                pnl = (cur - ep_fut) if sp["direction"] == "LONG" \
+                    else (ep_fut - cur)
                 floating_pts += pnl
                 d = "L" if sp["direction"] == "LONG" else "S"
                 exec_flag = "*" if sp.get("is_executed") else ""
                 shadow_parts.append(
-                    f"{s_sym}{exec_flag} {d}@{sp['entry_price']:.0f}"
+                    f"{s_sym}{exec_flag} {d}@{ep_fut:.0f}"
                     f" {'+' if pnl >= 0 else ''}{pnl:.0f}pt")
         total_pts = self._shadow_closed_pnl + floating_pts
         total_trades = self._shadow_closed_count + len(self._shadow_positions)

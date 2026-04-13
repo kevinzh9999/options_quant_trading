@@ -54,6 +54,8 @@ class MonitorV1:
         self._daily_trade_count: Dict[str, int] = {}
         self._vol_profiles: Dict[str, dict] = {}
         self._last_bar_time: Dict[str, int] = {}
+        self._panel_data: Dict[str, dict] = {}  # sym -> 最新bar的v1得分
+        self._closed_pnl: Dict[str, float] = {}  # sym -> 已平仓PnL
 
         # 加载vol_profile
         today_str = datetime.now().strftime("%Y%m%d")
@@ -87,6 +89,7 @@ class MonitorV1:
             _h += 1; _m -= 60
         utc_hm = f"{_h:02d}:{_m:02d}"
         bj_h = (_h + 8) % 24
+        bj_hm = f"{bj_h:02d}:{_m:02d}"
 
         # 开盘振幅过滤
         if sym not in self._low_amp:
@@ -96,22 +99,7 @@ class MonitorV1:
             if len(today_bars) >= 6:
                 self._low_amp[sym] = check_low_amplitude(today_bars.iloc[:6])
 
-        # 持仓中：检查exit
-        if sym in self._shadow_positions:
-            self._check_exit(sym, b5, b15, utc_hm)
-            return
-
-        # 无持仓：检查入场条件
-        if self._low_amp.get(sym):
-            return
-        if _NO_OPEN_LUNCH_START <= utc_time <= _NO_OPEN_LUNCH_END:
-            return
-        if utc_time >= _NO_OPEN_EOD:
-            return
-        if self._daily_trade_count.get(sym, 0) >= 5:
-            return
-
-        # 用v2 score_all获取raw值和方向（保留15m确认逻辑）
+        # 每根bar都计算v1得分（面板输出用）
         vp = self._vol_profiles.get(sym)
         result = self._gen.score_all(
             sym, b5, b15 if b15 is not None and len(b15) > 0 else None,
@@ -119,38 +107,72 @@ class MonitorV1:
             zscore=None, is_high_vol=True, d_override=None,
             vol_profile=vp,
         )
-        if not result or not result.get('direction'):
+        v1r = None
+        v1_score = 0
+        direction = ""
+        if result and result.get('direction'):
+            direction = result['direction']
+            raw_mom = result.get('raw_mom_5m', 0.0)
+            raw_atr = result.get('raw_atr_ratio', 0.0)
+            raw_vpct = result.get('raw_vol_pct', -1.0)
+            raw_vratio = result.get('raw_vol_ratio', -1.0)
+
+            # Gap计算
+            today_bars = self._extract_today_bars(b5)
+            gap_aligned = False
+            if len(today_bars) > 0 and len(b5) > len(today_bars):
+                today_open = float(today_bars.iloc[0]['open'])
+                prev_close = float(b5.iloc[-(len(today_bars) + 1)]['close'])
+                if prev_close > 0:
+                    gap_pct = (today_open - prev_close) / prev_close
+                    gap_aligned = (gap_pct > 0 and direction == 'LONG') or \
+                                  (gap_pct < 0 and direction == 'SHORT')
+
+            if sym == 'IM':
+                v1r = score_im(raw_mom, raw_atr, raw_vpct, raw_vratio, bj_h, gap_aligned)
+                threshold = THR_IM
+                version = "v1_im"
+            else:
+                v1r = score_ic(raw_mom, raw_atr, raw_vpct, raw_vratio, bj_h, gap_aligned)
+                threshold = THR_IC
+                version = "v1_ic"
+            v1_score = v1r['total_score']
+
+        # 面板输出：每根bar打印v1得分
+        cur_price = float(b5.iloc[-1]['close'])
+        pos_tag = ""
+        if sym in self._shadow_positions:
+            sp = self._shadow_positions[sym]
+            d = "L" if sp['direction'] == "LONG" else "S"
+            pnl = (cur_price - sp['entry_price']) if sp['direction'] == 'LONG' else (sp['entry_price'] - cur_price)
+            pos_tag = f" POS:{d}@{sp['entry_price']:.0f} {pnl:+.0f}pt"
+        dir_tag = "^L" if direction == "LONG" else ("vS" if direction == "SHORT" else "--")
+        m_s = v1r['m_score'] if v1r else 0
+        v_s = v1r['v_score'] if v1r else 0
+        q_s = v1r['q_score'] if v1r else 0
+        sess = v1r.get('session_bonus', 0) if v1r else 0
+        gap_b = v1r.get('gap_bonus', 0) if v1r else 0
+        self._panel_data[sym] = {
+            'bj_hm': bj_hm, 'price': cur_price, 'dir': dir_tag,
+            'm': m_s, 'v': v_s, 'q': q_s, 'sess': sess, 'gap': gap_b,
+            'total': v1_score, 'pos': pos_tag,
+        }
+
+        # 持仓中：检查exit
+        if sym in self._shadow_positions:
+            self._check_exit(sym, b5, b15, utc_hm)
             return
 
-        direction = result['direction']
-        raw_mom = result.get('raw_mom_5m', 0.0)
-        raw_atr = result.get('raw_atr_ratio', 0.0)
-        raw_vpct = result.get('raw_vol_pct', -1.0)
-        raw_vratio = result.get('raw_vol_ratio', -1.0)
-
-        # Gap计算
-        today_bars = self._extract_today_bars(b5)
-        gap_aligned = False
-        if len(today_bars) > 0 and len(b5) > len(today_bars):
-            today_open = float(today_bars.iloc[0]['open'])
-            prev_close = float(b5.iloc[-(len(today_bars) + 1)]['close'])
-            if prev_close > 0:
-                gap_pct = (today_open - prev_close) / prev_close
-                gap_aligned = (gap_pct > 0 and direction == 'LONG') or \
-                              (gap_pct < 0 and direction == 'SHORT')
-
-        # v1评分
-        if sym == 'IM':
-            v1r = score_im(raw_mom, raw_atr, raw_vpct, raw_vratio, bj_h, gap_aligned)
-            threshold = THR_IM
-            version = "v1_im"
-        else:
-            v1r = score_ic(raw_mom, raw_atr, raw_vpct, raw_vratio, bj_h, gap_aligned)
-            threshold = THR_IC
-            version = "v1_ic"
-
-        v1_score = v1r['total_score']
-        if v1_score < threshold:
+        # 无持仓：检查入场条件
+        if not v1r or v1_score < threshold:
+            return
+        if self._low_amp.get(sym):
+            return
+        if _NO_OPEN_LUNCH_START <= utc_time <= _NO_OPEN_LUNCH_END:
+            return
+        if utc_time >= _NO_OPEN_EOD:
+            return
+        if self._daily_trade_count.get(sym, 0) >= 5:
             return
 
         # 入场
@@ -181,8 +203,7 @@ class MonitorV1:
             'entry_session': f"{bj_h:02d}:00-{bj_h+1:02d}:00",
         }
 
-        entry_bj = f"{bj_h:02d}:{_m:02d}"
-        print(f"  [V1] {sym} OPEN {direction} @{entry_price:.0f} score={v1_score} [{version}] {entry_bj}")
+        print(f"  [V1] {sym} OPEN {direction} @{entry_price:.0f} score={v1_score} [{version}] {bj_hm}")
 
     def _check_exit(self, sym: str, b5: pd.DataFrame, b15, utc_hm: str):
         """复用v2的check_exit。"""
@@ -252,6 +273,7 @@ class MonitorV1:
 
             del self._shadow_positions[sym]
             self._daily_trade_count[sym] = self._daily_trade_count.get(sym, 0) + 1
+            self._closed_pnl[sym] = self._closed_pnl.get(sym, 0) + pnl
 
     def _write_shadow_trade(self, trade: Dict):
         cols = list(trade.keys())
@@ -275,6 +297,43 @@ class MonitorV1:
             pos = bar_5m.index.get_loc(gaps.index[-1])
             return bar_5m.iloc[pos:]
         return bar_5m
+
+    def print_panel(self):
+        """打印v1面板（每根bar后调用，类似v2的status面板）。"""
+        if not self._panel_data:
+            return
+        # 只在两个品种都有数据时打印（避免半屏输出）
+        if len(self._panel_data) < 2:
+            return
+        bj_hm = list(self._panel_data.values())[0].get('bj_hm', '??:??')
+        closed_pnl = sum(self._closed_pnl.values())
+        float_pnl = 0.0
+        pos_parts = []
+        for sym in SYMBOLS:
+            if sym in self._shadow_positions:
+                sp = self._shadow_positions[sym]
+                pd_info = self._panel_data.get(sym, {})
+                cp = pd_info.get('price', sp['entry_price'])
+                pnl = (cp - sp['entry_price']) if sp['direction'] == 'LONG' else (sp['entry_price'] - cp)
+                float_pnl += pnl
+                d = "L" if sp['direction'] == 'LONG' else 'S'
+                pos_parts.append(f"{sym}{d}1")
+        total_pnl = closed_pnl + float_pnl
+        trades_n = sum(self._daily_trade_count.values()) + len(self._shadow_positions)
+
+        print(f"\n  v1 Monitor | {bj_hm}")
+        print(f"  {'SYM':4s} | {'PRICE':>8s} | {'DIR':3s} | {'M':>3s} {'V':>3s} {'Q':>3s} {'S':>3s} {'G':>3s} | {'TOT':>3s} | POS")
+        print(f"  -----+----------+-----+---------------------+-----+----")
+        for sym in SYMBOLS:
+            p = self._panel_data.get(sym)
+            if not p:
+                continue
+            print(f"  {sym:4s} | {p['price']:8.1f} | {p['dir']:3s} | "
+                  f"{p['m']:3d} {p['v']:3d} {p['q']:3d} {p['sess']:+3d} {p['gap']:3d} | "
+                  f"{p['total']:3d} |{p['pos']}")
+        pos_str = ' '.join(pos_parts) if pos_parts else 'none'
+        print(f"  POS: {pos_str}  P&L: {total_pnl:+.0f}pt"
+              f" (已平{closed_pnl:+.0f} 浮盈{float_pnl:+.0f})  Trades: {trades_n}")
 
     def on_day_end(self):
         for sym in list(self._shadow_positions.keys()):
@@ -309,6 +368,7 @@ def run_live():
 
     while True:
         api.wait_update()
+        any_changed = False
         for sym in SYMBOLS:
             sk = spot_klines.get(sym)
             if sk is None or not api.is_changing(sk) or len(sk) < 2:
@@ -317,6 +377,7 @@ def run_live():
             if last_bar_time.get(sym) == completed_dt:
                 continue
             last_bar_time[sym] = completed_dt
+            any_changed = True
 
             # 构建bar数据
             completed = sk.iloc[:-1]
@@ -335,6 +396,9 @@ def run_live():
                     b15 = b15_full
 
             monitor.on_bar(sym, df, b15)
+
+        if any_changed:
+            monitor.print_panel()
 
 
 def run_backtest(td: str):
@@ -400,6 +464,8 @@ def run_backtest(td: str):
                         b15 = b15_full
 
                 monitor.on_bar(sym, df, b15)
+
+            # TqBacktest模式不打印面板（太多输出）
 
     except BacktestFinished:
         pass
