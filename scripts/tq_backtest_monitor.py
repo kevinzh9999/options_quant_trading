@@ -33,14 +33,21 @@ def run_tq_backtest(td: str, symbols: List[str] = None):
     # 现货→TQ代码映射
     SPOT_TQ = {"IM": "SSE.000852", "IF": "SSE.000300", "IH": "SSE.000016", "IC": "SSE.000905"}
 
-    # 创建monitor实例（会加载日线、Z-Score、vol_profile等）
+    # 创建monitor实例，使用独立临时DB（不污染实盘trading.db）
     from strategies.intraday.monitor import IntradayMonitor
     from strategies.intraday.strategy import IntradayConfig
+    import tempfile
+    _tqbt_db = os.path.join(tempfile.gettempdir(), f"tqbt_{td}.db")
 
     config = IntradayConfig()
     config.universe = set(symbols)
     config.tradeable = set(symbols)
-    monitor = IntradayMonitor(config)
+    monitor = IntradayMonitor(config, db_path=_tqbt_db)
+    # 隔离tmp文件（shadow_state、signal_pending等），避免污染实盘状态
+    _tqbt_tmp = os.path.join(tempfile.gettempdir(), f"tqbt_tmp_{td}")
+    os.makedirs(_tqbt_tmp, exist_ok=True)
+    monitor._tmp_dir = _tqbt_tmp
+    monitor._signal_file = os.path.join(_tqbt_tmp, "signal_pending.json")
 
     # 加载日线等初始化数据
     monitor._load_daily_data()
@@ -128,9 +135,18 @@ def run_tq_backtest(td: str, symbols: List[str] = None):
     spot_klines_15m = {}
     fut_quotes = {}
 
-    # 用近月合约作为期货数据源
-    from utils.cffex_calendar import _near_month_by_expiry
-    near_month = _near_month_by_expiry()
+    # 用回测日期判断主力合约（不能用当前日期）
+    from utils.cffex_calendar import _third_friday, _yymm, active_im_months
+    import pandas as _pd
+    _bt_date = _pd.Timestamp(f"{td[:4]}-{td[4:6]}-{td[6:]}")
+    _bt_tf = _third_friday(_bt_date.year, _bt_date.month)
+    if _bt_date.date() < _bt_tf.date():
+        # 到期日之前：当月合约
+        near_month = _yymm(_bt_date.year, _bt_date.month)
+    else:
+        # 到期日当天或之后：下月合约（当月已交割/即将交割）
+        _active = active_im_months(td)
+        near_month = _active[1] if len(_active) > 1 else _yymm(_bt_date.year, _bt_date.month + 1)
 
     for sym in symbols:
         spot_sym = SPOT_TQ.get(sym)
@@ -166,12 +182,13 @@ def run_tq_backtest(td: str, symbols: List[str] = None):
                             changed_syms.append(sym)
 
             if changed_syms:
-                # fut_quotes传空dict：shadow PnL用spot price（与自研backtest一致）
-                # 实盘monitor用期货价算PnL，但TqBacktest验证目的是对齐自研backtest
-                # 期货贴水3-4%会导致混合价源PnL偏差数十点/笔
+                # 传入真实期货行情，复现实盘monitor的完整价格链路：
+                # - entry_price_fut = 期货bid1/ask1（与实际下单一致）
+                # - check_exit的current_price = 现货close（monitor内部逻辑）
+                # - shadow PnL用期货价（与实盘PnL一致）
                 monitor._on_new_bar(
                     changed_syms, spot_klines_5m, spot_klines_15m,
-                    {}, None,
+                    fut_quotes, None,
                 )
 
     except BacktestFinished:
@@ -179,13 +196,14 @@ def run_tq_backtest(td: str, symbols: List[str] = None):
     finally:
         api.close()
 
-    # 收集shadow trades
-    from data.storage.db_manager import get_db
-    db = get_db()
-    # shadow_trades在monitor的recorder里，直接从DB读
-    trades_df = db.query_df(
-        f"SELECT * FROM shadow_trades WHERE trade_date='{td}' ORDER BY entry_time"
-    )
+    # 从TqBT专用临时DB读取shadow trades
+    import sqlite3 as _sql
+    _conn = _sql.connect(_tqbt_db)
+    import pandas as _pd
+    trades_df = _pd.read_sql(
+        f"SELECT * FROM shadow_trades WHERE trade_date='{td}' ORDER BY entry_time",
+        _conn)
+    _conn.close()
     return trades_df
 
 
@@ -234,28 +252,9 @@ def main():
                   f"pnl={t['pnl_pts']:+.1f}pt")
     print()
 
-    # 2. TqBacktest（直接驱动monitor）
+    # 2. TqBacktest（直接驱动monitor，写入独立临时DB，不污染实盘）
     print("── TqBacktest (直接驱动monitor) ──")
-
-    # 先备份今天的shadow_trades，避免TqBacktest写入污染
-    from data.storage.db_manager import get_db
-    db = get_db()
-    existing_shadow = db.query_df(
-        f"SELECT * FROM shadow_trades WHERE trade_date='{td}'"
-    )
-
-    # 清空今天的shadow记录（TqBacktest会重新写入）
-    db._conn.execute(f"DELETE FROM shadow_trades WHERE trade_date='{td}'")
-    db._conn.commit()
-
-    try:
-        tq_shadow = run_tq_backtest(td, symbols)
-    finally:
-        # 恢复原始shadow数据
-        db._conn.execute(f"DELETE FROM shadow_trades WHERE trade_date='{td}'")
-        if existing_shadow is not None and len(existing_shadow) > 0:
-            existing_shadow.to_sql("shadow_trades", db._conn, if_exists="append", index=False)
-        db._conn.commit()
+    tq_shadow = run_tq_backtest(td, symbols)
 
     print(f"\n── 汇总 ──")
     for sym in symbols:
@@ -287,13 +286,22 @@ def main():
                     t_str = f"{t['entry_time']}→{t['exit_time']} {float(t['pnl_pts']):+.1f}pt" if t is not None else "(无)"
                     print(f"    {i+1:>3d} | {c_str:^30s} | {t_str:^30s}")
 
-    # 3. 实盘shadow对比
-    print(f"\n── vs 实盘Shadow (修复前) ──")
+    # 3. 实盘shadow对比（从实盘DB读取，不受TqBT影响）
+    from data.storage.db_manager import get_db
+    db = get_db()
+    existing_shadow = db.query_df(
+        f"SELECT * FROM shadow_trades WHERE trade_date='{td}'"
+    )
+    print(f"\n── vs 实盘Shadow ──")
     if existing_shadow is not None and len(existing_shadow) > 0:
         for sym in symbols:
             sym_shadow = existing_shadow[existing_shadow["symbol"] == sym]
-            shadow_pnl = sym_shadow["pnl_pts"].astype(float).sum()
-            print(f"  {sym}: {len(sym_shadow)}笔 PnL={shadow_pnl:+.1f}pt")
+            if len(sym_shadow) > 0:
+                shadow_pnl = sym_shadow["pnl_pts"].astype(float).sum()
+                print(f"  {sym}: {len(sym_shadow)}笔 PnL={shadow_pnl:+.1f}pt")
+                for _, r in sym_shadow.iterrows():
+                    print(f"    {r['direction']} {r['entry_time']}→{r['exit_time']} "
+                          f"{r['exit_reason']} pnl={float(r['pnl_pts']):+.1f}pt")
     else:
         print("  (无)")
 

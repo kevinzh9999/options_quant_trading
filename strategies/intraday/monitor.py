@@ -43,7 +43,7 @@ from strategies.intraday.A_share_momentum_signal_v2 import (
     SentimentData, check_exit,
 )
 from strategies.intraday.reversal_signal import (
-    ReversalDetector, REVERSAL_CONFIG,
+    ReversalDetector, ReversalDetectorSlope, REVERSAL_CONFIG,
 )
 
 
@@ -402,11 +402,11 @@ def _calc_research_indicators(
 class IntradayMonitor:
     """盘中实时监控 + 数据记录。"""
 
-    def __init__(self, config: IntradayConfig | None = None):
+    def __init__(self, config: IntradayConfig | None = None, db_path: str | None = None):
         self.config = config or IntradayConfig()
         self.strategy = IntradayStrategy(self.config)
         self.symbols = list(self.config.universe)
-        self.recorder = IntradayRecorder()
+        self.recorder = IntradayRecorder(db_path=db_path) if db_path else IntradayRecorder()
         _debug = "--debug" in sys.argv
         # v2 / v3 信号生成器
         self.signal_v2 = SignalGeneratorV2({
@@ -458,9 +458,14 @@ class IntradayMonitor:
         self._tmp_dir: str = ConfigLoader().get_tmp_dir()
         self._signal_file: str = os.path.join(self._tmp_dir, "signal_pending.json")
         # 反转信号检测器（per-symbol, per-day reset）
-        self._reversal_detectors: Dict[str, ReversalDetector] = {
-            sym: ReversalDetector(sym) for sym in self.symbols
-        }
+        # IM用slope方法，其他品种用candle方法（如enabled）
+        self._reversal_detectors: Dict[str, ReversalDetector | ReversalDetectorSlope] = {}
+        for sym in self.symbols:
+            cfg = REVERSAL_CONFIG.get(sym, {})
+            if cfg.get("method") == "slope":
+                self._reversal_detectors[sym] = ReversalDetectorSlope(sym)
+            else:
+                self._reversal_detectors[sym] = ReversalDetector(sym)
         # v1独立进程运行，不在v2 monitor里嵌入
 
     def _load_daily_data(self) -> None:
@@ -1105,6 +1110,17 @@ class IntradayMonitor:
                 if len(df) > 0:
                     bar_data[sym] = df
 
+            # 记录实盘bar值供对账（验证TQ实时 vs 归档是否一致）
+            if len(df) > 0:
+                _last = df.iloc[-1]
+                _bar_ts = df.index[-1].strftime("%Y-%m-%d %H:%M:%S") if hasattr(df.index[-1], 'strftime') else str(df.index[-1])
+                try:
+                    with open(os.path.join(self._tmp_dir, "bar_audit.csv"), "a") as _f:
+                        _f.write(f"{sym},{_bar_ts},{_last['open']:.4f},{_last['high']:.4f},"
+                                 f"{_last['low']:.4f},{_last['close']:.4f},{_last['volume']:.0f}\n")
+                except Exception:
+                    pass
+
             # 15m从5m重采样（不用TQ原生15m）
             # TQ原生15m的partial更新行为不确定，从5m重采样是确定性的
             # 与backtest使用完全相同的_build_15m_from_5m逻辑
@@ -1193,6 +1209,16 @@ class IntradayMonitor:
                 float(last_bar["open"]), float(last_bar["high"]),
                 float(last_bar["low"]), float(last_bar["close"]),
             )
+            # 记录reversal detector状态供对账
+            try:
+                import numpy as _np
+                _n = len(det._closes)
+                _sS = _np.polyfit(range(min(_n,det.short_n)), det._closes[-min(_n,det.short_n):], 1)[0] if _n >= det.short_n else 0
+                _rev_str = f"{rev.direction},d={rev.depth:.0f}" if rev else ""
+                with open(os.path.join(self._tmp_dir, "reversal_audit.csv"), "a") as _rf:
+                    _rf.write(f"{utc_hm},{sym},{det.state},{_sS:.2f},{_n},{_rev_str}\n")
+            except Exception:
+                pass
             if rev is None:
                 continue
             # Check time window
