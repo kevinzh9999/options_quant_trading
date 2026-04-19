@@ -42,6 +42,9 @@ from strategies.intraday.A_share_momentum_signal_v2 import (
     SignalGeneratorV2, SignalGeneratorV3, SIGNAL_ROUTING,
     SentimentData, check_exit,
 )
+from strategies.intraday.reversal_signal import (
+    ReversalDetector, ReversalDetectorSlope, REVERSAL_CONFIG,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -399,11 +402,11 @@ def _calc_research_indicators(
 class IntradayMonitor:
     """盘中实时监控 + 数据记录。"""
 
-    def __init__(self, config: IntradayConfig | None = None):
+    def __init__(self, config: IntradayConfig | None = None, db_path: str | None = None):
         self.config = config or IntradayConfig()
         self.strategy = IntradayStrategy(self.config)
         self.symbols = list(self.config.universe)
-        self.recorder = IntradayRecorder()
+        self.recorder = IntradayRecorder(db_path=db_path) if db_path else IntradayRecorder()
         _debug = "--debug" in sys.argv
         # v2 / v3 信号生成器
         self.signal_v2 = SignalGeneratorV2({
@@ -454,6 +457,16 @@ class IntradayMonitor:
         from config.config_loader import ConfigLoader
         self._tmp_dir: str = ConfigLoader().get_tmp_dir()
         self._signal_file: str = os.path.join(self._tmp_dir, "signal_pending.json")
+        # 反转信号检测器（per-symbol, per-day reset）
+        # IM用slope方法，其他品种用candle方法（如enabled）
+        self._reversal_detectors: Dict[str, ReversalDetector | ReversalDetectorSlope] = {}
+        for sym in self.symbols:
+            cfg = REVERSAL_CONFIG.get(sym, {})
+            if cfg.get("method") == "slope":
+                self._reversal_detectors[sym] = ReversalDetectorSlope(sym)
+            else:
+                self._reversal_detectors[sym] = ReversalDetector(sym)
+        # v1独立进程运行，不在v2 monitor里嵌入
 
     def _load_daily_data(self) -> None:
         """从数据库加载日线数据 + 解析近月合约 + 用现货指数算Z-Score。"""
@@ -1079,6 +1092,8 @@ class IntradayMonitor:
             _now_utc = pd.Timestamp(datetime.utcnow())
             _now_bj = pd.Timestamp(datetime.now())
         current_time_utc = _now_utc.strftime("%Y-%m-%d %H:%M:%S")
+        utc_hm = _now_utc.strftime("%H:%M")
+        trade_date = _now_bj.strftime("%Y%m%d")
 
         # 构建现货bar数据（用于信号计算）
         bar_data: Dict[str, pd.DataFrame] = {}
@@ -1094,6 +1109,17 @@ class IntradayMonitor:
                 df.index = pd.to_datetime(completed["datetime"], unit="ns")
                 if len(df) > 0:
                     bar_data[sym] = df
+
+            # 记录实盘bar值供对账（验证TQ实时 vs 归档是否一致）
+            if len(df) > 0:
+                _last = df.iloc[-1]
+                _bar_ts = df.index[-1].strftime("%Y-%m-%d %H:%M:%S") if hasattr(df.index[-1], 'strftime') else str(df.index[-1])
+                try:
+                    with open(os.path.join(self._tmp_dir, "bar_audit.csv"), "a") as _f:
+                        _f.write(f"{sym},{_bar_ts},{_last['open']:.4f},{_last['high']:.4f},"
+                                 f"{_last['low']:.4f},{_last['close']:.4f},{_last['volume']:.0f}\n")
+                except Exception:
+                    pass
 
             # 15m从5m重采样（不用TQ原生15m）
             # TQ原生15m的partial更新行为不确定，从5m重采样是确定性的
@@ -1166,6 +1192,179 @@ class IntradayMonitor:
             # 面板辅助显示数据（VWAP, 趋势, 开盘区间, BOLL）
             self._display_data[sym] = self._calc_display_data(b5, b15)
 
+        # ── 反转信号检测 ──
+        # 时间窗口: 10:30-14:30 BJ = 02:30-06:30 UTC (02:25 for bar boundary)
+        _REV_BEFORE = "02:25"
+        _REV_AFTER = "06:30"
+        for sym in self.symbols:
+            b5 = bar_data.get(sym)
+            if b5 is None or len(b5) < 2:
+                continue
+            det = self._reversal_detectors.get(sym)
+            if det is None or not det.enabled:
+                continue
+            # Feed the latest completed bar
+            last_bar = b5.iloc[-1]
+            rev = det.update(
+                float(last_bar["open"]), float(last_bar["high"]),
+                float(last_bar["low"]), float(last_bar["close"]),
+            )
+            # 记录reversal detector状态供对账
+            try:
+                import numpy as _np
+                _n = len(det._closes)
+                _sS = _np.polyfit(range(min(_n,det.short_n)), det._closes[-min(_n,det.short_n):], 1)[0] if _n >= det.short_n else 0
+                _rev_str = f"{rev.direction},d={rev.depth:.0f}" if rev else ""
+                with open(os.path.join(self._tmp_dir, "reversal_audit.csv"), "a") as _rf:
+                    _rf.write(f"{utc_hm},{sym},{det.state},{_sS:.2f},{_n},{_rev_str}\n")
+            except Exception:
+                pass
+            if rev is None:
+                continue
+            # Check time window
+            if not (_REV_BEFORE <= utc_hm <= _REV_AFTER):
+                continue
+
+            # -- Reversal signal fired --
+            print(f"\n *** REVERSAL: {sym} {rev.direction} depth={rev.depth:.0f}pt ***")
+
+            # Case: opposite shadow position exists -> close it
+            sp = self._shadow_positions.get(sym)
+            if sp is not None and sp["direction"] != rev.direction:
+                # Close the existing shadow position
+                entry_p_fut = sp.get("entry_price_fut", sp["entry_price"])
+                # Use spot price for exit (consistent with check_exit)
+                exit_price = float(last_bar["close"])
+                pnl_pts = (exit_price - sp["entry_price"]) if sp["direction"] == "LONG" else (sp["entry_price"] - exit_price)
+                # For PnL record: use fut if available
+                fq = fut_quotes.get(sym) if fut_quotes else None
+                fut_exit = exit_price
+                if fq is not None:
+                    try:
+                        fp = float(fq.last_price)
+                        if fp > 0:
+                            fut_exit = fp
+                    except Exception:
+                        pass
+                pnl_pts_fut = (fut_exit - entry_p_fut) if sp["direction"] == "LONG" else (entry_p_fut - fut_exit)
+                try:
+                    e_h, e_m = int(sp["entry_time_utc"][:2]), int(sp["entry_time_utc"][3:5])
+                    c_h, c_m = int(utc_hm[:2]), int(utc_hm[3:5])
+                    hold_min = (c_h * 60 + c_m) - (e_h * 60 + e_m)
+                except Exception:
+                    hold_min = 0
+                self.recorder.record_shadow_trade({
+                    "trade_date": trade_date,
+                    "symbol": sym,
+                    "direction": sp["direction"],
+                    "entry_time": sp.get("entry_time_bj", ""),
+                    "entry_price": entry_p_fut,
+                    "entry_score": sp.get("entry_score", 0),
+                    "entry_dm": sp.get("entry_dm", 0),
+                    "entry_f": sp.get("entry_f", 0),
+                    "entry_t": sp.get("entry_t", 0),
+                    "entry_s": sp.get("entry_s", 0),
+                    "entry_m": sp.get("entry_m", 0),
+                    "entry_v": sp.get("entry_v", 0),
+                    "entry_q": sp.get("entry_q", 0),
+                    "exit_time": _now_bj.strftime("%H:%M"),
+                    "exit_price": fut_exit,
+                    "exit_reason": "REVERSAL_EXIT",
+                    "pnl_pts": round(pnl_pts_fut, 1),
+                    "hold_minutes": hold_min,
+                    "operator_action": sp.get("operator_action", ""),
+                    "is_executed": sp.get("is_executed", 0),
+                })
+                print(f"     EXIT: {sym} {sp['direction']} PnL={pnl_pts_fut:+.0f}pt (REVERSAL_EXIT)")
+                # Write CLOSE signal JSON
+                exit_bid = exit_ask = exit_last = exit_price
+                if fq is not None:
+                    try:
+                        exit_bid = float(fq.bid_price1) or exit_price
+                        exit_ask = float(fq.ask_price1) or exit_price
+                        exit_last = float(fq.last_price) or exit_price
+                    except Exception:
+                        pass
+                close_signal = {
+                    "timestamp": _now_bj.strftime("%Y-%m-%d %H:%M:%S"),
+                    "symbol": sym,
+                    "contract": self._tq_symbols.get(sym, ""),
+                    "direction": sp["direction"],
+                    "action": "CLOSE",
+                    "reason": "REVERSAL_EXIT",
+                    "bid1": exit_bid,
+                    "ask1": exit_ask,
+                    "last": exit_last,
+                    "suggested_lots": 1,
+                    "limit_price": exit_bid if sp["direction"] == "LONG" else exit_ask,
+                    "pnl_pts": round(pnl_pts_fut, 1),
+                }
+                self._append_signal(close_signal)
+                self._shadow_closed_pnl += pnl_pts_fut
+                self._shadow_closed_count += 1
+                del self._shadow_positions[sym]
+                self.strategy.position_mgr.remove_by_symbol(sym)
+                self._save_shadow_state()
+
+            # Case: no position -> open new reversal position
+            if sym not in self._shadow_positions:
+                spot_entry = float(last_bar["close"])
+                entry_price = spot_entry
+                # Futures entry price
+                fq = fut_quotes.get(sym) if fut_quotes else None
+                if rev.direction == "LONG":
+                    fut_entry = float(fq.ask_price1) if (fq and float(fq.ask_price1) > 0) else entry_price
+                else:
+                    fut_entry = float(fq.bid_price1) if (fq and float(fq.bid_price1) > 0) else entry_price
+                from strategies.intraday.A_share_momentum_signal_v2 import SYMBOL_PROFILES, _DEFAULT_PROFILE
+                _sym_prof = SYMBOL_PROFILES.get(sym, _DEFAULT_PROFILE)
+                _sl_pct = _sym_prof.get("stop_loss_pct", 0.005)
+                stop = entry_price * (1 - _sl_pct) if rev.direction == "LONG" else entry_price * (1 + _sl_pct)
+
+                self._shadow_positions[sym] = {
+                    "direction": rev.direction,
+                    "entry_time_utc": utc_hm,
+                    "entry_time_bj": _now_bj.strftime("%H:%M"),
+                    "entry_price": float(entry_price),
+                    "entry_price_fut": float(fut_entry),
+                    "highest_since": float(entry_price),
+                    "lowest_since": float(entry_price),
+                    "stop_loss": stop,
+                    "volume": 1,
+                    "bars_below_mid": 0,
+                    "entry_score": 0,
+                    "entry_dm": 0, "entry_f": 0, "entry_t": 0, "entry_s": 0,
+                    "entry_m": 0, "entry_v": 0, "entry_q": 0,
+                    "operator_action": "SIGNAL",
+                    "is_executed": 0,
+                    "fut_symbol": self._tq_symbols.get(sym, ""),
+                    "source": "reversal",
+                }
+                self.strategy.position_mgr.inject_position(
+                    sym, rev.direction, entry_price,
+                    _now_bj.strftime("%H:%M"), 0)
+                self._save_shadow_state()
+
+                # Write OPEN signal JSON (only for tradeable symbols)
+                if sym in self.strategy.tradeable:
+                    open_signal = {
+                        "timestamp": _now_bj.strftime("%Y-%m-%d %H:%M:%S"),
+                        "symbol": sym,
+                        "contract": self._tq_symbols.get(sym, ""),
+                        "direction": rev.direction,
+                        "action": "OPEN",
+                        "score": 0,
+                        "bid1": float(fq.bid_price1) if fq else 0,
+                        "ask1": float(fq.ask_price1) if fq else 0,
+                        "last": float(fq.last_price) if fq else 0,
+                        "suggested_lots": 1,
+                        "limit_price": float(fq.ask_price1) if (fq and rev.direction == "LONG") else (float(fq.bid_price1) if fq else 0),
+                        "reason": f"REVERSAL depth={rev.depth:.0f}",
+                    }
+                    self._append_signal(open_signal)
+                    print(f"     OPEN: {sym} {rev.direction} (reversal depth={rev.depth:.0f}pt)")
+                    print(f"     -> signal_pending.json(OPEN), waiting for executor")
+
         # 运行策略（外部数据固定为中性值，与score_all调用一致）
         # TODO: 验证对齐后恢复动态值
         actions = self.strategy.on_bar(
@@ -1208,7 +1407,10 @@ class IntradayMonitor:
                 if b5 is not None and not self._low_amplitude.get(sym, False):
                     # 首次检查（只做一次/天）
                     if sym not in self._low_amplitude:
-                        is_low = check_low_amplitude(b5)
+                        # 必须提取当天bar再判断振幅，b5包含多天历史
+                        # check_low_amplitude取iloc[:6]，如果传全量历史会取到前几天的bar
+                        today_b5 = self._extract_today_bars(b5)
+                        is_low = check_low_amplitude(today_b5)
                         self._low_amplitude[sym] = is_low
                         if is_low:
                             print(f"  [AMP-FILTER] {sym} 开盘30min振幅<0.4%，今日不开新仓")
@@ -1254,8 +1456,6 @@ class IntradayMonitor:
         # 更新影子持仓（每根K线用与回测相同的exit逻辑检查）
         # 注意：shadow entry_price是期货价格，所以check_exit也必须用期货价格
         # 否则贴水导致现货-期货价差 > 0.5%，SHORT持仓一开仓就假触发STOP_LOSS
-        utc_hm = _now_utc.strftime("%H:%M")
-        trade_date = _now_bj.strftime("%Y%m%d")
         for sym in list(self._shadow_positions.keys()):
             sp = self._shadow_positions[sym]
             b5 = bar_data.get(sym)
@@ -1290,9 +1490,9 @@ class IntradayMonitor:
             )
             if exit_info["should_exit"]:
                 reason = exit_info["exit_reason"]
-                entry_p = sp["entry_price"]
-                # 用期货价格计算PnL（entry是期货价，exit也用期货）
-                fut_exit = cur_price  # fallback
+                # PnL全部用期货价格（entry_price_fut vs 期货当前价）
+                entry_p_fut = sp.get("entry_price_fut", sp["entry_price"])
+                fut_exit = cur_price  # fallback到现货
                 fq = fut_quotes.get(sym)
                 if fq is not None:
                     try:
@@ -1301,7 +1501,7 @@ class IntradayMonitor:
                             fut_exit = fp
                     except Exception:
                         pass
-                pnl_pts = (fut_exit - entry_p) if sp["direction"] == "LONG" else (entry_p - fut_exit)
+                pnl_pts = (fut_exit - entry_p_fut) if sp["direction"] == "LONG" else (entry_p_fut - fut_exit)
                 try:
                     e_h, e_m = int(sp["entry_time_utc"][:2]), int(sp["entry_time_utc"][3:5])
                     c_h, c_m = int(utc_hm[:2]), int(utc_hm[3:5])
@@ -1313,7 +1513,7 @@ class IntradayMonitor:
                     "symbol": sym,
                     "direction": sp["direction"],
                     "entry_time": sp["entry_time_bj"],
-                    "entry_price": entry_p,
+                    "entry_price": entry_p_fut,
                     "entry_score": sp.get("entry_score", 0),
                     "entry_dm": sp.get("entry_dm", 0),
                     "entry_f": sp.get("entry_f", 0),
@@ -1356,7 +1556,7 @@ class IntradayMonitor:
                     "bid1": exit_bid,
                     "ask1": exit_ask,
                     "last": exit_last,
-                    "suggested_lots": self._calc_suggested_lots(entry_p, sym),
+                    "suggested_lots": self._calc_suggested_lots(entry_p_fut, sym),
                     "limit_price": exit_bid if d_cn == "LONG" else exit_ask,
                     "pnl_pts": round(pnl_pts, 1),
                 }
@@ -1425,18 +1625,24 @@ class IntradayMonitor:
                 except Exception:
                     pass
 
-                # 注册shadow持仓（所有信号自动进入）
-                # entry_price用现货close（与exit判断同源，确保backtest/monitor信号一致）
-                # 期货bid/ask只用于executor下单和PnL计算
+                # 注册shadow持仓
+                # entry_price = 现货close（check_exit止损/trailing用，与backtest一致）
+                # entry_price_fut = 期货价格（PnL计算和shadow记录用，反映实际交易）
                 b = bar_data.get(sym)
                 spot_entry = float(b.iloc[-1]["close"]) if (b is not None and len(b) > 0) else 0
                 entry_price = spot_entry if spot_entry > 0 else (ask1 or last or 0)
+                # 期货entry：做空用bid1，做多用ask1（与executor下单方向一致）
+                if direction == "LONG":
+                    fut_entry = ask1 if ask1 > 0 else (last if last > 0 else entry_price)
+                else:
+                    fut_entry = bid1 if bid1 > 0 else (last if last > 0 else entry_price)
                 sc = self._get_routed_score(sym) or {}
                 self._shadow_positions[sym] = {
                     "direction": direction,
                     "entry_time_utc": _now_utc.strftime("%H:%M"),
                     "entry_time_bj": _now_bj.strftime("%H:%M"),
                     "entry_price": float(entry_price),
+                    "entry_price_fut": float(fut_entry),
                     "highest_since": float(entry_price),
                     "lowest_since": float(entry_price),
                     "volume": 1,
@@ -1490,6 +1696,19 @@ class IntradayMonitor:
         _vp = self._vol_profiles.get(symbol)
         return self.strategy.signal_gen.update(
             symbol, bar_data[symbol], b15, daily, qd, vol_profile=_vp)
+
+    @staticmethod
+    def _extract_today_bars(bar_5m: pd.DataFrame) -> pd.DataFrame:
+        """提取当天的bar（通过检测>30分钟的gap识别日间分界）。"""
+        if len(bar_5m) < 2:
+            return bar_5m
+        idx = bar_5m.index
+        diffs = idx.to_series().diff()
+        gaps = diffs[diffs > pd.Timedelta(minutes=30)]
+        if len(gaps) > 0:
+            pos = bar_5m.index.get_loc(gaps.index[-1])
+            return bar_5m.iloc[pos:]
+        return bar_5m
 
     @staticmethod
     def _calc_display_data(
@@ -1724,13 +1943,14 @@ class IntradayMonitor:
                         pass
                 if cur <= 0:
                     cur = float(b5.iloc[-1]["close"])
-                pnl = (cur - sp["entry_price"]) if sp["direction"] == "LONG" \
-                    else (sp["entry_price"] - cur)
+                ep_fut = sp.get("entry_price_fut", sp["entry_price"])
+                pnl = (cur - ep_fut) if sp["direction"] == "LONG" \
+                    else (ep_fut - cur)
                 floating_pts += pnl
                 d = "L" if sp["direction"] == "LONG" else "S"
                 exec_flag = "*" if sp.get("is_executed") else ""
                 shadow_parts.append(
-                    f"{s_sym}{exec_flag} {d}@{sp['entry_price']:.0f}"
+                    f"{s_sym}{exec_flag} {d}@{ep_fut:.0f}"
                     f" {'+' if pnl >= 0 else ''}{pnl:.0f}pt")
         total_pts = self._shadow_closed_pnl + floating_pts
         total_trades = self._shadow_closed_count + len(self._shadow_positions)

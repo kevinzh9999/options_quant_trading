@@ -444,16 +444,33 @@ def check_exit(
     symbol: str = "",
     spot_price: float = 0.0,
 ) -> dict:
-    """
-    Multi-timeframe Bollinger exit system.
+    """因子化exit入口。通过ExitEvaluator评估，输出格式不变。"""
+    from strategies.intraday.factors import create_default_exit_evaluator
+    prof = SYMBOL_PROFILES.get(symbol, _DEFAULT_PROFILE) if symbol else _DEFAULT_PROFILE
+    ew = prof.get("exit_weights")
+    evaluator = create_default_exit_evaluator(ew)
+    return evaluator.evaluate(
+        position, current_price, bar_5m, bar_15m,
+        current_time_utc, symbol=symbol, spot_price=spot_price,
+        is_high_vol=is_high_vol,
+    )
+
+
+def _check_exit_legacy(
+    position: dict,
+    current_price: float,
+    bar_5m: pd.DataFrame,
+    bar_15m: pd.DataFrame | None,
+    current_time_utc: str,
+    reverse_signal_score: int = 0,
+    is_high_vol: bool = True,
+    symbol: str = "",
+    spot_price: float = 0.0,
+) -> dict:
+    """旧check_exit方法体（供双路径验证）。
 
     Priority: EOD > StopLoss > Lunch > TrailingStop > TrendComplete >
               MomentumExhausted > MidBreak > TimeStop
-
-    Price convention (live monitor):
-      - current_price / highest / lowest / entry_price: 期货价格（止损/跟踪止盈/PnL）
-      - spot_price: 现货价格（Bollinger zone判断，与bar_5m/bar_15m同源）
-      - 回测时 spot_price=0 → fallback 到 current_price（回测全用现货）
     """
     entry_price = position["entry_price"]
     direction = position["direction"]
@@ -820,7 +837,7 @@ SYMBOL_PROFILES: Dict[str, Dict] = {
         "dm_contrarian": 0.9,         # 轻度逆势惩罚，避免过度打折逆势交易
         "trailing_stop_scale": 1.5,   # 215天验证：1.5x > 1.0x（IM+259pt）
         "stop_loss_pct": 0.003,       # 217天稳健性三检通过：+366pt，邻域✅分半✅单日18%✅
-        "signal_threshold": 50,       # 新baseline分半✅(+185/+186对称)，+370pt，多次一致最优
+        "signal_threshold": 60,       # 681/219双窗口验证: OOS最优(60,0.3%)=+5571 > 旧(55)=+5045(+526pt); IS -272pt但比值1.17更鲁棒
         "session_multiplier": {
             "0935-1030": 1.0,
             "1030-1130": 1.1,
@@ -890,9 +907,10 @@ SYMBOL_PROFILES: Dict[str, Dict] = {
         "daily_conflict_penalty": 0.7,
         "dm_trend": 1.1,              # 215天验证：1.1/0.9 > 1.2/0.8
         "dm_contrarian": 0.9,
-        "signal_threshold": 60,       # 动态lb+th55/60: IC从65降至60（配合lb=4震荡模式）
+        "signal_threshold": 55,       # 681/219双窗口验证: OOS最优(55,0.3%)=+2575 > 旧(60,0.5%)=+1663(+912pt,+55%); IS无损失
         "trailing_stop_scale": 2.0,   # IC趋势中震荡大，需要更宽trailing（5/5周稳健验证）
-        "me_ratio": 0.12,             # 新baseline分半✅(+16/+51)，+67pt
+        "stop_loss_pct": 0.003,       # 681/219双窗口验证: 0.3%在OOS上优于0.5%(+912pt含thr+sl); 与IM趋同
+        "me_ratio": 0.10,             # 681/219双窗口验证: 0.10 OOS=+2929 > 旧0.12 OOS=+2575(+354pt,+14%); 与IM趋同
         "session_multiplier": {
             "0935-1030": 1.0,
             "1030-1130": 1.1,
@@ -1011,13 +1029,16 @@ def _get_session_weight(utc_time: time, session_map: Dict[str, float]) -> float:
 # ---------------------------------------------------------------------------
 
 class SignalGeneratorV2:
-    """简化三维度信号评分系统（A股特化参数）。"""
+    """因子化信号评分系统（A股特化参数）。"""
 
     def __init__(self, config: Dict | None = None):
         cfg = config or {}
         self.min_signal_score: int = cfg.get("min_signal_score", 50)
         self.debug: bool = cfg.get("debug", False)
         self._opening_bars: int = cfg.get("opening_bars", 6)
+        # 因子化组合器
+        from strategies.intraday.factors import create_default_combiner
+        self._combiner = create_default_combiner()
 
     def update(
         self, symbol: str, bar_5m: pd.DataFrame,
@@ -1085,6 +1106,7 @@ class SignalGeneratorV2:
         d_override: Dict[str, float] | None = None,
         vol_profile: Dict[str, list] | None = None,
     ) -> Dict | None:
+        """因子化评分入口。通过 FactorCombiner 计算，输出格式不变。"""
         prof = SYMBOL_PROFILES.get(symbol, _DEFAULT_PROFILE)
         lb_5m = prof.get("momentum_lookback_5m", MOM_5M_LOOKBACK)
         if bar_5m is None or len(bar_5m) < lb_5m + 1:
@@ -1093,16 +1115,53 @@ class SignalGeneratorV2:
         if utc_time and (utc_time < NO_TRADE_BEFORE or utc_time > NO_TRADE_AFTER):
             return None
 
+        # 更新 combiner 的 per-symbol 权重
+        fw = prof.get("factor_weights")
+        if fw:
+            self._combiner.weights = fw
+        else:
+            self._combiner.weights = {}
+
+        from strategies.intraday.factors import ScoringContext
+        ctx = ScoringContext(
+            symbol=symbol,
+            close_5m=bar_5m["close"].values,
+            high_5m=bar_5m["high"].values,
+            low_5m=bar_5m["low"].values,
+            volume_5m=bar_5m["volume"].values,
+            bar_15m=bar_15m,
+            daily_bar=daily_bar,
+            utc_time=utc_time,
+            vol_profile=vol_profile,
+            profile=prof,
+            current_close=float(bar_5m["close"].values[-1]),
+            bar_5m_df=bar_5m,
+        )
+        return self._combiner.combine(
+            ctx, daily_bar=daily_bar, sentiment=sentiment,
+            zscore=zscore, is_high_vol=is_high_vol, d_override=d_override,
+        )
+
+    # ── DEPRECATED: 旧方法保留一个release cycle，逻辑已移至 factors.py ──
+
+    def _score_all_legacy(self, symbol, bar_5m, bar_15m, daily_bar,
+                          quote_data=None, sentiment=None, zscore=None,
+                          is_high_vol=True, d_override=None, vol_profile=None):
+        """旧 score_all 方法体（仅供 verify_factor_migration.py 双路径验证）。"""
+        prof = SYMBOL_PROFILES.get(symbol, _DEFAULT_PROFILE)
+        lb_5m = prof.get("momentum_lookback_5m", MOM_5M_LOOKBACK)
+        if bar_5m is None or len(bar_5m) < lb_5m + 1:
+            return None
+        utc_time = _get_utc_time(bar_5m)
+        if utc_time and (utc_time < NO_TRADE_BEFORE or utc_time > NO_TRADE_AFTER):
+            return None
         close_5m = bar_5m["close"].values
         high_5m = bar_5m["high"].values
         low_5m = bar_5m["low"].values
         volume_5m = bar_5m["volume"].values
         current_close = float(close_5m[-1])
-
         s_mom, mom_dir = self._score_momentum(close_5m, bar_15m, daily_bar, lb_5m)
         s_vol, atr_short = self._score_volatility(high_5m, low_5m, close_5m)
-
-        # Q分：优先用历史同时段分位数（消除跨日volume偏差），fallback到rolling均值
         if vol_profile and utc_time:
             slot = utc_time.strftime("%H:%M")
             hist_vols = vol_profile.get(slot)
@@ -1112,14 +1171,10 @@ class SignalGeneratorV2:
                 s_qty = self._score_volume(volume_5m, mom_dir)
         else:
             s_qty = self._score_volume(volume_5m, mom_dir)
-
-        # 布林带突破加分（0~20分，仅动量已确认方向时生效）
         s_breakout, breakout_note = 0, ""
         if s_mom > 0 and mom_dir:
             s_breakout, breakout_note = _score_boll_breakout(
                 close_5m, bar_15m, mom_dir, volume_5m)
-
-        # 趋势启动检测器（0~15分，突破+振幅+放量三重确认）
         s_startup, startup_note = 0, ""
         if mom_dir:
             # 传入volume分位数（如有），消��跨日偏差

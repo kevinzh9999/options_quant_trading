@@ -467,8 +467,8 @@ def _eod_trade_records(trade_ref, trade_date: str, db) -> int:
 
 def _eod_archive_minute_bars(api, trade_date: str, db) -> int:
     """
-    用 get_kline_serial/get_tick_serial 归档当天的全部分钟线/Tick/ETF 数据。
-    免费版API，无需DataDownloader（Pro功能）。
+    归档当天的全部分钟线/Tick/ETF 数据。
+    K线用 get_kline_serial，Tick用 DataDownloader（获取完整全天数据）。
 
     归档内容（四库分流）:
       trading.db:   期货主连 1m+5m, 现货指数 1m+5m
@@ -536,23 +536,55 @@ def _eod_archive_minute_bars(api, trade_date: str, db) -> int:
             return 0
 
     def _archive_tick(tq_sym, symbol):
-        """用get_tick_serial获取Tick并写入DB。"""
+        """用DataDownloader下载当天完整Tick并写入DB（BJ→UTC转换）。"""
         nonlocal total
         try:
-            tk = api.get_tick_serial(tq_sym, data_length=10000)
-            api.wait_update()
-            if tk is None or tk.empty:
-                return 0
-            df = tk[tk["last_price"] > 0].copy()
-            df["dt_str"] = pd.to_datetime(df["datetime"], unit="ns").dt.strftime(
-                "%Y-%m-%d %H:%M:%S.%f")
-            df = df[df["dt_str"].str.startswith(date_dash)]
+            import tempfile as _tmpmod
+            from datetime import timedelta as _td
+            from tqsdk.tools import DataDownloader as _DL
+
+            td_date = date(int(trade_date[:4]), int(trade_date[4:6]),
+                           int(trade_date[6:]))
+            csv_path = os.path.join(_tmpmod.gettempdir(),
+                                    f"eod_tick_{symbol}_{trade_date}.csv")
+
+            dl = _DL(api, symbol_list=tq_sym, dur_sec=0,
+                     start_dt=td_date, end_dt=td_date,
+                     csv_file_name=csv_path)
+
+            _deadline = time.time() + 120
+            while not dl.is_finished():
+                api.wait_update(deadline=_deadline)
+                if time.time() > _deadline:
+                    logger.warning("归档 tick %s 超时(120s)", symbol)
+                    return 0
+
+            df = pd.read_csv(csv_path)
             if df.empty:
                 return 0
+
+            # DataDownloader输出BJ时间，转UTC（-8h）
+            dt_col = df.columns[0]
+            dt_parsed = pd.to_datetime(df[dt_col])
+            dt_utc = dt_parsed - _td(hours=8)
+            df["dt_str"] = dt_utc.dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+            # 只保留当天UTC数据
+            df = df[dt_utc.dt.strftime("%Y-%m-%d") == date_dash]
+            if df.empty:
+                return 0
+
             n = len(df)
+            cols = df.columns.tolist()
+            def _find(kw):
+                for c in cols:
+                    if kw in c.lower():
+                        return c
+                return kw
             def _c(name, dtype=float, default=0):
-                return df[name].fillna(default).astype(dtype).tolist() \
-                    if name in df.columns else [default]*n
+                col = _find(name)
+                return df[col].fillna(default).astype(dtype).tolist() \
+                    if col in df.columns else [default]*n
+
             rows = list(zip(
                 [symbol]*n, df["dt_str"].tolist(),
                 _c("last_price"), _c("average"), _c("highest"), _c("lowest"),
@@ -568,6 +600,11 @@ def _eod_archive_minute_bars(api, trade_date: str, db) -> int:
             conn.close()
             total += n
             logger.info("归档 tick %s: %d 行", symbol, n)
+            # 清理临时文件
+            try:
+                os.remove(csv_path)
+            except OSError:
+                pass
             return n
         except Exception as e:
             logger.warning("归档 tick %s 失败: %s", symbol, e)
@@ -1209,6 +1246,8 @@ def _calc_market_regime(db, model: dict | None) -> dict | None:
     """
     从 IM.CFX 日线数据计算市场状态评估指标。
 
+    model=None 时安全返回 None（不抛异常）。
+
     Returns dict with keys:
         garch_cond_vol, garch_long_vol, garch_ratio, garch_state
         rv5, rv20, rv60, rv_trend
@@ -1217,6 +1256,8 @@ def _calc_market_regime(db, model: dict | None) -> dict | None:
         vrp_percentile
         summary
     """
+    if model is None:
+        return None
     try:
         df = db.query_df(
             "SELECT trade_date, close FROM futures_daily "
@@ -1534,11 +1575,17 @@ def _print_eod_summary(
     print(sep)
     print()
 
-    # 生成 Markdown 报告并持久化
+    # 生成 Markdown 报告并持久化（即使model=None也保存，记录账户和持仓）
     try:
+        regime = None
+        if db and model:
+            try:
+                regime = _calc_market_regime(db, model)
+            except Exception as e:
+                logger.warning("市场状态评估失败（不影响报告保存）: %s", e)
         md = _generate_eod_markdown(
             trade_date, account, positions, n_trades, model,
-            regime=_calc_market_regime(db, model) if db else None,
+            regime=regime,
             backfill=backfill,
             db=db,
         )

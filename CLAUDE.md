@@ -151,44 +151,43 @@ A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - `_score_momentum()` 根据 `check_low_amplitude()` 返回的振幅动态选择lookback
 - 振幅阈值1.5%在1.0-2.0%范围内稳健（12个邻域全正）
 
-### 日内策略品种配置（2026-04-08更新，方案E 216天回测验证）
+### 日内策略品种配置（2026-04-12更新，681/219双窗口验证）
 
-| 品种 | 类型 | 状态 | 阈值 | dm(顺/逆) | trail_scale | M分lb | PnL(216d) | 均PnL |
-|------|------|------|------|-----------|-------------|-------|-----------|-------|
-| IM | 动量 | **实盘** | 50 | 1.1/0.9 | 1.5x | 动态4/12 | +2518 | +11.5 |
-| IC | 动量 | **实盘** | 60 | 1.1/0.9 | 2.0x | 动态4/12 | +2142 | +9.8 |
-| IF | 均值回归 | 观察 | 60 | 1.0/1.0 | 1.0x | 动态4/12 | 未测 | — |
-| IH | — | 放弃 | 60 | 1.1/0.9 | 1.0x | 动态4/12 | 未测 | — |
+**v2 当前参数（实盘运行）：**
 
-IM+IC合计 **+4660pt/219天**（2025-05-16~2026-04-09）。含Q分分位数+15m修复+IM thr=50+IC ME=0.12。
+| 品种 | 类型 | 状态 | 阈值 | sl | me_ratio | trail_scale | M分lb |
+|------|------|------|------|-----|---------|-------------|-------|
+| IM | 动量 | **实盘** | 60 | 0.3% | 0.10 | 1.5x | 动态4/12 |
+| IC | 动量 | **实盘** | 55 | 0.3% | 0.10 | 2.0x | 动态4/12 |
+| IF | 均值回归 | 观察 | 60 | 0.5% | 0.10 | 1.0x | 动态4/12 |
+| IH | — | 放弃 | 60 | 0.5% | 0.10 | 1.0x | 动态4/12 |
 
-**04-07~08 方案E改动（+20.2% vs 旧baseline +4124pt）：**
-- M分lookback：静态lb=12 → 动态lb=4/12（振幅<1.5%用4，否则12）
-- signal_threshold：IM 60→55，IC 65→60（动态lb提升了低分段信号质量）
-- d_override禁用（briefing dm累计-19.2%负贡献，改为纯算法dm 1.1/0.9）
+IM+IC v2合计 **+4234pt/219天**（2025-05-16~2026-04-09）。
 
-**04-04三项改动（215天敏感分析后实施，+21%/+717pt）：**
-- dm_trend/dm_contrarian 1.2/0.8→1.1/0.9（IM/IC/IH，IF保持1.0/1.0）
-- IM trailing_stop_scale 1.0→1.5x
-- 开盘30min振幅<0.4%过滤器（`check_low_amplitude()`）
+**04-12 参数切换（681/219双窗口30组合验证）：**
+- IM: thr 55→60, sl保持0.3%（OOS +526pt）
+- IC: thr 60→55, sl 0.5%→0.3%, me_ratio 0.12→0.10（OOS +912pt +354pt）
+- 参数空间高原型确认：IS效率跟参数关系弱，主要来自市场环境
 
-**此前改善来源（34天验证期）：**
-- 15分钟重采样对齐修复（label='left'）：最大单项改善
-- ME narrow_range ratio 0.20→0.10（+393pt合计）
-- MID_BREAK bars 2→3（+76pt合计）
-- IC trailing_stop_scale=2.0x（+186pt）
-- 午后session_weight 0.8→1.0（+76pt）
+**v1 新映射系统（shadow trade 并行中）：**
 
-- **实盘品种**：IM+IC，`IntradayConfig.tradeable = {"IM", "IC"}`，只有这两个品种通过strategy开仓占position_mgr槽位、写信号给executor、注册shadow持仓
-- **IF观察**：monitor全品种监控面板显示评分，但不占position_mgr槽位、不触发开仓。IF的BE=1.2pt余量小，等shadow验证2-4周后决定
-- **IH放弃日内**：BE=0.6pt无法覆盖滑点+手续费
-- IC的thr=60（从65下调）：动态lb改善了低分段信号质量，60-64分不再是"死亡区间"
-- IF的dm=1.0/1.0：IF逆势59%WR是利润主力，中性dm比惩罚逆势(0.8)+75%
-- 全品种统一v2：v3消灭了IF/IH的逆势交易（利润来源），干净数据验证v2更优
+| 品种 | 版本 | threshold | 状态 | 单笔效率vs v2 |
+|------|------|----------|------|-------------|
+| IM | v1_im | 60 | shadow观察 | +114.8% |
+| IC | v1_ic | 60 | shadow观察 | +106.9% |
 
-### 信号阈值（2026-04-09更新）
-- **IM阈值50**（分半+185/+186完美对称，+370pt），IC/IF/IH=60
-- 阈值来源：`SYMBOL_PROFILES.signal_threshold`（IM=50, IC=60, IF=60, IH=60）
+v1是独立评分系统，数据驱动映射替代v2的手工分档。详见 `docs/signal_new_mapping_v1.md`。
+v1 overlay嵌入monitor的_on_new_bar末尾，写入shadow_trades_new_mapping表。
+
+**外部数据中性化状态（monitor和backtest一致）：**
+- daily_bar = None → daily_mult/dm_trend/dm_contrarian/intraday_filter 全部不活跃
+- sentiment = None, zscore = None, is_high_vol = True（固定）
+- d_override = None（禁用）
+- 唯一活跃的外部数据：vol_profile
+
+### 信号阈值（2026-04-12更新）
+- **IM阈值60**，IC阈值55（681/219双窗口验证）
+- 阈值来源：`SYMBOL_PROFILES.signal_threshold`
 - 可通过 `--threshold` 参数覆盖回测阈值
 
 ### Monitor/Executor 职责分离（2026-03-31重构，04-02补充）

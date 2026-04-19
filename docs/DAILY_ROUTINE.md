@@ -59,8 +59,10 @@ python scripts/quadrant_monitor.py --once
 ### 执行
 
 ```bash
-# 终端1：日内信号monitor
+# 终端1：日内信号monitor（含v1 overlay自动并行）
 python -m strategies.intraday.monitor
+# monitor启动时自动初始化v1 overlay，打印"[V1] overlay初始化成功"
+# v1 shadow trade自动写入shadow_trades_new_mapping表
 
 # 终端2：期权波动率monitor
 python scripts/vol_monitor.py
@@ -68,9 +70,10 @@ python scripts/vol_monitor.py
 # 终端3：策略象限monitor（每5分钟刷新）
 python scripts/quadrant_monitor.py
 
-# 终端4：半自动下单（可选，信号触发时确认下单）
-python scripts/order_executor.py          # 实盘
-python scripts/order_executor.py --dry-run # 只显示不下单
+# 终端4：半自动下单
+python scripts/order_executor.py                        # 实盘（默认v2信号）
+python scripts/order_executor.py --signal-source v1     # v1信号（观察期后切换）
+python scripts/order_executor.py --dry-run              # 只显示不下单
 ```
 
 ### 观察和记录
@@ -193,6 +196,7 @@ python scripts/backtest_signals_day.py --symbol IM --date $(date +%Y%m%d)
 - [ ] 象限判定和持仓匹配度正常？
 - [ ] Markdown报告已保存？
 - [ ] shadow_trades表有今天的记录？
+- [ ] shadow_trades_new_mapping表有v1的记录？（v1观察期）
 - [ ] executor_log表记录完整？
 - [ ] 回测结果和实盘信号是否一致？
 
@@ -211,7 +215,7 @@ python scripts/backtest_signals_day.py --symbol IM --date $(date +%Y%m%d)
 
 **信号层面**
 ```bash
-# 查看今日shadow trades（系统理想交易）
+# 查看今日v2 shadow trades（系统理想交易）
 python -c "
 import sqlite3
 conn = sqlite3.connect('data/storage/trading.db')
@@ -222,9 +226,21 @@ rows = conn.execute('''
     WHERE trade_date = strftime('%Y%m%d', 'now')
     ORDER BY entry_time
 ''').fetchall()
-print('Shadow trades (理想交易):')
+print('v2 Shadow trades:')
 for r in rows:
     print(f'  {r[0]} {r[1]} {r[2]} @{r[3]:.0f} -> {r[4]} @{r[5]:.0f} {r[6]} {r[7]:+.1f}pt')
+
+# v1 shadow trades
+rows2 = conn.execute('''
+    SELECT entry_time, symbol, direction, entry_price,
+           exit_time, exit_price, exit_reason, pnl_pts, signal_version
+    FROM shadow_trades_new_mapping
+    WHERE trade_date = strftime('%Y%m%d', 'now')
+    ORDER BY entry_time
+''').fetchall()
+print(f'v1 Shadow trades ({len(rows2)}笔):')
+for r in rows2:
+    print(f'  {r[0]} {r[1]} {r[2]} @{r[3]:.0f} -> {r[4]} @{r[5]:.0f} {r[6]} {r[7]:+.1f}pt [{r[8]}]')
 conn.close()
 "
 
@@ -249,6 +265,7 @@ conn.close()
 - 今天最强的信号是什么？得分多少？方向对了吗？
 - shadow trades vs 实际执行：差异多大？你选N跳过的信号后来赚了还是亏了？
 - executor有没有撤单或超时？原因是什么？
+- v1 vs v2 shadow trade对比：v1今天跟v2的信号差异多大？v1漏掉了什么？v1多做了什么？
 - 有没有信号系统漏掉的交易机会（你有感觉但系统没给分）？
 
 **波动率层面**
