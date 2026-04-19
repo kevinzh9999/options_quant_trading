@@ -58,12 +58,17 @@ def _build_15m_from_5m(bar_5m: pd.DataFrame) -> pd.DataFrame:
 
 
 def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
-            slippage: float = 0, version: str = "auto") -> List[Dict]:
+            slippage: float = 0, version: str = "auto",
+            score_transform=None, threshold_override: int = 0) -> List[Dict]:
     """Replay one day. Returns list of completed trades.
 
     Args:
         slippage: points of slippage per trade (applied adversely on entry and exit)
         version: "v1", "v2", "v3", or "auto" (use SIGNAL_ROUTING)
+        score_transform: callable(result_dict, bj_time) -> int. 如果提供，用返回值替代
+            sig.score做threshold判断。result_dict是score_all()的完整输出。
+            用于测试评分公式变体（如M二值化、V相对化）而不自建backtest loop。
+        threshold_override: 如果>0，用此值替代SYMBOL_PROFILES的threshold。
     """
     date_dash = f"{td[:4]}-{td[4:6]}-{td[6:]}"
 
@@ -179,7 +184,7 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
     # Per-symbol threshold（IC=65等，从SYMBOL_PROFILES读取）
     from strategies.intraday.A_share_momentum_signal_v2 import SYMBOL_PROFILES, _DEFAULT_PROFILE
     _sym_prof = SYMBOL_PROFILES.get(sym, _DEFAULT_PROFILE)
-    effective_threshold = _sym_prof.get("signal_threshold", _SIGNAL_THRESHOLD)
+    effective_threshold = threshold_override if threshold_override > 0 else _sym_prof.get("signal_threshold", _SIGNAL_THRESHOLD)
 
     # Morning Briefing d_override（和monitor一致）
     d_override = None
@@ -471,12 +476,20 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
             else:
                 _low_amplitude = False
 
+        # score_transform: 用回调替代sig.score做threshold判断
+        _entry_score = sig.score if sig else 0
+        if score_transform and result and sig:
+            try:
+                _entry_score = score_transform(result, bj_time)
+            except Exception:
+                pass
+
         if (position is None and not action_str and sig is not None
-                and sig.score >= effective_threshold
+                and _entry_score >= effective_threshold
                 and not _low_amplitude):
             # 用sig的direction（与monitor一致，update()返回的方向）
             direction = sig.direction
-            score = sig.score
+            score = _entry_score
             # Apply slippage adversely on entry
             entry_p = price + slippage if direction == "LONG" else price - slippage
             # Compute rebound/pullback from recent 20-bar extreme (use signal bars)

@@ -461,6 +461,10 @@ dashboard/pages/model_diagnostics.py ← 含 GARCH 预测回测 section
 
 5. **Python 解释器**：`/opt/homebrew/Caskroom/miniforge/base/envs/quant/bin/python`
 
+6. **multiprocessing 必须用脚本文件**：`python -c "..."` 内联代码中定义的 `worker` 函数无法被 pickle，`Pool.map()` 会报 `AttributeError: Can't get attribute 'worker' on <module '__main__' (built-in)>`。任何需要多进程的计算必须写成 `.py` 脚本文件，在 `if __name__ == '__main__':` 下调用 Pool。**绝对不要在 `-c` 模式下使用 multiprocessing。**
+
+7. **Backtest baseline 必须用 run_day()**：任何参数/评分调整的对比实验，baseline 必须直接调用 `scripts/backtest_signals_day.py` 的 `run_day()` 函数，**不要自建 backtest loop**。自建 loop 用 `score_all()` 直接比 threshold 会绕过 `gen.update()` 内部的 `is_open_allowed()` / `min_signal_score` 等过滤逻辑，导致 trade 集合不一致。实验组如需修改评分逻辑，应在 `run_day()` 基础上添加参数（如 `score_override` 回调），而不是重写整个 backtest loop。**不可比的 baseline 得出的结论是无效的。**
+
 ---
 
 ## 常用命令速查

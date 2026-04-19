@@ -1,27 +1,32 @@
 """
 reversal_signal.py
 ------------------
-K线反转信号检测器。
+反转信号检测器。
 
-检测逻辑：
-  - 4根连续阴线 → BEAR_CONFIRMED 趋势
-  - 4根连续阳线 → BULL_CONFIRMED 趋势
-  - 趋势确认后，3根连续反向K线 → 反转信号
-  - depth = trend_confirm_price - trend_extreme_price（绝对点数）
-  - 反转触发后重置状态机，进入新趋势
+两种实现：
+1. ReversalDetector（v1）：K线阴阳计数，4连阴确认趋势+3连阳检测反转
+2. ReversalDetectorSlope（v2）：线性回归斜率，长窗口确认趋势+短窗口检测反转
+   - 趋势确认：长窗口（8根bar）斜率 < bear_thr → BEAR
+   - 反转检测：短窗口（6根bar）斜率 > rev_thr → LONG反转
+   - 无NONE退出：BEAR/BULL只能通过反转互相转换
+   - depth过滤：confirm_high - trend_low >= min_depth
 
-Per-symbol配置：enabled/min_depth/max_depth。
+Per-symbol配置：enabled + 方法特定参数。
 """
 
 from __future__ import annotations
 from typing import Dict, Optional
+import numpy as np
 
 
 REVERSAL_CONFIG: Dict[str, Dict] = {
-    "IM": {"enabled": True, "min_depth": 10, "max_depth": 30},
-    "IC": {"enabled": False, "min_depth": 10, "max_depth": 30},  # disabled until verified
-    "IF": {"enabled": False, "min_depth": 10, "max_depth": 30},
-    "IH": {"enabled": False, "min_depth": 10, "max_depth": 30},
+    "IM": {
+        "enabled": True, "method": "slope",
+        "long_n": 8, "short_n": 6, "bear_thr": -1.5, "rev_thr": 3.0, "min_depth": 25,
+    },
+    "IC": {"enabled": False},
+    "IF": {"enabled": False},
+    "IH": {"enabled": False},
 }
 
 
@@ -164,3 +169,102 @@ class ReversalDetector:
                 self.consec_bear = 3
 
         return reversal_signal
+
+
+class ReversalDetectorSlope:
+    """Slope-based reversal detector using linear regression.
+
+    Trend confirmation: slope of closes over long_n bars.
+    Reversal detection: slope of closes over short_n bars flips.
+    No exit to NONE — BEAR/BULL only transition via reversal.
+
+    Parameters (from config):
+        long_n: bars for trend slope (default 8 = 40min)
+        short_n: bars for reversal slope (default 6 = 30min)
+        bear_thr: slope threshold for BEAR confirmation (default -1.5 pt/bar)
+        rev_thr: slope threshold for reversal detection (default 3.0 pt/bar)
+        min_depth: minimum depth (confirm_high - trend_low) to fire signal
+    """
+
+    def __init__(self, symbol: str, config: Dict | None = None):
+        self.symbol = symbol
+        cfg = config or REVERSAL_CONFIG.get(symbol, {})
+        self.enabled = cfg.get("enabled", False)
+        self.long_n = cfg.get("long_n", 8)
+        self.short_n = cfg.get("short_n", 6)
+        self.bear_thr = cfg.get("bear_thr", -1.5)
+        self.rev_thr = cfg.get("rev_thr", 3.0)
+        self.min_depth = cfg.get("min_depth", 25)
+        self.reset()
+
+    def reset(self) -> None:
+        self.state: str = "NONE"
+        self._closes: list = []
+        self._highs: list = []
+        self._lows: list = []
+        self.confirm_high: float = 0.0
+        self.confirm_low: float = 0.0
+        self.trend_high: float = 0.0
+        self.trend_low: float = 0.0
+
+    def update(self, bar_open: float, bar_high: float,
+               bar_low: float, bar_close: float) -> Optional[ReversalSignal]:
+        if not self.enabled:
+            return None
+
+        self._closes.append(bar_close)
+        self._highs.append(bar_high)
+        self._lows.append(bar_low)
+        n = len(self._closes)
+
+        if n < self.long_n:
+            return None
+
+        sL = np.polyfit(range(min(n, self.long_n)),
+                        self._closes[-min(n, self.long_n):], 1)[0]
+        sS = np.polyfit(range(min(n, self.short_n)),
+                        self._closes[-min(n, self.short_n):], 1)[0]
+
+        signal = None
+
+        if self.state == "NONE":
+            if sL <= self.bear_thr:
+                self.state = "BEAR"
+                self.confirm_high = max(self._highs[-self.long_n:])
+                self.confirm_low = min(self._lows[-self.long_n:])
+                self.trend_low = self.confirm_low
+                self.trend_high = self.confirm_high
+            elif sL >= -self.bear_thr:
+                self.state = "BULL"
+                self.confirm_high = max(self._highs[-self.long_n:])
+                self.confirm_low = min(self._lows[-self.long_n:])
+                self.trend_high = self.confirm_high
+                self.trend_low = self.confirm_low
+
+        elif self.state == "BEAR":
+            self.trend_low = min(self.trend_low, bar_low)
+            self.trend_high = max(self.trend_high, bar_high)
+            if sS >= self.rev_thr:
+                depth = self.confirm_high - self.trend_low
+                if depth >= self.min_depth:
+                    signal = ReversalSignal(direction="LONG", depth=depth)
+                self.state = "BULL"
+                self.confirm_low = self.trend_low
+                self.confirm_high = bar_high
+                self.trend_high = bar_high
+                self.trend_low = bar_low
+
+        elif self.state == "BULL":
+            self.trend_high = max(self.trend_high, bar_high)
+            self.trend_low = min(self.trend_low, bar_low)
+            if sS <= -self.rev_thr:
+                depth = self.trend_high - self.confirm_low
+                if depth >= self.min_depth:
+                    signal = ReversalSignal(direction="SHORT", depth=depth)
+                self.state = "BEAR"
+                self.confirm_high = self.trend_high
+                self.confirm_low = bar_low
+                self.trend_low = bar_low
+                self.trend_high = bar_high
+
+        return signal

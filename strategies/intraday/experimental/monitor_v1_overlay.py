@@ -59,7 +59,7 @@ class MonitorV1Overlay:
         for sym, b5 in bar_data.items():
             if sym not in ('IM', 'IC'):
                 continue
-            if b5 is None or len(b5) < 20:
+            if b5 is None or not hasattr(b5, 'iloc') or len(b5) < 20:
                 continue
 
             b15 = bar_15m_data.get(sym)
