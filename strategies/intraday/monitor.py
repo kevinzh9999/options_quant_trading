@@ -133,6 +133,17 @@ class IntradayRecorder:
             ("direction_v3", "TEXT"),
             ("style_v3", "TEXT"),
             ("signal_version", "TEXT"),
+            ("s_momentum", "INT"),
+            ("s_volatility", "INT"),
+            ("s_quality", "INT"),
+            ("intraday_filter", "REAL"),
+            ("time_mult", "REAL"),
+            ("sentiment_mult", "REAL"),
+            ("z_score", "REAL"),
+            ("rsi", "REAL"),
+            ("raw_score", "INT"),
+            ("filtered_score", "INT"),
+            ("filter_reason", "TEXT"),
             # 研究指标（不参与评分，供未来迭代分析）
             ("adx_14", "REAL"),
             ("body_ratio", "REAL"),
@@ -454,9 +465,11 @@ class IntradayMonitor:
         self._shadow_closed_pnl: float = 0.0
         self._shadow_closed_count: int = 0
         # 项目 tmp 目录（信号文件、持仓文件等）
+        # Per-symbol文件路径：signal_pending_IM.json, shadow_state_IM.json等
         from config.config_loader import ConfigLoader
         self._tmp_dir: str = ConfigLoader().get_tmp_dir()
-        self._signal_file: str = os.path.join(self._tmp_dir, "signal_pending.json")
+        _sym_tag = self.symbols[0] if len(self.symbols) == 1 else "ALL"
+        self._signal_file: str = os.path.join(self._tmp_dir, f"signal_pending_{_sym_tag}.json")
         # 反转信号检测器（per-symbol, per-day reset）
         # IM用slope方法，其他品种用candle方法（如enabled）
         self._reversal_detectors: Dict[str, ReversalDetector | ReversalDetectorSlope] = {}
@@ -679,7 +692,7 @@ class IntradayMonitor:
             "positions": self._shadow_positions,
             "prompted_bars": [list(k) for k in self._prompted_bars],
         }
-        path = os.path.join(self._tmp_dir, "shadow_state.json")
+        path = os.path.join(self._tmp_dir, f"shadow_state_{self.symbols[0]}.json")
         tmp_path = path + ".tmp"
         try:
             with open(tmp_path, "w") as f:
@@ -700,7 +713,7 @@ class IntradayMonitor:
         trade_date = datetime.now().strftime("%Y%m%d")
 
         # --- 1. 从 shadow_state.json 恢复活跃的 shadow 持仓 ---
-        state_path = os.path.join(self._tmp_dir, "shadow_state.json")
+        state_path = os.path.join(self._tmp_dir, f"shadow_state_{self.symbols[0]}.json")
         if os.path.exists(state_path):
             try:
                 with open(state_path) as f:
@@ -899,7 +912,7 @@ class IntradayMonitor:
                         "float_profit_short": float_pnl_short,
                     }
             import json as _json
-            path = os.path.join(self._tmp_dir, "futures_positions.json")
+            path = os.path.join(self._tmp_dir, f"futures_positions_{self.symbols[0]}.json")
             with open(path, "w") as f:
                 _json.dump({
                     "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1321,6 +1334,13 @@ class IntradayMonitor:
                 _sl_pct = _sym_prof.get("stop_loss_pct", 0.005)
                 stop = entry_price * (1 - _sl_pct) if rev.direction == "LONG" else entry_price * (1 + _sl_pct)
 
+                # 记录开仓时的布林zone（TREND_COMPLETE方案4用）
+                from strategies.intraday.atomic_factors import boll_params, boll_zone
+                _rev_zone_5m = ""
+                _b5_rev = bar_data.get(sym)
+                if _b5_rev is not None and len(_b5_rev) >= 20:
+                    _bm, _bs = boll_params(_b5_rev["close"].astype(float), 20)
+                    _rev_zone_5m = boll_zone(float(entry_price), _bm, _bs)
                 self._shadow_positions[sym] = {
                     "direction": rev.direction,
                     "entry_time_utc": utc_hm,
@@ -1335,6 +1355,7 @@ class IntradayMonitor:
                     "entry_score": 0,
                     "entry_dm": 0, "entry_f": 0, "entry_t": 0, "entry_s": 0,
                     "entry_m": 0, "entry_v": 0, "entry_q": 0,
+                    "entry_zone_5m": _rev_zone_5m,
                     "operator_action": "SIGNAL",
                     "is_executed": 0,
                     "fut_symbol": self._tq_symbols.get(sym, ""),
@@ -1637,6 +1658,12 @@ class IntradayMonitor:
                 else:
                     fut_entry = bid1 if bid1 > 0 else (last if last > 0 else entry_price)
                 sc = self._get_routed_score(sym) or {}
+                # 记录开仓时的布林zone（TREND_COMPLETE方案4用）
+                from strategies.intraday.atomic_factors import boll_params, boll_zone
+                _entry_zone_5m = ""
+                if b is not None and len(b) >= 20:
+                    _bm, _bs = boll_params(b["close"].astype(float), 20)
+                    _entry_zone_5m = boll_zone(float(entry_price), _bm, _bs)
                 self._shadow_positions[sym] = {
                     "direction": direction,
                     "entry_time_utc": _now_utc.strftime("%H:%M"),
@@ -1655,6 +1682,7 @@ class IntradayMonitor:
                     "entry_m": sc.get("s_momentum", 0),
                     "entry_v": sc.get("s_volatility", 0),
                     "entry_q": sc.get("s_volume", 0),
+                    "entry_zone_5m": _entry_zone_5m,
                     "operator_action": "SIGNAL",
                     "is_executed": 0,
                     "fut_symbol": self._tq_symbols.get(sym, ""),
@@ -1964,7 +1992,22 @@ class IntradayMonitor:
 
 
 def main():
-    monitor = IntradayMonitor()
+    import argparse
+    parser = argparse.ArgumentParser(description="日内信号监控（per-symbol单进程）")
+    parser.add_argument("--symbol", required=True,
+                        choices=["IF", "IH", "IM", "IC"],
+                        help="监控品种（每个品种独立进程）")
+    args = parser.parse_args()
+
+    sym = args.symbol
+    tradeable = {sym} if sym in {"IM", "IC"} else set()
+
+    config = IntradayConfig()
+    config.universe = {sym}
+    config.tradeable = tradeable
+    config.max_position = 1  # per-symbol独立，最多1手
+
+    monitor = IntradayMonitor(config=config)
     monitor.run()
 
 

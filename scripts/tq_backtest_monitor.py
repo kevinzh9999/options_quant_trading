@@ -19,7 +19,9 @@ import pandas as pd
 
 
 def run_tq_backtest(td: str, symbols: List[str] = None):
-    """用TqBacktest回放指定日期，直接驱动monitor。"""
+    """用TqBacktest回放指定日期，per-symbol独立跑monitor。
+    对每个symbol分别创建TqApi+Monitor实例，避免跨品种干扰。
+    """
     from dotenv import load_dotenv
     load_dotenv()
 
@@ -27,6 +29,24 @@ def run_tq_backtest(td: str, symbols: List[str] = None):
 
     if symbols is None:
         symbols = ["IM", "IC"]
+
+    # Per-symbol独立跑，合并结果
+    all_trades = []
+    for _sym in symbols:
+        trades = _run_tq_backtest_single(td, _sym)
+        if trades is not None:
+            all_trades.append(trades)
+
+    import pandas as pd
+    if all_trades:
+        return pd.concat(all_trades, ignore_index=True)
+    return pd.DataFrame()
+
+
+def _run_tq_backtest_single(td: str, symbol: str):
+    """单品种TqBacktest回放。"""
+    from tqsdk import TqApi, TqBacktest, BacktestFinished, TqAuth
+    symbols = [symbol]  # 单品种
 
     y, m, d = int(td[:4]), int(td[4:6]), int(td[6:8])
 
@@ -39,15 +59,20 @@ def run_tq_backtest(td: str, symbols: List[str] = None):
     import tempfile
     _tqbt_db = os.path.join(tempfile.gettempdir(), f"tqbt_{td}.db")
 
+    # Per-symbol monitor（和实盘一致，每品种独立实例）
+    # 对每个symbol分别跑一次TqBacktest
+    # 这里只创建第一个symbol的monitor，后续在循环中为每个symbol独立跑
+    _sym = symbols[0]  # 当前跑的品种（循环外层控制）
     config = IntradayConfig()
-    config.universe = set(symbols)
-    config.tradeable = set(symbols)
+    config.universe = {_sym}
+    config.tradeable = {_sym} if _sym in {"IM", "IC"} else set()
+    config.max_position = 1
     monitor = IntradayMonitor(config, db_path=_tqbt_db)
-    # 隔离tmp文件（shadow_state、signal_pending等），避免污染实盘状态
-    _tqbt_tmp = os.path.join(tempfile.gettempdir(), f"tqbt_tmp_{td}")
+    # 隔离tmp文件
+    _tqbt_tmp = os.path.join(tempfile.gettempdir(), f"tqbt_tmp_{td}_{_sym}")
     os.makedirs(_tqbt_tmp, exist_ok=True)
     monitor._tmp_dir = _tqbt_tmp
-    monitor._signal_file = os.path.join(_tqbt_tmp, "signal_pending.json")
+    monitor._signal_file = os.path.join(_tqbt_tmp, f"signal_pending_{_sym}.json")
 
     # 加载日线等初始化数据
     monitor._load_daily_data()
@@ -135,18 +160,38 @@ def run_tq_backtest(td: str, symbols: List[str] = None):
     spot_klines_15m = {}
     fut_quotes = {}
 
-    # 用回测日期判断主力合约（不能用当前日期）
+    # 用回测日期判断主力合约
+    # 优先从futures_daily按OI选主力（和实盘get_main_contract逻辑一致）
     from utils.cffex_calendar import _third_friday, _yymm, active_im_months
     import pandas as _pd
     _bt_date = _pd.Timestamp(f"{td[:4]}-{td[4:6]}-{td[6:]}")
-    _bt_tf = _third_friday(_bt_date.year, _bt_date.month)
-    if _bt_date.date() < _bt_tf.date():
-        # 到期日之前：当月合约
-        near_month = _yymm(_bt_date.year, _bt_date.month)
-    else:
-        # 到期日当天或之后：下月合约（当月已交割/即将交割）
-        _active = active_im_months(td)
-        near_month = _active[1] if len(_active) > 1 else _yymm(_bt_date.year, _bt_date.month + 1)
+    _active = active_im_months(td)
+    # 查前一天的OI确定主力
+    _oi_db = _get_db()
+    _oi_df = _oi_db.query_df(
+        f"SELECT ts_code, oi FROM futures_daily "
+        f"WHERE ts_code LIKE 'IM%' AND trade_date <= '{td}' "
+        f"ORDER BY trade_date DESC LIMIT 20"
+    )
+    near_month = None
+    if _oi_df is not None and len(_oi_df) > 0:
+        # 取最新日期的各合约，找OI最大的（和实盘get_main_contract一致）
+        _latest = _oi_df.groupby("ts_code").first().reset_index()
+        _latest["oi"] = _latest["oi"].astype(float)
+        _latest = _latest.sort_values("oi", ascending=False)
+        for _, _r in _latest.iterrows():
+            _tc = str(_r["ts_code"])  # e.g. IM2606.CFX
+            _m = _tc[2:6]  # 2606
+            if _m in _active:
+                near_month = _m
+                break
+    if not near_month:
+        # fallback: 到期日逻辑
+        _bt_tf = _third_friday(_bt_date.year, _bt_date.month)
+        if _bt_date.date() < _bt_tf.date():
+            near_month = _yymm(_bt_date.year, _bt_date.month)
+        else:
+            near_month = _active[1] if len(_active) > 1 else _yymm(_bt_date.year, _bt_date.month + 1)
 
     for sym in symbols:
         spot_sym = SPOT_TQ.get(sym)

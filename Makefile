@@ -17,8 +17,14 @@ briefing:
 	$(PYTHON) scripts/morning_briefing.py
 
 # 盘中（单独启动各组件）
+monitor-im:
+	$(PYTHON) -m strategies.intraday.monitor --symbol IM
+
+monitor-ic:
+	$(PYTHON) -m strategies.intraday.monitor --symbol IC
+
 monitor:
-	$(PYTHON) -m strategies.intraday.monitor
+	@echo "Per-symbol monitor: make monitor-im / make monitor-ic"
 
 vol:
 	$(PYTHON) scripts/vol_monitor.py

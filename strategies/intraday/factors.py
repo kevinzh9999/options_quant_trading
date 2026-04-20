@@ -481,20 +481,36 @@ class TrailingStopCondition(ExitCondition):
 
 
 class TrendCompleteCondition(ExitCondition):
-    """基于 af.boll_zone（5m+15m双极端）原子因子。"""
+    """基于 af.boll_zone（5m+15m双极端）原子因子。
+
+    修复(2026-04-20)：加两个保护条件防止秒平——
+    1. 最小持仓10分钟（方案1）：刚开仓不触发
+    2. 开仓时已在极端zone的不触发（方案4）：只有'从内部涨到极端'才算趋势完成
+    """
     name = "TREND_COMPLETE"
     priority = 40
     urgency = "NORMAL"
+    MIN_HOLD_MINUTES = 10  # 最小持仓时间
 
     def check(self, ctx: ExitContext) -> Optional[dict]:
         if not ctx.zone_5m or not ctx.zone_15m:
             return None
+        # 方案1：最小持仓时间保护
+        if ctx.hold_minutes < self.MIN_HOLD_MINUTES:
+            return None
         direction = ctx.position["direction"]
+        # 方案4：如果开仓时已在极端zone，不触发TC
+        # （开仓时记录entry_zone到position dict，若无则不阻止——兼容旧持仓）
+        entry_zone = ctx.position.get("entry_zone_5m", "")
         if direction == "LONG":
+            if entry_zone == "ABOVE_UPPER":
+                return None  # 开仓时就在上轨之上，不算趋势完成
             if ctx.zone_5m == "ABOVE_UPPER" and ctx.zone_15m == "ABOVE_UPPER":
                 return {"should_exit": True, "exit_volume": ctx.position.get("volume", 1),
                         "exit_reason": "TREND_COMPLETE", "exit_urgency": "NORMAL"}
         else:
+            if entry_zone == "BELOW_LOWER":
+                return None  # 开仓时就在下轨之下
             if ctx.zone_5m == "BELOW_LOWER" and ctx.zone_15m == "BELOW_LOWER":
                 return {"should_exit": True, "exit_volume": ctx.position.get("volume", 1),
                         "exit_reason": "TREND_COMPLETE", "exit_urgency": "NORMAL"}

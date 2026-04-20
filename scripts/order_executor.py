@@ -43,7 +43,8 @@ from config.config_loader import ConfigLoader
 from data.storage.db_manager import DBManager
 
 _TMP_DIR = ConfigLoader().get_tmp_dir()
-SIGNAL_FILE = os.path.join(_TMP_DIR, "signal_pending.json")
+SIGNAL_FILE = os.path.join(_TMP_DIR, "signal_pending.json")  # legacy, kept for reference
+SIGNAL_PATTERN = os.path.join(_TMP_DIR, "signal_pending_*.json")  # per-symbol files
 CONTRACT_MULT = {"IF": 300, "IH": 300, "IM": 200, "IC": 200}
 STOP_LOSS_PCT = 0.005
 MAX_DAILY_ORDERS = 10
@@ -223,22 +224,40 @@ def _record_denied_position(symbol: str, contract: str, direction: str,
 # ---------------------------------------------------------------------------
 
 def _read_signals() -> list:
-    """读取所有待处理信号（列表），读后删除文件。兼容旧单对象格式。"""
-    if not os.path.exists(SIGNAL_FILE):
-        return []
-    try:
-        with open(SIGNAL_FILE, "r") as f:
-            data = json.load(f)
-        os.remove(SIGNAL_FILE)
-        if isinstance(data, list):
-            return data
-        return [data]  # 兼容旧格式
-    except Exception:
+    """读取所有待处理信号（per-symbol文件），读后删除文件。"""
+    import glob
+    all_signals = []
+    # 读取per-symbol信号文件 (signal_pending_IM.json, signal_pending_IC.json, ...)
+    for fpath in glob.glob(SIGNAL_PATTERN):
         try:
+            with open(fpath, "r") as f:
+                data = json.load(f)
+            os.remove(fpath)
+            if isinstance(data, list):
+                all_signals.extend(data)
+            else:
+                all_signals.append(data)
+        except Exception:
+            try:
+                os.remove(fpath)
+            except OSError:
+                pass
+    # 兼容旧格式（过渡期）
+    if not all_signals and os.path.exists(SIGNAL_FILE):
+        try:
+            with open(SIGNAL_FILE, "r") as f:
+                data = json.load(f)
             os.remove(SIGNAL_FILE)
-        except OSError:
-            pass
-        return []
+            if isinstance(data, list):
+                all_signals.extend(data)
+            else:
+                all_signals.append(data)
+        except Exception:
+            try:
+                os.remove(SIGNAL_FILE)
+            except OSError:
+                pass
+    return all_signals
 
 
 # ---------------------------------------------------------------------------
@@ -951,7 +970,7 @@ def main():
 
     print(f"{'═' * W}")
     print(f" Order Executor | {'DRY RUN' if args.dry_run else 'LIVE'}")
-    print(f" 账户: {account:,.0f}  信号文件: {SIGNAL_FILE}")
+    print(f" 账户: {account:,.0f}  信号文件: {SIGNAL_PATTERN}")
     print(f" 安全: 单日最多{MAX_DAILY_ORDERS}单"
           f"  亏损上限{MAX_DAILY_LOSS_PCT*100:.0f}%")
     print(f"{'═' * W}")

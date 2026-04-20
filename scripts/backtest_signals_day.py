@@ -507,6 +507,12 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                             (_gap_pct > 0 and direction == "LONG"))
             _sl_pct = SYMBOL_PROFILES.get(sym, _DEFAULT_PROFILE).get("stop_loss_pct", STOP_LOSS_PCT)
             stop = entry_p * (1 - _sl_pct) if direction == "LONG" else entry_p * (1 + _sl_pct)
+            # 记录开仓时布林zone（TREND_COMPLETE方案4）
+            from strategies.intraday.atomic_factors import boll_params, boll_zone
+            _ez5 = ""
+            if len(bar_5m) >= 20:
+                _bm, _bs = boll_params(bar_5m["close"].astype(float), 20)
+                _ez5 = boll_zone(entry_p, _bm, _bs)
             position = {
                 "entry_price": entry_p,
                 "direction": direction,
@@ -517,6 +523,7 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                 "volume": 1,
                 "half_closed": False,
                 "bars_below_mid": 0,
+                "entry_zone_5m": _ez5,
                 # 信号质量字段（供分析用，M/V/Q/B/S五维度）
                 "entry_score": score,
                 "entry_m_score": result.get("s_momentum", 0),
