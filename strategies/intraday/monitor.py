@@ -479,6 +479,10 @@ class IntradayMonitor:
                 self._reversal_detectors[sym] = ReversalDetectorSlope(sym)
             else:
                 self._reversal_detectors[sym] = ReversalDetector(sym)
+        # F1 过滤器: 追踪当天已开reversal仓的次数 (per-symbol)
+        # 若某品种 first_trade_min_bj 配置，则在首次fire早于该时间时跳过
+        # 被F1跳过的fire不计入此计数，下次fire仍按"首次"test
+        self._reversal_opens_today: Dict[str, int] = {sym: 0 for sym in self.symbols}
         # v1独立进程运行，不在v2 monitor里嵌入
 
     def _load_daily_data(self) -> None:
@@ -768,6 +772,25 @@ class IntradayMonitor:
                 print(f"  恢复当日交易: {len(rows)}笔已平仓, "
                       f"累计{self._shadow_closed_pnl:+.0f}pt")
 
+            # 恢复F1过滤器计数：reversal开仓使用entry_score=0作为proxy
+            # 活跃reversal持仓从 _shadow_positions 的 source 字段判断
+            rev_closed_rows = conn.execute(
+                "SELECT symbol, COUNT(*) FROM shadow_trades "
+                "WHERE trade_date = ? AND entry_score = 0 "
+                "GROUP BY symbol",
+                (trade_date,),
+            ).fetchall()
+            for symbol, cnt in rev_closed_rows:
+                if symbol in self._reversal_opens_today:
+                    self._reversal_opens_today[symbol] += int(cnt)
+            for sym, sp in self._shadow_positions.items():
+                if sp.get("source") == "reversal" and sym in self._reversal_opens_today:
+                    self._reversal_opens_today[sym] += 1
+            active_cnt = sum(self._reversal_opens_today.values())
+            if active_cnt > 0:
+                _parts = [f"{s}:{n}" for s, n in self._reversal_opens_today.items() if n > 0]
+                print(f"  恢复F1计数: reversal_opens_today = {{{', '.join(_parts)}}}")
+
             # --- 3. 安全网：从 order_log 交叉验证是否有孤立持仓 ---
             # executor 已 FILLED 的 OPEN 单如果没有对应的 LOCK/CLOSE，
             # 说明有真实持仓但 shadow 丢失了——必须恢复
@@ -921,6 +944,89 @@ class IntradayMonitor:
         except Exception as e:
             print(f"  [WARN] 期货持仓写出失败: {e}")
 
+    def _check_auto_locks(self) -> None:
+        """消费 executor 写出的 auto_lock_{sym}.json，同步清理 shadow 持仓。
+
+        executor bar_low 精度止损触发锁仓后 drop 此文件，monitor:
+        - 记 shadow_trade（reason=AUTO_STOP_LOCK）
+        - 从 _shadow_positions 移除
+        - position_mgr.remove_by_symbol()
+        - 删除文件（幂等消费）
+
+        每个 TQ tick 调用一次，延迟 < 1s。
+        """
+        import json as _json
+        for sym in self.symbols:
+            path = os.path.join(self._tmp_dir, f"auto_lock_{sym}.json")
+            if not os.path.exists(path):
+                continue
+            info = None
+            try:
+                with open(path, "r") as f:
+                    info = _json.load(f)
+            except Exception as e:
+                print(f"  [WARN] auto_lock读取失败 {sym}: {e}")
+
+            try:
+                if info is not None:
+                    sp = self._shadow_positions.get(sym)
+                    if sp is not None:
+                        now_bj = datetime.now()
+                        entry_price = float(sp.get("entry_price", 0))
+                        exit_price = float(info.get("exit_price", entry_price))
+                        direction = sp.get("direction") or info.get("direction", "")
+                        if direction == "LONG":
+                            pnl_pts = exit_price - entry_price
+                        else:
+                            pnl_pts = entry_price - exit_price
+                        try:
+                            e_h = int(sp["entry_time_utc"][:2])
+                            e_m = int(sp["entry_time_utc"][3:5])
+                            now_utc = datetime.utcnow()
+                            hold_min = ((now_utc.hour * 60 + now_utc.minute)
+                                        - (e_h * 60 + e_m))
+                        except Exception:
+                            hold_min = 0
+                        reason = info.get("reason", "AUTO_STOP_LOCK")
+                        self.recorder.record_shadow_trade({
+                            "trade_date": now_bj.strftime("%Y%m%d"),
+                            "symbol": sym,
+                            "direction": direction,
+                            "entry_time": sp.get("entry_time_bj", ""),
+                            "entry_price": entry_price,
+                            "entry_score": sp.get("entry_score", 0),
+                            "entry_dm": sp.get("entry_dm", 0),
+                            "entry_f": sp.get("entry_f", 0),
+                            "entry_t": sp.get("entry_t", 0),
+                            "entry_s": sp.get("entry_s", 0),
+                            "entry_m": sp.get("entry_m", 0),
+                            "entry_v": sp.get("entry_v", 0),
+                            "entry_q": sp.get("entry_q", 0),
+                            "exit_time": now_bj.strftime("%H:%M"),
+                            "exit_price": exit_price,
+                            "exit_reason": reason,
+                            "pnl_pts": round(pnl_pts, 1),
+                            "hold_minutes": hold_min,
+                            "operator_action": "AUTO",
+                            "is_executed": 1,
+                        })
+                        self._shadow_closed_pnl += pnl_pts
+                        self._shadow_closed_count += 1
+                        print(f"\n *** {reason} {sym} {direction} "
+                              f"@ {exit_price:.1f} PnL={pnl_pts:+.1f}pt ***")
+                        del self._shadow_positions[sym]
+                        self.strategy.position_mgr.remove_by_symbol(sym)
+                        self._save_shadow_state()
+                    else:
+                        print(f"  [INFO] {info.get('reason','AUTO_STOP_LOCK')} "
+                              f"{sym}: shadow 已空，忽略")
+            finally:
+                # 幂等消费：无论处理结果都删除文件
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+
     def run(self) -> None:
         """主循环：连接天勤获取实时K线。"""
         from data.sources.tq_client import TqClient
@@ -1029,6 +1135,9 @@ class IntradayMonitor:
                     import time as _time
                     _time.sleep(5)
                     continue
+
+                # bar_low 自动锁仓回传（executor tick守护 → shadow 同步清理）
+                self._check_auto_locks()
 
                 # 检查是否有新K线（用现货指数触发信号）
                 # 重要：先收集所有变化的品种，再统一处理一次
@@ -1238,6 +1347,17 @@ class IntradayMonitor:
             if not (_REV_BEFORE <= utc_hm <= _REV_AFTER):
                 continue
 
+            # -- F1 filter: skip 1st reversal of day if before configured BJ time --
+            _rev_cfg = REVERSAL_CONFIG.get(sym, {})
+            _f1_min_bj = _rev_cfg.get("first_trade_min_bj")
+            if _f1_min_bj and self._reversal_opens_today.get(sym, 0) == 0:
+                _bj_hm = _now_bj.strftime("%H:%M")
+                if _bj_hm < _f1_min_bj:
+                    print(f"\n *** REVERSAL FILTERED: {sym} {rev.direction} "
+                          f"depth={rev.depth:.0f}pt @ {_bj_hm} "
+                          f"(F1: 1st reversal needs >= {_f1_min_bj}) ***")
+                    continue
+
             # -- Reversal signal fired --
             print(f"\n *** REVERSAL: {sym} {rev.direction} depth={rev.depth:.0f}pt ***")
 
@@ -1365,6 +1485,8 @@ class IntradayMonitor:
                     sym, rev.direction, entry_price,
                     _now_bj.strftime("%H:%M"), 0)
                 self._save_shadow_state()
+                # F1 counter: only successful opens count, filtered fires don't
+                self._reversal_opens_today[sym] = self._reversal_opens_today.get(sym, 0) + 1
 
                 # Write OPEN signal JSON (only for tradeable symbols)
                 if sym in self.strategy.tradeable:
