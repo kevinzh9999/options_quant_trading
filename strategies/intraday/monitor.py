@@ -18,12 +18,21 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
+
+
+def _bj_now() -> datetime:
+    """BJ (China Standard Time, UTC+8) 当前时间，与系统时区无关。
+
+    用于所有写入 DB / 跨进程 JSON 的时间戳，保证在日本/美国/中国跑出一致结果。
+    K线时间戳本身来自 TQ ns 戳（UTC 绝对值），不走这里。
+    """
+    return datetime.utcnow() + timedelta(hours=8)
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT not in sys.path:
@@ -302,7 +311,7 @@ class IntradayRecorder:
             "(datetime, symbol, signal_score, signal_direction, decision, "
             "manual_note, created_at) VALUES (?,?,?,?,?,?,?)",
             (dt_str, symbol, score, direction, decision, note,
-             datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+             _bj_now().strftime("%Y-%m-%d %H:%M:%S")),
         )
         conn.commit()
         conn.close()
@@ -590,7 +599,7 @@ class IntradayMonitor:
             # 6. Q分历史同时段volume profile（分位数法）
             _SPOT_SYM = {"IM": "000852", "IF": "000300", "IH": "000016", "IC": "000905"}
             from strategies.intraday.A_share_momentum_signal_v2 import compute_volume_profile
-            today_str = datetime.now().strftime("%Y%m%d")
+            today_str = _bj_now().strftime("%Y%m%d")
             for sym in self.symbols:
                 spot_sym = _SPOT_SYM.get(sym)
                 if not spot_sym:
@@ -691,8 +700,8 @@ class IntradayMonitor:
         """
         import json as _json
         state = {
-            "trade_date": datetime.now().strftime("%Y%m%d"),
-            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "trade_date": _bj_now().strftime("%Y%m%d"),
+            "updated_at": _bj_now().strftime("%Y-%m-%d %H:%M:%S"),
             "positions": self._shadow_positions,
             "prompted_bars": [list(k) for k in self._prompted_bars],
         }
@@ -714,7 +723,7 @@ class IntradayMonitor:
           3. risk_mgr + daily_trades（当天已完成交易的计数/PnL）→ 从 shadow_trades 表
         """
         import json as _json
-        trade_date = datetime.now().strftime("%Y%m%d")
+        trade_date = _bj_now().strftime("%Y%m%d")
 
         # --- 1. 从 shadow_state.json 恢复活跃的 shadow 持仓 ---
         state_path = os.path.join(self._tmp_dir, f"shadow_state_{self.symbols[0]}.json")
@@ -857,7 +866,7 @@ class IntradayMonitor:
             from data.storage.db_manager import get_db
             db = get_db()
 
-            today_str = datetime.now().strftime("%Y%m%d")
+            today_str = _bj_now().strftime("%Y%m%d")
             dmo = db.query_df(
                 "SELECT atm_iv, atm_iv_market, vrp, rr_25d, term_structure_shape "
                 "FROM daily_model_output WHERE underlying='IM' "
@@ -887,7 +896,7 @@ class IntradayMonitor:
         """从 TQ 读取期货实盘持仓（所有活跃合约），写入共享文件供 executor 对账。"""
         try:
             from utils.cffex_calendar import active_im_months
-            today_str = datetime.now().strftime("%Y%m%d")
+            today_str = _bj_now().strftime("%Y%m%d")
             active_months = active_im_months(today_str)
 
             positions = {}
@@ -938,7 +947,7 @@ class IntradayMonitor:
             path = os.path.join(self._tmp_dir, f"futures_positions_{self.symbols[0]}.json")
             with open(path, "w") as f:
                 _json.dump({
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "timestamp": _bj_now().strftime("%Y-%m-%d %H:%M:%S"),
                     "positions": positions,
                 }, f, indent=2)
         except Exception as e:
@@ -971,7 +980,7 @@ class IntradayMonitor:
                 if info is not None:
                     sp = self._shadow_positions.get(sym)
                     if sp is not None:
-                        now_bj = datetime.now()
+                        now_bj = _bj_now()
                         entry_price = float(sp.get("entry_price", 0))
                         exit_price = float(info.get("exit_price", entry_price))
                         direction = sp.get("direction") or info.get("direction", "")
@@ -1056,7 +1065,7 @@ class IntradayMonitor:
             # 用 TQ 按持仓量批量选择主力合约
             from utils.cffex_calendar import active_im_months, _near_month_by_expiry
             import time as _time
-            today_str = datetime.now().strftime("%Y%m%d")
+            today_str = _bj_now().strftime("%Y%m%d")
             active_months = active_im_months(today_str)
             print(f"  活跃合约月份: {active_months}")
             all_quotes = {}  # (sym, contract) -> quote
@@ -1126,9 +1135,9 @@ class IntradayMonitor:
                 try:
                     api.wait_update()
                 except Exception as e:
-                    now_h = datetime.now().hour
-                    now_m = datetime.now().minute
-                    if now_h >= 15 and now_m >= 5:
+                    # 市场收盘检查用 BJ（15:05 BJ 交易结束），TZ 无关
+                    _bj = _bj_now()
+                    if _bj.hour >= 15 and _bj.minute >= 5:
                         print(f"\n  Market closed, exiting normally")
                         break
                     print(f"\n  [TQ] connection error: {e}, retrying in 5s...")
@@ -1212,8 +1221,9 @@ class IntradayMonitor:
             _now_bj = _now_utc + pd.Timedelta(hours=8)
         else:
             _now_utc = pd.Timestamp(datetime.utcnow())
-            _now_bj = pd.Timestamp(datetime.now())
+            _now_bj = _now_utc + pd.Timedelta(hours=8)  # 不用datetime.now()（Japan Mac=JST≠BJ）
         current_time_utc = _now_utc.strftime("%Y-%m-%d %H:%M:%S")
+        current_time_bj = _now_bj.strftime("%Y-%m-%d %H:%M:%S")  # BJ, 用于写signal_log/orderbook/trade_decisions/信号JSON
         utc_hm = _now_utc.strftime("%H:%M")
         trade_date = _now_bj.strftime("%Y%m%d")
 
@@ -1270,7 +1280,7 @@ class IntradayMonitor:
                 quote_dict[sym] = qd
                 # 记录盘口快照（fail-safe，不阻塞信号流程）
                 try:
-                    self.recorder.record_orderbook(current_time_utc, sym, qd)
+                    self.recorder.record_orderbook(current_time_bj, sym, qd)
                 except Exception:
                     pass
 
@@ -1747,8 +1757,9 @@ class IntradayMonitor:
                 sugg_lots = self._calc_suggested_lots(last, sym)
 
                 # 写信号JSON供executor（只有实盘品种）
+                # 用BJ时间戳，与CLOSE信号（行1422/1494/1693 用_now_bj）保持一致
                 if sym in self.strategy.tradeable:
-                    self._write_signal_file(act, current_time_utc)
+                    self._write_signal_file(act, current_time_bj)
 
                 # 面板打印信号（不等确认）
                 d_cn = "LONG" if direction == "LONG" else "SHORT"
@@ -1763,7 +1774,7 @@ class IntradayMonitor:
                 # 记录信号决策（fail-safe）
                 try:
                     self.recorder.record_decision(
-                        current_time_utc, sym, act.get("score", 0),
+                        current_time_bj, sym, act.get("score", 0),
                         direction, "SIGNAL")
                 except Exception:
                     pass
@@ -1820,7 +1831,7 @@ class IntradayMonitor:
             except Exception:
                 pass
             self.recorder.record_signal(
-                current_time_utc, sym, sig, action_taken,
+                current_time_bj, sym, sig, action_taken,
                 v2_score=sc2.get("total", 0),
                 v2_direction=sc2.get("direction", ""),
                 v3_score=sc3.get("total", 0),
@@ -1943,7 +1954,7 @@ class IntradayMonitor:
         actions: list,
     ) -> None:
         """打印状态面板（全ASCII表头 + 固定列宽 + 竖线分隔）。"""
-        now = datetime.now()
+        now = _bj_now()
         bj_time = now.strftime("%Y-%m-%d %H:%M:%S")
 
         # 纯 ASCII 表头 (SPOT=现货信号基准, FUT=期货下单参考)

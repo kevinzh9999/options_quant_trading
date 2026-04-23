@@ -25,9 +25,18 @@ import select
 import sqlite3
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+
+
+def _bj_now() -> datetime:
+    """BJ (UTC+8) 当前时间，与系统时区无关。
+
+    用于所有写入 DB / 跨进程 JSON / 时间 diff 比较的时间戳。
+    保证在日本/美国/中国跑出一致结果。
+    """
+    return datetime.utcnow() + timedelta(hours=8)
 
 ROOT = str(Path(__file__).resolve().parents[1])
 if ROOT not in sys.path:
@@ -205,12 +214,12 @@ def _record_denied_position(symbol: str, contract: str, direction: str,
                             lots: int, reason: str, entry_price: float):
     """将被否决的平仓持仓写入 denied_positions.json（追加）。"""
     record = {
-        "date": datetime.now().strftime("%Y%m%d"),
+        "date": _bj_now().strftime("%Y%m%d"),
         "symbol": symbol,
         "contract": contract,
         "direction": direction,
         "lots": lots,
-        "deny_time": datetime.now().strftime("%H:%M:%S"),
+        "deny_time": _bj_now().strftime("%H:%M:%S"),
         "deny_reason": reason,
         "entry_price": entry_price,
     }
@@ -299,7 +308,7 @@ def _execute_order(
     positions: dict, tq_api=None,
 ) -> dict:
     """处理一个信号。返回 {status, filled_lots, ...}。"""
-    receive_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    receive_time = _bj_now().strftime("%Y-%m-%d %H:%M:%S")
     ts = signal.get("timestamp", receive_time)
     sym = signal.get("symbol", "IM")
     direction = signal.get("direction", "")
@@ -325,13 +334,10 @@ def _execute_order(
     # 记录到 executor_log（无论后续是否下单）
     log_id = _log_signal(db_path, signal, receive_time, lots)
 
-    # 信号过期检查
+    # 信号过期检查（signal JSON timestamp 现在统一 BJ）
     try:
         sig_dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-        age = (datetime.now() - sig_dt).total_seconds()
-        # UTC时间可能差8小时，用utcnow比较
-        age_utc = (datetime.utcnow() - sig_dt).total_seconds()
-        age = min(abs(age), abs(age_utc))
+        age = abs((_bj_now() - sig_dt).total_seconds())
     except Exception:
         age = 0
     if age > SIGNAL_EXPIRY_SECS:
@@ -554,7 +560,7 @@ def _execute_order(
             # 未完全成交 → 撤单
             if order.volume_left > 0 and not order.is_dead:
                 api.cancel_order(order)
-                cancel_time = datetime.now().strftime("%H:%M:%S")
+                cancel_time = _bj_now().strftime("%H:%M:%S")
                 print(f"  撤单: {order.volume_left}手未成交，已撤销")
                 # 等撤单确认
                 cancel_deadline = time.time() + 5
@@ -638,7 +644,7 @@ def _execute_order(
             positions[sym] = {
                 "direction": direction, "lots": filled,
                 "entry_price": trade_price,
-                "entry_time": datetime.now().strftime("%H:%M"),
+                "entry_time": _bj_now().strftime("%H:%M"),
                 "contract": signal.get("contract", ""),
                 "stop_price": stop_price,
                 "auto_lock_sent": False,
@@ -744,7 +750,7 @@ def _check_auto_stop_lock(positions: dict, tq_api, db_path: str, dry_run: bool):
                 "lots": lots, "entry_price": entry,
                 "exit_price": last, "stop_price": stop_price,
                 "reason": "AUTO_STOP_LOCK",
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "timestamp": _bj_now().strftime("%Y-%m-%d %H:%M:%S"),
                 "dry_run": True,
             })
             continue
@@ -801,7 +807,7 @@ def _check_auto_stop_lock(positions: dict, tq_api, db_path: str, dry_run: bool):
             print(f"  [ERROR] 锁仓下单失败: {e}")
 
         if filled > 0:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ts = _bj_now().strftime("%Y-%m-%d %H:%M:%S")
             # 写order_log（LOCK记录，次日平昨用）
             _record_order(db_path, {
                 "datetime": ts, "symbol": sym, "direction": direction,
@@ -935,7 +941,7 @@ def _check_denied_positions():
     if not records:
         return
 
-    today = datetime.now().strftime("%Y%m%d")
+    today = _bj_now().strftime("%Y%m%d")
     old_records = [r for r in records if r.get("date", "") != today]
     today_records = [r for r in records if r.get("date", "") == today]
 
@@ -984,10 +990,10 @@ def _reconcile_positions(positions: dict):
     ts = data.get("timestamp", "")
     tq_positions = data.get("positions", {})
 
-    # 检查数据新鲜度：超过 10 分钟的数据不用
+    # 检查数据新鲜度：超过 10 分钟的数据不用（两端统一 BJ）
     try:
         ts_dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-        if (datetime.now() - ts_dt).total_seconds() > 600:
+        if (_bj_now() - ts_dt).total_seconds() > 600:
             return
     except Exception:
         return
@@ -1026,8 +1032,8 @@ def _reconcile_positions(positions: dict):
             if entry_t and entry_t != "restored" and ts:
                 try:
                     snap_dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-                    # entry_time 格式是 "HH:MM"
-                    now = datetime.now()
+                    # entry_time 格式是 "HH:MM"（BJ），用 BJ 拼日期比较
+                    now = _bj_now()
                     entry_dt = now.replace(
                         hour=int(entry_t[:2]), minute=int(entry_t[3:5]),
                         second=0, microsecond=0)
@@ -1057,7 +1063,7 @@ def _restore_positions_from_log(db_path: str, positions: dict):
     逻辑：当天 OPEN(FILLED) - CLOSE/LOCK(FILLED) = 净持仓。
     恢复后再由 _reconcile_positions 用 TQ 实盘数据校正。
     """
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = _bj_now().strftime("%Y-%m-%d")
     try:
         db = DBManager(db_path)
         rows = db.query_df(
@@ -1204,7 +1210,7 @@ def main():
             # 下单时 insert_order 内部 _ensure_symbol 会直接命中缓存，零延迟
             from utils.cffex_calendar import active_im_months
             import time as _time
-            today_str = datetime.now().strftime("%Y%m%d")
+            today_str = _bj_now().strftime("%Y%m%d")
             _active = active_im_months(today_str)
             _warmup_contracts = []
             for _sym in CFFEX_INDEX_FUTURES:
@@ -1272,8 +1278,8 @@ def main():
                       f"成交{signals_executed}单  亏损¥{daily_loss:,.0f}")
                 print(f" 等待信号...\n")
 
-            # 检查时间
-            now = datetime.now()
+            # 检查时间（BJ 15:05 收盘，TZ 无关）
+            now = _bj_now()
             if now.hour >= 15 and now.minute >= 5:
                 print(f"\n  收盘，退出")
                 break
