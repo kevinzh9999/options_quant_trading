@@ -467,16 +467,17 @@ def _eod_trade_records(trade_ref, trade_date: str, db) -> int:
 
 def _eod_archive_minute_bars(api, trade_date: str, db) -> int:
     """
-    归档当天的全部分钟线/Tick/ETF 数据。
-    K线用 get_kline_serial，Tick用 DataDownloader（获取完整全天数据）。
+    归档当天的全部 K 线数据（1m/5m，免费版 TqApi.get_kline_serial）。
 
     归档内容（四库分流）:
       trading.db:   期货主连 1m+5m, 现货指数 1m+5m
-      tick_data.db: IM/IC/IF 主连 tick
       etf_data.db:  512100/510500/510300/510050 5m
       options_data.db: MO/IO/HO 活跃合约 5m
 
-    get_kline_serial的datetime是纳秒时间戳(UTC)，无需BJ→UTC转换。
+    Tick 归档已注释（DataDownloader 需 TQ 专业版，免费账户不支持）—
+    见下方 _archive_tick 函数及调用位置。
+
+    get_kline_serial 的 datetime 是纳秒时间戳（UTC），无需 BJ→UTC 转换。
     """
     from pathlib import Path
     import sqlite3 as _sqlite3
@@ -535,80 +536,83 @@ def _eod_archive_minute_bars(api, trade_date: str, db) -> int:
             logger.warning("归档 %s %ss 失败: %s", symbol, duration, e)
             return 0
 
-    def _archive_tick(tq_sym, symbol):
-        """用DataDownloader下载当天完整Tick并写入DB（BJ→UTC转换）。"""
-        nonlocal total
-        try:
-            import tempfile as _tmpmod
-            from datetime import timedelta as _td
-            from tqsdk.tools import DataDownloader as _DL
-
-            td_date = date(int(trade_date[:4]), int(trade_date[4:6]),
-                           int(trade_date[6:]))
-            csv_path = os.path.join(_tmpmod.gettempdir(),
-                                    f"eod_tick_{symbol}_{trade_date}.csv")
-
-            dl = _DL(api, symbol_list=tq_sym, dur_sec=0,
-                     start_dt=td_date, end_dt=td_date,
-                     csv_file_name=csv_path)
-
-            _deadline = time.time() + 120
-            while not dl.is_finished():
-                api.wait_update(deadline=_deadline)
-                if time.time() > _deadline:
-                    logger.warning("归档 tick %s 超时(120s)", symbol)
-                    return 0
-
-            df = pd.read_csv(csv_path)
-            if df.empty:
-                return 0
-
-            # DataDownloader输出BJ时间，转UTC（-8h）
-            dt_col = df.columns[0]
-            dt_parsed = pd.to_datetime(df[dt_col])
-            dt_utc = dt_parsed - _td(hours=8)
-            df["dt_str"] = dt_utc.dt.strftime("%Y-%m-%d %H:%M:%S.%f")
-            # 只保留当天UTC数据
-            df = df[dt_utc.dt.strftime("%Y-%m-%d") == date_dash]
-            if df.empty:
-                return 0
-
-            n = len(df)
-            cols = df.columns.tolist()
-            def _find(kw):
-                for c in cols:
-                    if kw in c.lower():
-                        return c
-                return kw
-            def _c(name, dtype=float, default=0):
-                col = _find(name)
-                return df[col].fillna(default).astype(dtype).tolist() \
-                    if col in df.columns else [default]*n
-
-            rows = list(zip(
-                [symbol]*n, df["dt_str"].tolist(),
-                _c("last_price"), _c("average"), _c("highest"), _c("lowest"),
-                _c("bid_price1"), _c("bid_volume1", int),
-                _c("ask_price1"), _c("ask_volume1", int),
-                _c("volume", int), _c("amount"), _c("open_interest", int),
-            ))
-            conn = _get_db_conn("tick")
-            conn.executemany(
-                "INSERT OR IGNORE INTO futures_tick VALUES "
-                "(?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
-            conn.commit()
-            conn.close()
-            total += n
-            logger.info("归档 tick %s: %d 行", symbol, n)
-            # 清理临时文件
-            try:
-                os.remove(csv_path)
-            except OSError:
-                pass
-            return n
-        except Exception as e:
-            logger.warning("归档 tick %s 失败: %s", symbol, e)
-            return 0
+    # ── _archive_tick: 已注释（DataDownloader 专业版才支持）──
+    # 2026-04-24: 免费账户调用必 fail，注释避免每天打 warning。
+    # 恢复方法：升级 TQ 专业版后取消此函数注释 + 取消上方调用位置的注释。
+    # def _archive_tick(tq_sym, symbol):
+    #     """用DataDownloader下载当天完整Tick并写入DB（BJ→UTC转换）。"""
+    #     nonlocal total
+    #     try:
+    #         import tempfile as _tmpmod
+    #         from datetime import timedelta as _td
+    #         from tqsdk.tools import DataDownloader as _DL
+    #
+    #         td_date = date(int(trade_date[:4]), int(trade_date[4:6]),
+    #                        int(trade_date[6:]))
+    #         csv_path = os.path.join(_tmpmod.gettempdir(),
+    #                                 f"eod_tick_{symbol}_{trade_date}.csv")
+    #
+    #         dl = _DL(api, symbol_list=tq_sym, dur_sec=0,
+    #                  start_dt=td_date, end_dt=td_date,
+    #                  csv_file_name=csv_path)
+    #
+    #         _deadline = time.time() + 120
+    #         while not dl.is_finished():
+    #             api.wait_update(deadline=_deadline)
+    #             if time.time() > _deadline:
+    #                 logger.warning("归档 tick %s 超时(120s)", symbol)
+    #                 return 0
+    #
+    #         df = pd.read_csv(csv_path)
+    #         if df.empty:
+    #             return 0
+    #
+    #         # DataDownloader输出BJ时间，转UTC（-8h）
+    #         dt_col = df.columns[0]
+    #         dt_parsed = pd.to_datetime(df[dt_col])
+    #         dt_utc = dt_parsed - _td(hours=8)
+    #         df["dt_str"] = dt_utc.dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+    #         # 只保留当天UTC数据
+    #         df = df[dt_utc.dt.strftime("%Y-%m-%d") == date_dash]
+    #         if df.empty:
+    #             return 0
+    #
+    #         n = len(df)
+    #         cols = df.columns.tolist()
+    #         def _find(kw):
+    #             for c in cols:
+    #                 if kw in c.lower():
+    #                     return c
+    #             return kw
+    #         def _c(name, dtype=float, default=0):
+    #             col = _find(name)
+    #             return df[col].fillna(default).astype(dtype).tolist() \
+    #                 if col in df.columns else [default]*n
+    #
+    #         rows = list(zip(
+    #             [symbol]*n, df["dt_str"].tolist(),
+    #             _c("last_price"), _c("average"), _c("highest"), _c("lowest"),
+    #             _c("bid_price1"), _c("bid_volume1", int),
+    #             _c("ask_price1"), _c("ask_volume1", int),
+    #             _c("volume", int), _c("amount"), _c("open_interest", int),
+    #         ))
+    #         conn = _get_db_conn("tick")
+    #         conn.executemany(
+    #             "INSERT OR IGNORE INTO futures_tick VALUES "
+    #             "(?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    #         conn.commit()
+    #         conn.close()
+    #         total += n
+    #         logger.info("归档 tick %s: %d 行", symbol, n)
+    #         # 清理临时文件
+    #         try:
+    #             os.remove(csv_path)
+    #         except OSError:
+    #             pass
+    #         return n
+    #     except Exception as e:
+    #         logger.warning("归档 tick %s 失败: %s", symbol, e)
+    #         return 0
 
     # ── 期货主连 1m + 5m ──
     print("  归档期货K线...", flush=True)
@@ -630,11 +634,13 @@ def _eod_archive_minute_bars(api, trade_date: str, db) -> int:
                      ("510300","SSE.510300"),("510050","SSE.510050")]:
         _archive_kline(tq, 300, sym, "etf_min", "symbol", "etf")
 
-    # ── Tick (IM/IC/IF) ──
-    print("  归档Tick...", flush=True)
-    for sym, tq in [("IM","KQ.m@CFFEX.IM"),("IC","KQ.m@CFFEX.IC"),
-                     ("IF","KQ.m@CFFEX.IF")]:
-        _archive_tick(tq, sym)
+    # ── Tick (IM/IC/IF) ── 已注释：DataDownloader 需 TQ 专业版，免费账户不支持
+    # 2026-04-24 注释掉避免每次 EOD 都打 warning。恢复方法：取消下面 3 行注释 +
+    # 取消 _archive_tick 函数定义（538-611 行）注释。
+    # print("  归档Tick...", flush=True)
+    # for sym, tq in [("IM","KQ.m@CFFEX.IM"),("IC","KQ.m@CFFEX.IC"),
+    #                  ("IF","KQ.m@CFFEX.IF")]:
+    #     _archive_tick(tq, sym)
 
     # ── 期权 5m ──
     print("  归档期权5m K线...", flush=True)
@@ -1844,8 +1850,8 @@ def run_eod(
         reason = "未配置实盘账户凭证" if use_tq else "--no-tq 已指定"
         print(f"[EOD] a. 跳过 TQ 账户（{reason}）")
 
-    # ── a2. TQ DataDownloader 归档（独立行情连接，不依赖实盘） ──────────
-    print("[EOD] a2. DataDownloader 归档(1m/5m/tick/ETF)...")
+    # ── a2. TQ K 线归档（免费版 get_kline_serial，独立行情连接）──────────
+    print("[EOD] a2. K 线归档(1m/5m 期货/现货/ETF/期权)...")
     try:
         from tqsdk import TqApi, TqAuth
         _archive_api = TqApi(auth=TqAuth(
@@ -1854,7 +1860,7 @@ def run_eod(
         _archive_api.close()
         print(f"  归档完成: {n_bars} 行")
     except Exception as e:
-        logger.warning("DataDownloader 归档失败: %s", e)
+        logger.warning("K 线归档失败: %s", e)
         print(f"  [警告] 归档失败（{e}）")
 
     # ── b. Tushare 增量数据更新 + 时效性检查（最多重试 3 次）────────────
