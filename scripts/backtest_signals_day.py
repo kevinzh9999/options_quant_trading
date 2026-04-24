@@ -100,6 +100,23 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
     if not today_indices:
         return []
 
+    # 双价格 PnL: 同步加载期货主连 bar，供 futures PnL 计算
+    # spot PnL (index_min) = 策略信号强度指标
+    # fut PnL  (futures_min) = 实际期货交易可实现结果（贴水/roll 影响）
+    fut_bars = db.query_df(
+        f"SELECT datetime, close FROM futures_min "
+        f"WHERE symbol='{sym}' AND period=300 "
+        f"AND datetime LIKE '{date_dash}%' ORDER BY datetime"
+    )
+    fut_by_dt: Dict[str, float] = {}
+    if fut_bars is not None and not fut_bars.empty:
+        for _, _r in fut_bars.iterrows():
+            fut_by_dt[str(_r["datetime"])] = float(_r["close"])
+
+    def _lookup_fut(dt_str: str, fallback: float) -> float:
+        """按 bar datetime 查期货 close；缺失时用 fallback (spot price)。"""
+        return fut_by_dt.get(dt_str, fallback)
+
     # 历史同时段volume profile（Q分用分位数法，消除跨日偏差）
     from strategies.intraday.A_share_momentum_signal_v2 import compute_volume_profile
     vol_profile = compute_volume_profile(all_bars, before_date=td, lookback_days=20)
@@ -318,6 +335,15 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                     pnl_pts = exit_p - entry_p
                 else:
                     pnl_pts = entry_p - exit_p
+                # 双价格: 精度止损下期货 PnL 近似用 spot stop 百分比映射到 futures entry
+                _fut_entry_p = position.get("entry_price_fut", entry_p)
+                _sl_pct_used = abs(exit_p / entry_p - 1)
+                if position["direction"] == "LONG":
+                    _fut_exit = _fut_entry_p * (1 - _sl_pct_used)
+                    pnl_pts_fut = _fut_exit - _fut_entry_p
+                else:
+                    _fut_exit = _fut_entry_p * (1 + _sl_pct_used)
+                    pnl_pts_fut = _fut_entry_p - _fut_exit
                 elapsed = _calc_minutes(position["entry_time_utc"], utc_hm)
                 reason = "STOP_LOSS"
                 action_str = (f"EXIT {reason} "
@@ -326,10 +352,13 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                 completed_trades.append({
                     "entry_time": _utc_to_bj(position["entry_time_utc"]),
                     "entry_price": entry_p,
+                    "entry_price_fut": _fut_entry_p,
                     "exit_time": bj_time,
                     "exit_price": exit_p,
+                    "exit_price_fut": _fut_exit,
                     "direction": position["direction"],
                     "pnl_pts": pnl_pts,
+                    "pnl_pts_fut": pnl_pts_fut,
                     "reason": reason,
                     "minutes": elapsed,
                     "entry_score": position.get("entry_score", 0),
@@ -385,6 +414,13 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                         pnl_pts = exit_p - entry_p
                     else:
                         pnl_pts = entry_p - exit_p
+                    # 双价格: 期货出场价 + fut PnL
+                    _fut_exit = _lookup_fut(dt_str, exit_p)
+                    _fut_entry_p = position.get("entry_price_fut", entry_p)
+                    if position["direction"] == "LONG":
+                        pnl_pts_fut = _fut_exit - _fut_entry_p
+                    else:
+                        pnl_pts_fut = _fut_entry_p - _fut_exit
 
                     elapsed = _calc_minutes(position["entry_time_utc"], utc_hm)
 
@@ -396,10 +432,13 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                         completed_trades.append({
                             "entry_time": _utc_to_bj(position["entry_time_utc"]),
                             "entry_price": entry_p,
+                            "entry_price_fut": _fut_entry_p,
                             "exit_time": bj_time,
                             "exit_price": exit_p,
+                            "exit_price_fut": _fut_exit,
                             "direction": position["direction"],
                             "pnl_pts": pnl_pts,
+                            "pnl_pts_fut": pnl_pts_fut,
                             "reason": reason,
                             "minutes": elapsed,
                             "entry_score": position.get("entry_score", 0),
@@ -434,10 +473,13 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                         completed_trades.append({
                             "entry_time": _utc_to_bj(position["entry_time_utc"]),
                             "entry_price": entry_p,
+                            "entry_price_fut": _fut_entry_p,
                             "exit_time": bj_time,
                             "exit_price": exit_p,
+                            "exit_price_fut": _fut_exit,
                             "direction": position["direction"],
                             "pnl_pts": pnl_pts,
+                            "pnl_pts_fut": pnl_pts_fut,
                             "reason": reason + "(半仓)",
                             "minutes": elapsed,
                             "partial": True,
@@ -492,6 +534,8 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
             score = _entry_score
             # Apply slippage adversely on entry
             entry_p = price + slippage if direction == "LONG" else price - slippage
+            # 双价格：期货入场价（同 bar datetime 查 futures_min close）
+            _fut_entry = _lookup_fut(dt_str, entry_p)
             # Compute rebound/pullback from recent 20-bar extreme (use signal bars)
             recent_20 = bar_5m.tail(20)
             min_20 = float(recent_20["low"].min())
@@ -515,6 +559,7 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                 _ez5 = boll_zone(entry_p, _bm, _bs)
             position = {
                 "entry_price": entry_p,
+                "entry_price_fut": _fut_entry,        # 双价格: 期货入场
                 "direction": direction,
                 "entry_time_utc": utc_hm,
                 "highest_since": high,
@@ -657,23 +702,39 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
     if verbose:
         print(f"\n{'=' * W}")
         if completed_trades:
-            print(f"\n === Trade Summary {td} ===")
+            print(f"\n === Trade Summary {td} (spot PnL | futures PnL) ===")
             total_pnl = 0
+            total_pnl_fut = 0
             for i, t in enumerate(completed_trades):
                 d = "L" if t["direction"] == "LONG" else "S"
                 pnl = t["pnl_pts"]
+                pnl_f = t.get("pnl_pts_fut", pnl)
                 total_pnl += pnl
-                print(f"  #{i+1}  {t['entry_time']} {d}@{t['entry_price']:.0f}"
-                      f" → {t['exit_time']} @{t['exit_price']:.0f}"
-                      f"  {'+'if pnl>=0 else ''}{pnl:.0f}pt"
+                total_pnl_fut += pnl_f
+                _fut_ep = t.get("entry_price_fut", t["entry_price"])
+                _fut_xp = t.get("exit_price_fut", t["exit_price"])
+                print(f"  #{i+1}  {t['entry_time']} {d} "
+                      f"spot {t['entry_price']:.0f}→{t['exit_price']:.0f} "
+                      f"{'+'if pnl>=0 else ''}{pnl:.0f}pt"
+                      f" | fut {_fut_ep:.0f}→{_fut_xp:.0f} "
+                      f"{'+'if pnl_f>=0 else ''}{pnl_f:.0f}pt"
                       f"  {t['reason']}  {t['minutes']}min")
             yuan = total_pnl * IM_MULT
+            yuan_fut = total_pnl_fut * IM_MULT
             n = len([t for t in completed_trades if not t.get("partial")])
             wins = len([t for t in completed_trades if t["pnl_pts"] > 0 and not t.get("partial")])
+            wins_fut = len([t for t in completed_trades if t.get("pnl_pts_fut", 0) > 0 and not t.get("partial")])
             wr = wins / n * 100 if n > 0 else 0
-            print(f"\n  Total: {'+'if total_pnl>=0 else ''}{total_pnl:.0f}pt"
+            wr_fut = wins_fut / n * 100 if n > 0 else 0
+            print(f"\n  Total spot: {'+'if total_pnl>=0 else ''}{total_pnl:.0f}pt"
                   f" = {'+'if yuan>=0 else ''}{yuan:,.0f}元(1手)"
-                  f"  Trades: {n}  WinRate: {wr:.0f}%")
+                  f"  WR={wr:.0f}%")
+            print(f"  Total fut : {'+'if total_pnl_fut>=0 else ''}{total_pnl_fut:.0f}pt"
+                  f" = {'+'if yuan_fut>=0 else ''}{yuan_fut:,.0f}元(1手)"
+                  f"  WR={wr_fut:.0f}%")
+            _basis_gap = total_pnl_fut - total_pnl
+            print(f"  Basis gap : {'+'if _basis_gap>=0 else ''}{_basis_gap:.0f}pt"
+                  f"  (fut − spot, {n} trades)")
         else:
             print(f"\n  No trades for {td}")
         print()
