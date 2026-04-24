@@ -59,7 +59,8 @@ def _build_15m_from_5m(bar_5m: pd.DataFrame) -> pd.DataFrame:
 
 def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
             slippage: float = 0, version: str = "auto",
-            score_transform=None, threshold_override: int = 0) -> List[Dict]:
+            score_transform=None, threshold_override: int = 0,
+            reversal_mode: str = "off") -> List[Dict]:
     """Replay one day. Returns list of completed trades.
 
     Args:
@@ -69,6 +70,11 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
             sig.score做threshold判断。result_dict是score_all()的完整输出。
             用于测试评分公式变体（如M二值化、V相对化）而不自建backtest loop。
         threshold_override: 如果>0，用此值替代SYMBOL_PROFILES的threshold。
+        reversal_mode: reversal_signal 集成模式
+            - "off" (默认): 不使用 reversal，同 baseline
+            - "full": 完整 reversal — 既会 REVERSAL_EXIT 逼出原仓，又会反手开 reversal 仓
+            - "exit_only": 只允许 REVERSAL_EXIT 平原仓，不反手开新仓
+            配置从 REVERSAL_CONFIG 读取（仅 IM enabled）。
     """
     date_dash = f"{td[:4]}-{td[4:6]}-{td[6:]}"
 
@@ -228,6 +234,19 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
     # Cooldown tracker: prevent same-direction re-entry within 15min
     last_exit_utc: str = ""
     last_exit_dir: str = ""
+
+    # Reversal detector（仅 reversal_mode != "off" 且 symbol 配置 enabled 时激活）
+    _rev_det = None
+    _rev_opens_today = 0
+    _REV_TIME_BEFORE_UTC = "02:25"  # BJ 10:25
+    _REV_TIME_AFTER_UTC = "06:30"   # BJ 14:30
+    if reversal_mode != "off":
+        from strategies.intraday.reversal_signal import (
+            ReversalDetectorSlope, REVERSAL_CONFIG as _REV_CFG,
+        )
+        _rev_cfg = _REV_CFG.get(sym, {})
+        if _rev_cfg.get("enabled"):
+            _rev_det = ReversalDetectorSlope(sym)
     # 开盘振幅过滤（215天验证：<0.4%日均亏-21pt，过滤+274pt）
     from strategies.intraday.A_share_momentum_signal_v2 import check_low_amplitude
     _low_amplitude: Optional[bool] = None  # None=未判断, True=低振幅, False=正常
@@ -321,7 +340,117 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
 
         # Check exit first (if we have a position)
         action_str = ""
-        if position is not None:
+
+        # ── Reversal processing (与 monitor 对齐，先 feed detector 再决策) ──
+        if _rev_det is not None and _rev_det.enabled:
+            _bar_open = float(bar_5m.iloc[-1]["open"])
+            rev = _rev_det.update(_bar_open, high, low, price)
+            if rev is not None and _REV_TIME_BEFORE_UTC <= utc_hm <= _REV_TIME_AFTER_UTC:
+                # F1 filter: 首笔 reversal 必须 BJ >= first_trade_min_bj
+                _f1_pass = True
+                _f1_min_bj = _rev_cfg.get("first_trade_min_bj")
+                if _f1_min_bj and _rev_opens_today == 0:
+                    if bj_time < _f1_min_bj:
+                        _f1_pass = False
+                if _f1_pass:
+                    # Case 1: 对向 position 存在 → REVERSAL_EXIT
+                    if position is not None and position["direction"] != rev.direction:
+                        _entry_p = position["entry_price"]
+                        _exit_p = price - slippage if position["direction"] == "LONG" else price + slippage
+                        if position["direction"] == "LONG":
+                            _pnl = _exit_p - _entry_p
+                        else:
+                            _pnl = _entry_p - _exit_p
+                        _fut_ep = position.get("entry_price_fut", _entry_p)
+                        _fut_xp = _lookup_fut(dt_str, _exit_p)
+                        if position["direction"] == "LONG":
+                            _pnl_fut = _fut_xp - _fut_ep
+                        else:
+                            _pnl_fut = _fut_ep - _fut_xp
+                        _elap = _calc_minutes(position["entry_time_utc"], utc_hm)
+                        completed_trades.append({
+                            "entry_time": _utc_to_bj(position["entry_time_utc"]),
+                            "entry_price": _entry_p,
+                            "entry_price_fut": _fut_ep,
+                            "exit_time": bj_time,
+                            "exit_price": _exit_p,
+                            "exit_price_fut": _fut_xp,
+                            "direction": position["direction"],
+                            "pnl_pts": _pnl,
+                            "pnl_pts_fut": _pnl_fut,
+                            "reason": "REVERSAL_EXIT",
+                            "minutes": _elap,
+                            "entry_score": position.get("entry_score", 0),
+                            "entry_m_score": position.get("entry_m_score", 0),
+                            "entry_v_score": position.get("entry_v_score", 0),
+                            "entry_q_score": position.get("entry_q_score", 0),
+                            "entry_b_score": position.get("entry_b_score", 0),
+                            "entry_s_score": position.get("entry_s_score", 0),
+                            "entry_daily_mult": position.get("entry_daily_mult", 1.0),
+                            "entry_raw_total": position.get("entry_raw_total", 0),
+                            "raw_mom_5m": position.get("raw_mom_5m", 0.0),
+                            "raw_atr_ratio": position.get("raw_atr_ratio", 0.0),
+                            "raw_vol_pct": position.get("raw_vol_pct", -1.0),
+                            "raw_vol_ratio": position.get("raw_vol_ratio", -1.0),
+                            "entry_gap_pct": position.get("entry_gap_pct", 0.0),
+                            "entry_gap_aligned": position.get("entry_gap_aligned", False),
+                            "entry_rebound_pct": position.get("entry_rebound_pct", 0.0),
+                            "entry_total_drop": position.get("entry_total_drop", 0.0),
+                            "entry_intraday_drop": position.get("entry_intraday_drop", 0.0),
+                            "entry_filter_mult": position.get("entry_filter_mult", 1.0),
+                            "entry_zscore": position.get("entry_zscore"),
+                            "source": position.get("source", "score"),
+                        })
+                        last_exit_utc = utc_hm
+                        last_exit_dir = position["direction"]
+                        position = None
+                        action_str = f"EXIT REVERSAL_EXIT {'+'if _pnl>=0 else ''}{_pnl:.0f}pt {_elap}min"
+
+                    # Case 2: 无 position 且 reversal_mode="full" → 开新仓
+                    if position is None and reversal_mode == "full":
+                        _rdir = rev.direction
+                        _rep = price + slippage if _rdir == "LONG" else price - slippage
+                        _rfe = _lookup_fut(dt_str, _rep)
+                        _rsl = SYMBOL_PROFILES.get(sym, _DEFAULT_PROFILE).get("stop_loss_pct", STOP_LOSS_PCT)
+                        _rstop = _rep * (1 - _rsl) if _rdir == "LONG" else _rep * (1 + _rsl)
+                        position = {
+                            "entry_price": _rep,
+                            "entry_price_fut": _rfe,
+                            "direction": _rdir,
+                            "entry_time_utc": utc_hm,
+                            "highest_since": high,
+                            "lowest_since": low,
+                            "stop_loss": _rstop,
+                            "volume": 1,
+                            "half_closed": False,
+                            "bars_below_mid": 0,
+                            "entry_zone_5m": "",
+                            # reversal 开仓无 score/M/V/Q/B/S 指标
+                            "entry_score": 0,
+                            "entry_m_score": 0, "entry_v_score": 0,
+                            "entry_q_score": 0, "entry_b_score": 0,
+                            "entry_s_score": 0, "entry_s_breakout": 0,
+                            "entry_daily_mult": 1.0, "entry_raw_total": 0,
+                            "raw_mom_5m": 0.0, "raw_atr_ratio": 0.0,
+                            "raw_vol_pct": -1.0, "raw_vol_ratio": -1.0,
+                            "entry_gap_pct": _gap_pct,
+                            "entry_gap_aligned": False,
+                            "entry_rebound_pct": 0.0,
+                            "entry_total_drop": 0.0,
+                            "entry_intraday_drop": 0.0,
+                            "entry_filter_mult": 1.0,
+                            "entry_zscore": z_val,
+                            "source": "reversal",
+                        }
+                        _rev_opens_today += 1
+                        if action_str:
+                            action_str += f" | OPEN REV {_rdir} d={rev.depth:.0f}"
+                        else:
+                            action_str = f"OPEN REV {_rdir} d={rev.depth:.0f}"
+
+        # 如果刚在 reversal block 开了新仓，本 bar 不再 check_exit（避开自 SL/EOD）
+        _just_opened_rev = "OPEN REV" in action_str
+        if position is not None and not _just_opened_rev:
             # P0: Bar high/low 止损检查 — 暂时禁用，与monitor对齐
             # monitor的check_exit用cur_price(close)判断止损，不用bar high/low
             # TODO: monitor也加P0后恢复
@@ -1172,6 +1301,8 @@ def main():
                         help="Signal version: v2, v3, or auto (use SIGNAL_ROUTING)")
     parser.add_argument("--sensitivity", action="store_true",
                         help="Run sensitivity sweep: slippage 0/5/10 × threshold 50/55/60")
+    parser.add_argument("--reversal", choices=["off", "full", "exit_only"],
+                        default="off", help="Reversal integration: off/full/exit_only")
     args = parser.parse_args()
 
     db = get_db()
@@ -1202,7 +1333,8 @@ def main():
     all_trades = []
     for td in dates:
         trades = run_day(args.symbol, td, db, verbose=(len(dates) <= 3),
-                         slippage=args.slippage, version=args.version)
+                         slippage=args.slippage, version=args.version,
+                         reversal_mode=args.reversal)
         all_trades.extend([(td, t) for t in trades])
 
     if len(dates) > 1:
