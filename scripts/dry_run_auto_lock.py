@@ -15,6 +15,7 @@ import json
 import os
 import sqlite3
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = str(Path(__file__).resolve().parents[1])
@@ -167,6 +168,8 @@ def test_monitor_consume(lock_file_path: str):
     mon._shadow_closed_count = 0
     # _save_shadow_state 需要 _prompted_bars
     mon._prompted_bars = set()
+    # 平仓冷却 dict (2026-04-24 新增)
+    mon._cooldown_until = {}
 
     # 调用被测方法
     mon._check_auto_locks()
@@ -211,6 +214,17 @@ def test_monitor_consume(lock_file_path: str):
     # 断言 5: 重入安全 — 再次调用 shadow 已空
     mon._check_auto_locks()
     print(" ✓ 重入测试通过（文件已删，shadow 已空）")
+
+    # 断言 6: 冷却已设置（AUTO_STOP_LOCK in COOLDOWN_EXIT_REASONS）
+    import pandas as pd
+    cd_key = ("IM", "LONG")
+    assert cd_key in mon._cooldown_until, (
+        f"FAIL: _cooldown_until 未设置 {cd_key}: {mon._cooldown_until}")
+    cd_until = mon._cooldown_until[cd_key]
+    delta_min = (cd_until - pd.Timestamp(datetime.utcnow() + timedelta(hours=8))).total_seconds() / 60
+    assert 13 < delta_min <= 15, f"FAIL: 冷却时长异常 {delta_min:.1f}min"
+    print(f" ✓ 冷却设置正确: {cd_key} until {cd_until.strftime('%H:%M:%S')} "
+          f"(~{delta_min:.1f}min 后解禁)")
 
     # 清理测试 db
     os.remove(test_db)

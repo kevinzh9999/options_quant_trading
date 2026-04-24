@@ -34,6 +34,19 @@ def _bj_now() -> datetime:
     """
     return datetime.utcnow() + timedelta(hours=8)
 
+
+# 平仓后同方向冷却：TC/SL/TRAILING/MID_BREAK/ME 触发后 15min 内不再同方向开仓
+# 防止 4/24 暴露的 "TC 锁利 → 立即 re-entry 追空 → 反弹打止损" pattern
+COOLDOWN_EXIT_REASONS = {
+    "TREND_COMPLETE",
+    "STOP_LOSS",
+    "AUTO_STOP_LOCK",
+    "TRAILING_STOP",
+    "MID_BREAK",
+    "MOMENTUM_EXHAUSTED",
+}
+COOLDOWN_MINUTES = 15
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -473,6 +486,9 @@ class IntradayMonitor:
         # 影子交易累计已平仓PnL（点数）和笔数，用于面板显示
         self._shadow_closed_pnl: float = 0.0
         self._shadow_closed_count: int = 0
+        # 平仓后同方向冷却（防止 TC/SL 后立即 re-entry 追高追空）
+        # key=(sym, direction) value=允许开仓的 pd.Timestamp (BJ)。见COOLDOWN_EXIT_REASONS。
+        self._cooldown_until: Dict[tuple, pd.Timestamp] = {}
         # 项目 tmp 目录（信号文件、持仓文件等）
         # Per-symbol文件路径：signal_pending_IM.json, shadow_state_IM.json等
         from config.config_loader import ConfigLoader
@@ -1025,6 +1041,10 @@ class IntradayMonitor:
                               f"@ {exit_price:.1f} PnL={pnl_pts:+.1f}pt ***")
                         del self._shadow_positions[sym]
                         self.strategy.position_mgr.remove_by_symbol(sym)
+                        if reason in COOLDOWN_EXIT_REASONS:
+                            self._cooldown_until[(sym, direction)] = (
+                                pd.Timestamp(_bj_now())
+                                + pd.Timedelta(minutes=COOLDOWN_MINUTES))
                         self._save_shadow_state()
                     else:
                         print(f"  [INFO] {info.get('reason','AUTO_STOP_LOCK')} "
@@ -1654,6 +1674,24 @@ class IntradayMonitor:
                             fut_exit = fp
                     except Exception:
                         pass
+                # STOP_LOSS 精度止损：bar close 可能远超 stop_price（4/24 实测 -37/-43pt）。
+                # 假设执行端 bar_low tick 监控会在 stop_price 处触发，shadow 据此近似。
+                # 前提：exit_info.should_exit==STOP_LOSS 意味着 bar close 已越 stop，
+                # tick 期间必然先到达 stop_price。
+                if reason == "STOP_LOSS":
+                    from strategies.intraday.A_share_momentum_signal_v2 import (
+                        SYMBOL_PROFILES as _SP, _DEFAULT_PROFILE as _DP,
+                        STOP_LOSS_PCT as _SLD,
+                    )
+                    _sl_pct = _SP.get(sym, _DP).get("stop_loss_pct", _SLD)
+                    if sp["direction"] == "LONG":
+                        fut_stop = entry_p_fut * (1 - _sl_pct)
+                        if fut_exit < fut_stop:
+                            fut_exit = fut_stop
+                    else:
+                        fut_stop = entry_p_fut * (1 + _sl_pct)
+                        if fut_exit > fut_stop:
+                            fut_exit = fut_stop
                 pnl_pts = (fut_exit - entry_p_fut) if sp["direction"] == "LONG" else (entry_p_fut - fut_exit)
                 try:
                     e_h, e_m = int(sp["entry_time_utc"][:2]), int(sp["entry_time_utc"][3:5])
@@ -1720,6 +1758,11 @@ class IntradayMonitor:
                 self._shadow_closed_count += 1
                 del self._shadow_positions[sym]
                 self.strategy.position_mgr.remove_by_symbol(sym)
+                if reason in COOLDOWN_EXIT_REASONS:
+                    self._cooldown_until[(sym, d_s)] = (
+                        _now_bj + pd.Timedelta(minutes=COOLDOWN_MINUTES))
+                    print(f"     [cooldown] {sym} {d_s} 至 "
+                          f"{self._cooldown_until[(sym, d_s)].strftime('%H:%M')}")
                 self._save_shadow_state()
 
         # 持久化shadow状态（每根bar都保存，防crash丢失）
@@ -1748,9 +1791,20 @@ class IntradayMonitor:
                     # 否则孤儿占位永远不会清除，阻止后续所有同品种信号
                     self.strategy.position_mgr.remove_by_symbol(sym)
                     continue
-                self._prompted_bars.add(key)
 
+                # 同方向冷却检查（TC/SL 后 15min 内不再同方向开仓）
                 direction = act.get("direction", "")
+                _cd_key = (sym, direction)
+                _cd_until = self._cooldown_until.get(_cd_key)
+                if _cd_until is not None and _now_bj < _cd_until:
+                    _remain_s = (_cd_until - _now_bj).total_seconds()
+                    print(f"  [cooldown] {sym} {direction} 剩余 "
+                          f"{_remain_s/60:.1f}min (until {_cd_until.strftime('%H:%M')})")
+                    # 撤销position_mgr占位避免孤儿
+                    self.strategy.position_mgr.remove_by_symbol(sym)
+                    continue
+
+                self._prompted_bars.add(key)
                 bid1 = act.get("bid1", 0)
                 ask1 = act.get("ask1", 0)
                 last = act.get("last", 0)
