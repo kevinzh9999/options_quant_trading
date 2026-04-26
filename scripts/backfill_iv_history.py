@@ -365,8 +365,10 @@ def main():
                 rv_5d, rv_20d, hurst,
             )
 
+            # Gate: 只要 atm_iv 或 atm_iv_market 任一有效就写
             atm_iv = result.get("atm_iv")
-            if atm_iv:
+            atm_iv_mkt = result.get("atm_iv_market")
+            if atm_iv or atm_iv_mkt:
                 # Upsert to daily_model_output
                 # Check if row exists
                 existing = db.query_df(
@@ -424,14 +426,14 @@ def main():
                     db._conn.commit()
 
                 success += 1
-                rr_str = f"RR={result.get('rr_25d', 'N/A')}" if result.get('rr_25d') else "RR=N/A"
-                ts_str = f"TS={result.get('iv_term_spread', 'N/A'):.4f}" if result.get('iv_term_spread') else "TS=N/A"
-                if (i + 1) % 10 == 0 or i < 3:
+                if (i + 1) % 50 == 0 or i < 3:
+                    iv_use = atm_iv_mkt or atm_iv or 0
+                    rr_v = result.get('rr_25d')
+                    ts_v = result.get('iv_term_spread')
                     print(f"  [{i+1}/{len(dates_to_fill)}] {td}: "
-                          f"IV={atm_iv*100:.1f}% "
-                          f"mktIV={result.get('atm_iv_market',0)*100:.1f}% "
-                          f"RV5={rv_5d*100:.1f}% " if rv_5d else "",
-                          f"{rr_str} {ts_str}")
+                          f"mktIV={iv_use*100:.1f}% "
+                          f"RV5={(rv_5d or 0)*100:.1f}% "
+                          f"RR={rr_v:+.4f}" + (f" TS={ts_v:+.4f}" if ts_v is not None else ""))
             else:
                 errors += 1
                 if (i + 1) % 20 == 0:

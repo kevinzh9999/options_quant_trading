@@ -4,7 +4,11 @@
 A股股指期货/期权多策略量化交易系统（实盘运行中）。
 - 数据层：Tushare 历史数据 + 天勤 TqSdk 实时行情和交易
 - 标的：IM（中证1000期货）、MO（中证1000期权）为主
-- 核心策略：① VRP 做空波动率（卖出 MO OTM Strangle）② 贴水捕获（多 IM 期货 + 保护性 Put）
+- 核心策略：
+  ① VRP 做空波动率（卖出 MO OTM Strangle）
+  ② 贴水捕获（多 IM 期货 + 保护性 Put）
+  ③ Intraday 日内 5min momentum/reversal（IM/IC 实盘）
+  ④ **Daily XGB 跨日 swing**（21因子 XGBoost + regime gate, 2026-04-26 上线）
 
 ---
 
@@ -252,6 +256,69 @@ IM+IC v2合计 **+4234pt/219天**（2025-05-16~2026-04-09）。
 - **本地DB优先**：`download_briefing_history.py` 预下载历史数据到7个表，briefing优先读本地（快速），Tushare作fallback
 - 增量更新：`python scripts/download_briefing_history.py --update`
 
+### Daily XGB 跨日策略（2026-04-26 上线，与 intraday 完全隔离）
+
+跨日 trend-following swing strategy。21因子 XGBoost regression 预测 5d forward return + regime-aware enhancement gates。详见 `docs/DAILY_XGB_STRATEGY.md`。
+
+**核心数字**（walk-forward 2.9 yr, 1×lot）：
+- 年化 +1,572K, MaxDD -536K, Calmar 2.93, Sharpe 5.64, WR 61%
+- 保守模式部署: 1 lot/signal + cap=10, 实盘期望 +21%/年, MaxDD -8.4%
+- Realistic execution (T+1 open) 打 9% 折扣，仍 +1,343K/年
+
+**架构 — 完全独立**：
+- 信号 JSON: `tmp/daily_xgb_pending_{date}.json`（不与 intraday `signal_pending_*.json` 混）
+- DB 表: `daily_xgb_signals` / `daily_xgb_trades` / `daily_xgb_orders` / `daily_xgb_executor_log`
+- Executor: `scripts/daily_xgb_executor.py`（独立 TqApi 进程, order_id 前缀 `DXGB_`）
+- 持仓: `tmp/daily_xgb_positions.json`（不读 `shadow_state.json`）
+- 锁仓模式：与 intraday 共账户，broker 看聚合，各自管理逻辑持仓
+
+**21 因子 = 18 默认 + 3 regime**：
+- IV (8): atm_iv_market, iv_pct_60d, rr_25d, vrp, iv_term_spread, iv_change/rr_change/vrp_change
+- RV (2): realized_vol_5d, realized_vol_20d
+- Price (8): today_return/amp/gap, ret_1d/5d/20d, pos_in_20d, slope_5d
+- **Regime (3, 关键)**: close_sma60_ratio, slope_60d, vol_regime (RV5/RV60)
+
+**Gate 三层**：
+- **G3s SHORT block**: close/sma60>1.04 AND close/sma200>1.05 → 拦截 SHORT（牛市禁空）
+- **N5 LONG enhancement**:
+  - strict bull (60>1.04 AND 200>1.05) → hold 10d, SL ATR×4
+  - dip bull (200>1.03 AND 60<1.02) → hold 15d, SL ATR×4 ← 2025 牛市 buy-the-dip 模式
+- **M7 SHORT enhancement (镜像 N5)**:
+  - extended bear (60<0.97 AND 200<0.97) → hold 10d, SL ATR×4
+  - rip bear (200<0.99 AND 60>0.98) → hold 15d, SL ATR×4 ← 熊市反弹做空
+- 默认 (其他): hold 5d, SL ATR×1.5
+
+**信号阈值**: in-sample preds P80 → LONG, P20 → SHORT
+
+**Walk-forward 训练**: 每日 retrain（cache 在 `logs/daily_xgb/models/model_{date}.pkl`），每月 retrain 也行（改 `pipeline.get_or_train_model` 缓存策略）。XGBoost 超参从研究阶段验证: n_estimators=200, max_depth=4, lr=0.03, min_child_weight=10, reg_alpha=0.5, reg_lambda=2.0
+
+**Risk circuit breakers**:
+- `tmp/daily_xgb_kill.flag` 存在 → 永久暂停新开仓
+- 单日亏损 < -3% × equity → 当日暂停
+- 单周累亏 < -5% × equity → 7日窗口暂停
+- 保证金占用 > 85% × equity → 暂停
+- Concurrent 持仓 > cap (10) → 拦截新开仓
+
+**执行流程**:
+- T 日 17:30 (EOD 后) 跑 `signal_generator` 生成 T+1 pending 信号
+- T+1 09:00 早盘 review，09:30 限价单委托（first 5min bar 后）
+- 60s 未成交 → 撤单 → 激进价 +2pt 重试
+- 14:55 EOD check：TIME (hold 满) / SL (close ≤ entry × (1-sl_pct)) → flag 次日开盘平仓
+
+**关键 trade-offs (50+ 变体测试)**:
+- ✗ 收紧 SL → 触发 intraday whipsaw 反而更糟
+- ✗ EOD SL 用次日开盘平 → 黑天鹅日次日跳低开盘锁低位
+- ✗ Break-even / trailing stop → 抽掉 2024 winners
+- ✗ Day-1 fast exit → 不划算（3:1 亏损/收益比）
+- ✓ 仅 Pareto 改进: VRP < 0.02 enhancement filter (年化 -10% 换 Calmar +17%)
+- **2026 Jan -152K 黑天鹅是 trend strategy 的 black swan tax (9.7% 年化), 接受不可避免**
+
+**仓位 sizing**:
+- 保守 1×lot, cap=10 (实盘部署版): +1,472K/年, +23% 账户回报
+- 中等 1×lot, no cap: +1,572K/年
+- 激进 2×lot, cap=20: +2,944K/年, +46% 账户回报
+- "1 lot per signal" 是合理的隐含 sizing；fixed-risk per trade 反而破坏 enhancement alpha
+
 ### 回测注意事项（重要！2026-04-01全面审计，04-04新增15m修复）
 - **Lookahead fix**：`bar_5m_signal = bar_5m.iloc[:-1]`，信号评分用上一根完成bar，执行价用当前bar close（详见 `docs/lookahead_audit.md`）
 - **止损精确化**：check_exit前先用bar high/low检查止损位，触发时exit_price=stop_price（不是close）
@@ -289,7 +356,11 @@ IM+IC v2合计 **+4234pt/219天**（2025-05-16~2026-04-09）。
 | futures_min | 2,447,680 | 2016~04-03 | 主连 1m/5m K线 |
 | index_daily | 10,932 | 2015~04-03 | 000852/000300/000016/000905 |
 | index_min | 1,986,912 | 2018~04-03 | 现货 1m/5m K线（日内策略核心） |
-| daily_model_output | 190 | 2025-06~04-03 | GARCH/IV/VRP/贴水/Greeks |
+| daily_model_output | 894 | 2022-07~04-25 | GARCH/IV/VRP/贴水/Greeks (2026-04 backfill 700+ 天) |
+| daily_xgb_signals | 0+ | 2026-04-26 | Daily XGB 信号记录 (status: PENDING/EXECUTED/SKIPPED_*) |
+| daily_xgb_trades | 0+ | 2026-04-26 | Daily XGB 完整交易（OPEN/CLOSED） |
+| daily_xgb_orders | 0+ | 2026-04-26 | Daily XGB executor 下单 audit |
+| daily_xgb_executor_log | 0+ | 2026-04-26 | Daily XGB executor 事件流 |
 
 **options_data.db:**
 | 表 | 行数 | 时间范围 | 说明 |
@@ -418,18 +489,27 @@ rr_25d                                                  ← 25D Risk Reversal（
 
 ## 每日操作流程
 
+详见 `docs/DAILY_ROUTINE.md`（2026-04-26 重写，含 Daily XGB 流程）。
+
 ```bash
-# 推荐：一键启动全天（tmux 4窗口 + 定时EOD）
+# 推荐：一键启动全天
 make trading-day
 
-# 或分步执行：
-make briefing                        # 盘前 Morning Briefing
-make monitor                        # 盘中日内信号
-make vol                            # 盘中波动率监控
-make quadrant                       # 盘中象限监控
-make executor                       # 半自动下单
-make eod                            # 收盘后 EOD
-make backtest                       # 回测今天
+# Intraday 流程
+make briefing                        # 盘前 Morning Briefing (8:50-9:25)
+make monitor-im / make monitor-ic    # 盘中日内信号
+make vol                             # 盘中波动率监控
+make quadrant                        # 盘中象限监控
+make executor                        # 半自动下单 (intraday)
+make eod                             # 收盘后 EOD (17:00)
+make backtest                        # 回测今天
+
+# Daily XGB 流程（独立运行，不与 intraday 冲突）
+make dxgb-signal                     # 17:30 EOD 后生成次日信号
+make dxgb-executor                   # 次日 09:25 启动独立 executor
+make dxgb-status                     # 风险熔断状态查询
+make dxgb-self-bt                    # 自研 backtest 验证
+make dxgb-tq-bt                      # TqBacktest 实盘模拟
 
 # 其他
 python scripts/portfolio_analysis.py # 持仓分析
@@ -448,7 +528,8 @@ python scripts/daily_record.py model --date YYYYMMDD  # 补跑模型
 | 模型层 | GJR-GARCH / RealizedVol / ImpliedVol / VolSurface / Greeks / 统计模型 / 技术指标，638+ 测试全绿 |
 | 贴水策略 | DiscountSignal / DiscountPosition（含 Put Spread 对比）/ DiscountBacktest / DiscountCaptureStrategy |
 | 日内策略 | v2/v3信号系统 / 4层Z-Score过滤 / 布林带突破+平仓 / 现货数据源 / 离线回测 / 信号质量分析 / 216天全量敏感分析 / 振幅过滤器 / 动态lb |
-| 半自动下单 | order_executor.py / 限价单+手工确认 / 锁仓（股指期货平今优化）/ TqBacktest验证 |
+| **Daily XGB 跨日策略** | **21因子 XGBoost + G3s/N5/M7 regime gate + ATR SL + 4层风险熔断 / 独立 executor (DXGB_前缀) / 完整 DB+JSON 隔离 / 自研+TqBacktest 双重验证（2026-04-26 上线）** |
+| 半自动下单 | order_executor.py (intraday) + daily_xgb_executor.py (Daily XGB, 完全独立TqApi) |
 | Morning Briefing | P1(跨市场/宽度/成交额/波动率/价格) + P2(北向/融资/PCR/ETF/期货持仓) + 极端值逆向修正 |
 | 象限监控 | quadrant_monitor.py / A/B/C/D判定 / 持仓匹配 / 象限切换alert |
 | EOD 记录系统 | TQ 快照 / 模型输出 / GARCH 预测回溯回填 / 市场状态评估 / BlendedRV VRP |
@@ -480,7 +561,19 @@ strategies/intraday/             ← 日内策略（v2/v3信号 + 平仓系统 +
   A_share_momentum_signal_v2.py  ← 信号生成器V2/V3 + 平仓系统 + Z-Score过滤
   monitor.py                     ← 盘中实时信号监控 + 数据记录
   strategy.py                    ← IntradayStrategy（必须用SignalGeneratorV2）
+strategies/daily_xgb/            ← 跨日 swing 策略（与 intraday 隔离）
+  config.py                      ← 保守模式参数硬编码
+  factors.py                     ← 21 因子 = 18 default + 3 regime
+  regime.py                      ← G3s/N5/M7 gate 函数
+  pipeline.py                    ← XGBoost wrapper + 模型缓存
+  signal_generator.py            ← 主入口 CLI: python -m strategies.daily_xgb.signal_generator
+  position_manager.py            ← OPEN trades 追踪 + EOD check
+  risk_guard.py                  ← 4 层熔断
+  persist.py                     ← DB IO + JSON pipe IO
 scripts/daily_record.py          ← EOD 主流程（~1500 行）
+scripts/daily_xgb_executor.py    ← Daily XGB 独立 TQ executor (DXGB_ 前缀)
+scripts/daily_xgb_self_backtest.py ← Daily XGB 自研 backtest (验证 production 代码)
+scripts/daily_xgb_tq_backtest.py ← Daily XGB TqBacktest 实盘模拟
 scripts/portfolio_analysis.py    ← 持仓分析主流程（~950 行）
 scripts/vol_monitor.py           ← 期权波动率实时监控面板（~1650 行）
 scripts/backtest_signals_day.py  ← 日内信号离线回测（含振幅过滤）

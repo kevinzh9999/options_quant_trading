@@ -23,6 +23,12 @@ REVERSAL_CONFIG: Dict[str, Dict] = {
     "IM": {
         "enabled": True, "method": "slope",
         "long_n": 8, "short_n": 6, "bear_thr": -1.5, "rev_thr": 3.0, "min_depth": 25,
+        # F1 filter: skip 1st reversal of day if BJ time < this threshold.
+        # Rationale: slope params long_n=8 + short_n=6 make earliest possible
+        # reversal fire ≈10:30 BJ, but that captures "breakout's first pullback"
+        # rather than a true reversal. 900d IS/OOS backtest shows delay to ≥11:00
+        # yields +156K yuan (+0.86pt/day). Empty/None disables.
+        "first_trade_min_bj": "11:00",
     },
     "IC": {"enabled": False},
     "IF": {"enabled": False},

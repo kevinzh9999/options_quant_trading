@@ -378,6 +378,33 @@ Phase 1.11震荡日分析发现：IM震荡日62天亏-798pt，IC震荡日亏-341
 - v2开仓方向与slope短窗口方向矛盾时的过滤（T3 fast slope filter IS +12K，太激进，暂不实施）
 - IC slope reversal参数继续探索
 
+### 1.5.1b F1 First-Trade时段过滤 ✅ 已部署（2026-04-22）
+
+**问题诊断**：4/20-4/21实盘发现低振幅日reversal迟到打尾部。242天深挖：第1笔reversal 205笔 sum=**-511pt**（占全年reversal收益1/2），亏损集中在 10:30-11:00 时段 (-569pt) × SHORT方向 (-471pt)。
+
+**机理**：slope参数 long_n=8 + short_n=6 决定最早可能触发时间≈10:30 BJ，但该时段"开盘确认趋势还未走完"，所谓"反转"实为"趋势内正常回调"。
+
+**规则**：当天首次reversal fire时若 BJ 时间<11:00 则跳过（不开仓、不平v2仓位）。被跳过的fire不计入计数，下次fire仍按首次test。
+
+**候选规则对比（907天, IS 242+OOS 665）**：
+| 规则 | ΔIS | ΔOOS | ΔFull | 状态 |
+|------|-----|------|-------|------|
+| **F1: entry≥11:00** | **+111K** | **+45K** | **+156K** | ✅ 上线 |
+| F3: \|sL\|≥2.0 | -13K | -124K | -137K | ✗ OOS反转 |
+| F1 AND F3 | +97K | -158K | -61K | ✗ F3拖累 |
+| F1 OR F3 | +28K | +24K | +52K | 弱但稳 |
+| F1: entry≥10:45 | +28K | +63K | +91K | 次优 |
+| F1: entry≥11:15 | +121K | +7K | +128K | OOS衰减 |
+
+**稳健性三检**：邻域稳（11:00高原最高）、时间分半稳（H1+34K H2+77K）、单日贡献14.6%<30%。
+
+**实施**：
+- `REVERSAL_CONFIG["IM"]["first_trade_min_bj"] = "11:00"`
+- monitor 新增 `_reversal_opens_today` counter，重启从shadow_trades (entry_score=0 proxy) + 当前reversal持仓重建
+- 全样本改善约 **+0.86pt/天 × 907天 = +156K元**
+
+**教训**（写入 memory/feedback_small_sample_and_filter）：小样本(205笔)发现的2参数AND过滤器易OOS反转，单参数版本稳健胜出，parsimony wins。
+
 ### 1.5.2 环境识别 + 策略模式切换（下一步优先）
 
 **目标**：构建"波动率区间过滤器"作为动量/均值回归的总开关。

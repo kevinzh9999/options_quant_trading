@@ -1,7 +1,8 @@
 PYTHON := /opt/homebrew/Caskroom/miniforge/base/envs/quant/bin/python
 PYTEST := /opt/homebrew/Caskroom/miniforge/base/envs/quant/bin/pytest
 
-.PHONY: test test-data test-all briefing monitor vol quadrant executor eod backtest dashboard trading-day signal-quality sensitivity
+.PHONY: test test-data test-all briefing monitor monitor-im monitor-ic vol quadrant executor eod backtest dashboard trading-day signal-quality sensitivity \
+        dxgb-signal dxgb-executor dxgb-self-bt dxgb-tq-bt dxgb-status
 
 test:
 	$(PYTEST) tests/test_data/ -v
@@ -51,6 +52,22 @@ dashboard:
 
 signal-quality:
 	$(PYTHON) scripts/signal_quality_analysis.py --symbol IM
+
+# === Daily XGB 跨日策略（独立 namespace） ===
+dxgb-signal:
+	$(PYTHON) -m strategies.daily_xgb.signal_generator
+
+dxgb-executor:
+	$(PYTHON) scripts/daily_xgb_executor.py
+
+dxgb-self-bt:
+	$(PYTHON) scripts/daily_xgb_self_backtest.py
+
+dxgb-tq-bt:
+	$(PYTHON) scripts/daily_xgb_tq_backtest.py --start 20250407 --end 20250425
+
+dxgb-status:
+	$(PYTHON) -c "from strategies.daily_xgb.risk_guard import status_report; from strategies.daily_xgb.config import DailyXGBConfig; print(status_report(DailyXGBConfig()))"
 
 # 一键全天
 trading-day:

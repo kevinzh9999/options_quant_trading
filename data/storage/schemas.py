@@ -904,6 +904,112 @@ ETF_TABLES: list[str] = [
 ]
 
 # ---------------------------------------------------------------------------
+# Daily XGB 跨日策略表（与 intraday 完全隔离, 独立 namespace daily_xgb_*）
+# ---------------------------------------------------------------------------
+
+DAILY_XGB_SIGNALS_SQL = """
+CREATE TABLE IF NOT EXISTS daily_xgb_signals (
+    signal_date          TEXT    PRIMARY KEY,    -- YYYYMMDD, 信号生成日 (T)
+    underlying           TEXT,                   -- IM
+    direction            TEXT,                   -- LONG / SHORT / NONE
+    pred                 REAL,                   -- 模型预测值
+    top_thr              REAL,                   -- in-sample P80 阈值
+    bot_thr              REAL,                   -- in-sample P20 阈值
+    train_end_date       TEXT,                   -- 模型 train cutoff
+    train_ic             REAL,                   -- training IC
+    n_train_samples      INT,
+    -- regime state at signal date
+    close_sma60          REAL,
+    close_sma200         REAL,
+    slope_60d            REAL,
+    vol_regime           REAL,
+    atr20_pct            REAL,
+    -- enhancement decision
+    enhancement_type     TEXT,   -- default / n5_strict / n5_dip / m7_extended / m7_rip
+    hold_days            INT,
+    atr_k                REAL,
+    sl_pct               REAL,
+    -- planning
+    entry_intended_open  REAL,                   -- T 日 close (供 T+1 open 参考)
+    lots_planned         INT,
+    -- lifecycle
+    status               TEXT,   -- PENDING / EXECUTED / SKIPPED_OPERATOR / SKIPPED_RISK / EXPIRED
+    reason               TEXT,
+    signal_json          TEXT,                   -- 完整 JSON 留底
+    created_at           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_dxgb_sig_status ON daily_xgb_signals (status);
+"""
+
+DAILY_XGB_TRADES_SQL = """
+CREATE TABLE IF NOT EXISTS daily_xgb_trades (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy_id          TEXT DEFAULT 'DAILY_XGB',
+    signal_date          TEXT,                   -- YYYYMMDD T 信号日
+    entry_date           TEXT,                   -- YYYYMMDD T+1 实际开仓日
+    direction            TEXT,                   -- LONG / SHORT
+    underlying           TEXT,
+    contract_code        TEXT,                   -- IM2606.CFX
+    enhancement_type     TEXT,
+    hold_days            INT,
+    atr_k                REAL,
+    sl_pct               REAL,
+    -- entry
+    entry_price          REAL,                   -- T+1 open 实际成交价
+    entry_lots           INT,
+    entry_atr            REAL,                   -- ATR20 at signal time
+    -- planned exit
+    planned_exit_date    TEXT,                   -- YYYYMMDD entry + hold_days
+    sl_price             REAL,                   -- entry × (1 - sl_pct) for LONG
+    -- actual exit
+    exit_date            TEXT,
+    exit_price           REAL,
+    exit_reason          TEXT,                   -- TIME / SL / MANUAL / KILL_SWITCH
+    pnl_yuan             REAL,
+    net_ret              REAL,                   -- after slippage
+    status               TEXT,                   -- OPEN / CLOSED
+    created_at           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_dxgb_tr_status ON daily_xgb_trades (status);
+CREATE INDEX IF NOT EXISTS idx_dxgb_tr_entry ON daily_xgb_trades (entry_date);
+"""
+
+DAILY_XGB_ORDERS_SQL = """
+CREATE TABLE IF NOT EXISTS daily_xgb_orders (
+    order_id             TEXT PRIMARY KEY,       -- DXGB_OPEN_YYYYMMDD_HHMMSS_xxx
+    strategy_id          TEXT DEFAULT 'DAILY_XGB',
+    submit_time          TEXT,
+    update_time          TEXT,
+    contract_code        TEXT,
+    direction            TEXT,                   -- BUY / SELL
+    offset               TEXT,                   -- OPEN / CLOSE
+    lots                 INT,
+    limit_price          REAL,
+    filled_lots          INT DEFAULT 0,
+    filled_price         REAL,
+    status               TEXT,                   -- SUBMITTED / FILLED / CANCELLED / TIMEOUT
+    cancel_reason        TEXT,
+    trade_id             INT,                    -- FK to daily_xgb_trades.id
+    signal_date          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_dxgb_ord_status ON daily_xgb_orders (status);
+"""
+
+DAILY_XGB_EXECUTOR_LOG_SQL = """
+CREATE TABLE IF NOT EXISTS daily_xgb_executor_log (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_time           TEXT,
+    event_type           TEXT,                   -- START / SIGNAL_RECEIVED / OPEN_SUBMITTED /
+                                                 -- OPEN_FILLED / CLOSE_SUBMITTED / CLOSE_FILLED /
+                                                 -- SL_TRIGGERED / KILL_SWITCH / RECONCILE / ERROR
+    order_id             TEXT,
+    details              TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_dxgb_ev_time ON daily_xgb_executor_log (event_time);
+CREATE INDEX IF NOT EXISTS idx_dxgb_ev_type ON daily_xgb_executor_log (event_type);
+"""
+
+# ---------------------------------------------------------------------------
 # 主库表（trading.db）— 不含期权表
 # ---------------------------------------------------------------------------
 
@@ -947,6 +1053,11 @@ ALL_TABLES: list[str] = [
     SHADOW_TRADES_SQL,
     # Executor完整信号记录
     EXECUTOR_LOG_SQL,
+    # Daily XGB 跨日策略（独立 namespace, daily_xgb_*）
+    DAILY_XGB_SIGNALS_SQL,
+    DAILY_XGB_TRADES_SQL,
+    DAILY_XGB_ORDERS_SQL,
+    DAILY_XGB_EXECUTOR_LOG_SQL,
 ]
 
 # 向后兼容别名（db_manager.py 等现有代码使用 ALL_DDL）

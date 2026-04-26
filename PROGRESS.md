@@ -1,6 +1,6 @@
 # 开发进度追踪
 
-> 最后更新：2026-04-08（方案E动态lb + d_override禁用 + EOD重构四库分离 + Shadow恢复修复）
+> 最后更新：2026-04-26（Daily XGB 跨日策略生产级实施完成）
 
 ## 总体状态
 
@@ -656,6 +656,115 @@ Breakeven滑点：~2.5pt → ~4.0pt
 ### BAND_REVERSAL研究结论
 - [x] 因子有效（WR=69%），但作为独立exit信号-32%，加regime+cooldown仍-5.3%
 - [x] 结论：不实施，保持当前exit系统
+
+---
+
+## 2026-04-24~26：Daily XGB 跨日策略研究 + 生产级实施
+
+### 研究历程（连续 4 天密集 sprint）
+
+#### 阶段 1：5min reversal XGBoost 失败 → 转向 daily horizon
+- [x] **5min reversal 信号 XGBoost**：试图用 21 维 features 预测 5min reversal 是否成功
+- [x] **结果**：Test AUC 0.50，5min 时间尺度被 noise 主导，模型无法学习
+- [x] **用户洞察**：IV/RR/VRP 是日级信号，不是分钟级。把 horizon 升到 5d 测一下
+
+#### 阶段 2：Daily IV/RR/VRP 信号验证
+- [x] Backfill `daily_model_output` 700 天历史 (2022-07~2025-06)，多进程
+- [x] 18 因子（IV 8 + RV 2 + Price 8）+ XGBoost regression
+- [x] **Test IC 0.10-0.19**（5d horizon），TimeSeriesSplit 5-fold 全正
+- [x] 因子化框架 `strategies/daily/factors.py`：DailyContext + DailyFactor ABC + DailyFactorPipeline
+
+#### 阶段 3：Strict OOS + Walk-forward 验证 robustness
+- [x] **Strict OOS**：train ≤ 2024-12, predict 2025+ 不重训 → OOS IC +0.115
+- [x] **Walk-forward**：retrain every 20 days → OOS IC +0.097（一致）
+- [x] **结论**：信号 robust，不是 partial overfit。Walk-forward 年化 +132 万 / 1 手 (2.9 yr)
+
+#### 阶段 4：MaxDD 归因 → A+D 组合
+- [x] DD 分析：SHORT 端在 2024-2025 牛市亏 -58 万 是 MaxDD -83 万 的主要来源
+- [x] 4 个修复方案 A/B/C/D 单独 + 组合测试
+- [x] **A+D 胜出**：A (ATR×1.5 SL) + D (3 个 regime 因子: close/sma60, slope_60d, vol_regime)
+- [x] **A+D 结果**：年化 +918K, MaxDD -789K, Calmar 1.16, Sharpe 3.44
+
+#### 阶段 5：G3s SHORT block + N5 LONG enhancement
+- [x] 用户洞察："去掉 SHORT 是过拟合 2025 牛市，到熊市要亏死"
+- [x] **G3s gate**：close/sma60>1.04 AND close/sma200>1.05 → 屏蔽 SHORT 信号（牛市禁空）
+- [x] G3s 后 2025 SHORT 从 -323K → -55K，整体 Calmar 升到 2.22
+- [x] **N5 2-branch LONG enhancement**：
+  - strict bull (close/sma60>1.04 AND close/sma200>1.05) → hold 10d, SL ATR×4
+  - dip bull (close/sma200>1.03 AND close/sma60<1.02) → hold 15d, SL ATR×4
+- [x] **N5 后**：2025 LONG +405K → +1,255K (+267%), Calmar 2.13
+
+#### 阶段 6：M7 SHORT 镜像 enhancement
+- [x] 用户关键问题："策略是不是只在牛市好用？熊市能不能镜像？"
+- [x] **M7 镜像 N5**：
+  - extended bear (close/sma60<0.97 AND close/sma200<0.97) → hold 10d, SL ATR×4
+  - rip bear (close/sma200<0.99 AND close/sma60>0.98) → hold 15d, SL ATR×4
+- [x] **M7 后**：2024 H1 SHORT +766K → +1,797K，2023 全年 +40K → +272K
+- [x] **完整 baseline (A+D+G3s+N5+M7)**：
+  - 年化 **+1,572K / 1 手** (= +24.6% 账户)
+  - MaxDD **-536K** (= -8.4% 账户)
+  - **Calmar 2.93, Sharpe 5.64, WR 61%**
+
+#### 阶段 7：2026 Q1 黑天鹅深度分析
+- [x] 2026 Jan 12 笔 LONG 净 -152K (Trump 提名 Warsh 为 Fed Chair, 1/30-2/2 全球风险资产同步抛售)
+- [x] **测试 50+ 修复方案**: chop detector / vol filter / IV term filter / SL 收紧 / hold 缩短 / EOD SL / break-even / trailing stop / day-1 fast exit / regime feedback
+- [x] **唯一 Pareto 改进 IV3** (VRP < 0.02 enhancement filter)：年化 -10% 换 Calmar +17%
+- [x] **核心结论**：2/2 单日 -3.39% 暴跌后立即反弹是 wick whipsaw，任何 SL 都在低点击中后错过反弹。2026 Jan -152K 是 trend strategy 的 black swan tax（占年化 9.7%）
+
+#### 阶段 8：Position sizing 三档对比
+- [x] **保守 1×lot, cap=10**: 年化 +1,472K (+23% 账户), MaxDD -8.4%, Calmar 2.75
+- [x] 中等 1×lot, no cap: 年化 +1,572K, Calmar 2.93
+- [x] 激进 2×lot, cap=20: 年化 +2,944K (+46% 账户), MaxDD -16.7%, Calmar 2.75
+- [x] 用 fixed-risk per trade（B 方案）反而破坏 enhancement alpha
+- [x] **结论**："1 lot per signal" 是合理的隐含 sizing，保守模式部署
+
+#### 阶段 9：Realistic execution 模型修正
+- [x] backtest 假设 T close 进出场，实际 T+1 open 进出场
+- [x] **Realistic walk-forward**：年化 +1,343K (vs idealized +1,472K，-9% 滑点 + gap)
+
+### 生产级实施（4 phase 完整代码）
+
+**Phase 1：核心信号生成** ✅
+```
+strategies/daily_xgb/
+├── config.py              # 保守模式参数硬编码
+├── factors.py             # 21 因子 = 18 default + 3 regime
+├── regime.py              # G3s/N5/M7 gate 函数
+├── pipeline.py            # XGBoost wrapper, train/predict, 模型缓存
+├── persist.py             # DB IO + JSON pipe IO
+├── signal_generator.py    # 主入口 CLI
+└── __init__.py
+```
+
+**Phase 2：DB schema + 持仓管理** ✅
+- 4 张新表：`daily_xgb_signals` / `daily_xgb_trades` / `daily_xgb_orders` / `daily_xgb_executor_log`
+- `position_manager.py`：OPEN trades 追踪 + EOD check_exits
+- `risk_guard.py`：4 层熔断 (kill_switch / daily_loss / weekly_dd / margin_usage)
+
+**Phase 3：独立 TQ executor** ✅
+- `scripts/daily_xgb_executor.py`：独立 TqApi 进程，DXGB_ order_id 前缀
+- 09:30 限价开仓 → 60s 撤单 → 激进价 +2pt 重试
+- 14:55 EOD check → TIME/SL 触发 → 次日 09:30 平仓
+- 与 intraday executor 完全隔离（不读 signal_pending_*.json）
+
+**Phase 4：测试验证** ✅
+- `scripts/daily_xgb_self_backtest.py`：production 代码精确复现 research baseline
+  - 年化 +1,472,218 / MaxDD -536,066 / Calmar 2.75 / Sharpe 5.37 ✓
+- `scripts/daily_xgb_tq_backtest.py`：TqBacktest 实盘模拟
+  - 2025-04-07~25: 13 trades, 92% WR, +605K PnL, +6.16%/月
+
+### 双策略架构 (intraday vs daily_xgb 完全隔离)
+
+| 维度 | Intraday | Daily XGB |
+|---|---|---|
+| 信号源 | `tmp/signal_pending_{sym}.json` | `tmp/daily_xgb_pending_{date}.json` |
+| 入口 | 5min bar trigger (monitor) | EOD 17:30 (signal_generator) |
+| Executor | `scripts/order_executor.py` | `scripts/daily_xgb_executor.py` |
+| 持仓 | `shadow_state.json` + `position_mgr` | `daily_xgb_positions.json` + DB |
+| DB tables | signal_log, shadow_trades, order_log, executor_log | daily_xgb_signals, daily_xgb_trades, daily_xgb_orders, daily_xgb_executor_log |
+| TQ order_id | 默认 | DXGB_ 前缀 |
+| 平仓时机 | 盘中 5min triggers | 仅 EOD 检查 |
+| 锁仓模式 | 对 (CFFEX 平今手续费) | 对 (与 intraday 共账户独立持仓) |
 
 ---
 

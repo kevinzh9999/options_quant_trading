@@ -1,406 +1,357 @@
 # 每日交易运营手册
 
-> 每天按这个流程执行，养成纪律。核心目标：系统性地积累数据、验证信号、优化策略。
+> 干净版（2026-04-26 重写）。两条独立策略管线：
+>   - **Intraday 日内**：5min K线，盘中 monitor + executor
+>   - **Daily XGB 跨日**：21 因子 XGBoost + regime gate，盘后生成信号 + 次日开盘执行
+>
+> 完全隔离：各自的信号 JSON、DB 表、TQ executor 进程、order_id 前缀。
 
 ---
 
-## 一、盘前准备（8:50 - 9:25）
+## 时间表（全天）
 
-### 执行
+```
+09:00     盘前 — Briefing + 复习昨日 Daily XGB pending 信号
+09:25     启动 intraday monitor + intraday executor
+09:25     启动 daily_xgb_executor（review 昨晚生成的信号 → 集合竞价委托）
+09:30     开盘
+09:30-09:35  Daily XGB 限价开仓（first 5min bar 后）
+09:45-11:20  Intraday 主交易时段
+11:20-13:05  午休（系统禁开仓）
+13:05-14:30  Intraday 下午时段
+14:30-14:55  Intraday 不开新仓，只管理持仓
+14:55     Daily XGB EOD 检查（TIME/SL 触发的次日开盘平仓 flag）
+15:00     收盘
+17:00-17:30  EOD: daily_record.py eod
+17:30     Daily XGB 信号生成（写次日 pending JSON）
+18:00-18:30  交易笔记 / 复盘
+```
+
+---
+
+## 一、盘前（08:50 - 09:25）
 
 ```bash
-# 1. Morning Briefing（综合方向判断）
-python scripts/morning_briefing.py
+# 1. Morning Briefing（综合方向 / Hurst / 象限）
+make briefing
 
-# 2. 查看昨日报告回顾
+# 2. 看昨日 EOD 报告
 cat logs/eod/$(date -v-1d +%Y%m%d).md
-cat logs/analysis/$(date -v-1d +%Y%m%d).md
 
-# 3. 象限状态检查
-python scripts/quadrant_monitor.py --once
+# 3. 看 Daily XGB 上一交易日生成的 pending 信号
+ls -la tmp/daily_xgb_pending_*.json
+cat tmp/daily_xgb_pending_*.json | jq '.'
+
+# 4. 检查 Daily XGB 风险状态
+python -m strategies.daily_xgb.risk_guard
 ```
 
-### 思考和判断
+### 决策
 
-**确定今日方向 Guidance（多/空/中性）**
-
-需要回答的问题：
-- 昨天的趋势是什么？是否有延续的动力？
-- 昨日ATM IV是上升还是下降？VRP信号是什么？
-- 昨日贴水有没有异常变化（突然加深=做空力量增强）？
-- 有没有重大事件（经济数据、政策、外盘大跌）？
-- 昨天的signal_log里，哪个品种的信号最强、方向是什么？
-- 当前处于哪个象限（A/B/C/D）？象限建议的策略方向是什么？
-- 持仓和象限是否匹配？如果不匹配，需要什么调仓？
-- 参考 STRATEGY_PLAYBOOK.md 对应象限的操作建议
-
-**确认持仓的风控线**
-
-逐个持仓回答：
-- 止损价是多少？距离当前价多远？
-- 如果今天跳空到止损线以外怎么办？
-- 期权持仓的安全距离够不够？卖方合约距离行权价多远？
-- 今天有没有必须平仓的合约（到期、周五不过周末等）？
-
-**写下今日计划**
-
-用一句话写下来，例如：
-- "今日偏空，IF找反弹高点平多头，IH等反弹做空，IM观察不动"
-- "今日中性，不开新仓，Strangle继续持有吃Theta"
-
-### 想要取得的结论
-
-> 开盘前必须有一个明确的方向判断和操作计划，不能盘中临时起意。
+- 当前 regime 是什么（A/B/C/D 象限 + Hurst）
+- Daily XGB 信号方向 / 手数 / SL 是否合理
+- 持仓的止损线距离当前价多远
+- 一句话写下今日方向 Guidance
 
 ---
 
-## 二、开盘监控（9:25 - 9:45）
+## 二、盘中启动（09:25 之前）
 
-### 执行
+### tmux 一键启动（推荐）
 
 ```bash
-# 终端1：日内信号monitor（含v1 overlay自动并行）
-python -m strategies.intraday.monitor
-# monitor启动时自动初始化v1 overlay，打印"[V1] overlay初始化成功"
-# v1 shadow trade自动写入shadow_trades_new_mapping表
+make trading-day
+# 启动 5 窗口 tmux session：
+#   0: intraday monitor (IM)
+#   1: intraday monitor (IC)
+#   2: vol_monitor
+#   3: quadrant_monitor
+#   4: intraday order_executor
+#   5: daily_xgb_executor    ← 新增
+```
 
-# 终端2：期权波动率monitor
+### 或分步启动
+
+```bash
+# Intraday
+python -m strategies.intraday.monitor --symbol IM
+python -m strategies.intraday.monitor --symbol IC
 python scripts/vol_monitor.py
-
-# 终端3：策略象限monitor（每5分钟刷新）
 python scripts/quadrant_monitor.py
+python scripts/order_executor.py
 
-# 终端4：半自动下单
-python scripts/order_executor.py                        # 实盘（默认v2信号）
-python scripts/order_executor.py --signal-source v1     # v1信号（观察期后切换）
-python scripts/order_executor.py --dry-run              # 只显示不下单
+# Daily XGB（独立 executor 进程）
+python scripts/daily_xgb_executor.py
 ```
 
-### 观察和记录
+### Daily XGB executor 启动后做什么
 
-**开盘竞价阶段（9:15-9:25）**
-- 集合竞价的方向（高开/低开/平开）
-- 高开/低开幅度——超过0.5%算大幅
-- 竞价方向和你的 Guidance 是否一致？
-
-**前15分钟区间形成（9:30-9:45）**
-- 这段时间不交易（系统禁止开仓，09:45后才允许）
-- 记录三个品种的开盘区间高低点
-- 成交量是放量还是缩量（vs昨日同时段）
-
-### 想要取得的结论
-
-> 开盘区间和竞价方向是否确认了你的盘前 Guidance？如果矛盾，要警惕。
+- 读 `tmp/daily_xgb_pending_*.json`（上一交易日盘后生成）
+- 显示信号 + regime + 风险状态 → 操作员 [y/n] (60s timeout=skip)
+- 09:30 后第一根 5min bar：限价单委托（LONG 取 ask, SHORT 取 bid）
+- 60s 未成交 → 撤单 → 激进价 +2pt 重试
+- 成交后写 `daily_xgb_trades` (status=OPEN) + `daily_xgb_positions.json`
+- 14:55 自动跑 EOD check，TIME / SL 触发的下个开盘平仓
 
 ---
 
-## 三、盘中交易时段（9:45 - 14:30）
+## 三、盘中（09:30 - 14:30）
 
-### 持续关注
+### Intraday — 看 monitor 面板
 
-**日内 monitor 面板（每5分钟刷新）**
-- 信号得分变化趋势——是在升高（趋势加强）还是回落（趋势减弱）？
-- 哪个品种的信号最强？方向是什么？
-- 情绪乘数有没有异常（>1.2 或 <0.8）？
-- 各维度的得分分布——是某一个维度主导还是多维度共振？
+- 信号得分变化趋势（升高=趋势加强）
+- 哪个品种最强，方向是什么
+- 情绪乘数 / Z-Score 是否极端
+- vol_monitor: ATM IV / RR Skew / Theta 累计 / 持仓安全距离
 
-**vol_monitor 面板（每5分钟刷新）**
-- 市场IV vs 结构IV 的分离程度——分离越大说明恐慌越重
-- Skew（RR）的变化方向——扩大=恐慌加重，收窄=恐慌消退
-- 持仓安全距离——三基准（Forward/期货/现货）都要看
-- Theta累计——你的卖方持仓今天赚了多少时间价值
+### Daily XGB — 一般无操作
 
-**象限 monitor 面板（每5分钟刷新）**
-- 当前象限是否发生变化？
-- 持仓匹配度评估是否出现⚠️或🔴？
-- 象限切换预警距离多远？
+- Daily XGB 是 swing 策略，盘中不交易
+- 持仓自动跟踪 SL（基于 EOD close）
+- 14:55 EOD check 触发的平仓在次日 09:30 执行
 
-### 关键决策点
+### 信号触发处理
 
-**信号触发时（得分 >= 60）**
+**Intraday 信号 (>=60 分)**：
+1. Monitor 自动写 `tmp/signal_pending_{sym}.json` + 注册 shadow
+2. Executor 弹窗：建议 N 手 → 减半 N/2 → 实际 1 手（EXEC_MAX_LOTS=1）
+3. [y/n] 60s 超时自动放弃；STOP_LOSS / EOD / LUNCH 是 opt-out
+4. 60s 限价未成交自动撤单 + 激进价重试
 
-Monitor产生信号后自动写入signal_pending.json并记录shadow trade，不等待输入。
-切换到executor窗口（Ctrl-b 3）查看信号详情并确认是否下单。
+**Daily XGB 信号**：
+1. 09:30-09:35 自动开仓（一日一笔，cap=10）
+2. 14:55 EOD 检查所有 OPEN 持仓
+3. SL（close ≤ entry × (1-sl_pct)）或 TIME（hold_days 到期）→ 次日 09:30 平仓
 
-信号执行流程：
-1. Monitor产生信号 → 面板打印`*** SIGNAL ***` → 自动写JSON + 注册shadow
-2. Executor收到JSON → 展示：建议4手 → 减半2手 → 实际执行1手
-3. Executor等待确认 [y/n]（60秒超时自动放弃）
-4. 开仓限价单60秒未成交自动撤单，平仓30秒后提示改激进价
+### 异常
 
-> 实盘验证期executor限定每笔1手（EXEC_MAX_LOTS=1）
-
-判断要点：
-- 信号和你的 Guidance 一致吗？
-- 信号是在趋势中间还是趋势末端？（日内已涨跌>1.5%要警惕）
-
-**每次你有交易冲动时**
-- 不管有没有执行，记录下来：
-  - 时间、品种、方向
-  - 触发你这个想法的原因（用自己的话）
-  - 当时 monitor 的信号得分是多少
-  - 你最终执行了还是放弃了
-- 这些记录是将来量化你盘感的原材料
-
-**异常情况处理**
-- 标的日内跌/涨超2%：检查卖方持仓安全距离，考虑是否需要对冲
-- IV突然飙升5pp+：可能有重大消息，先评估再操作
-- 止损线接近：提前准备好平仓单，不要犹豫
-- Monitor重启：自动从`shadow_state.json`恢复shadow持仓和position_mgr占位，从`shadow_trades`恢复交易计数。启动时会打印"恢复shadow持仓"和"恢复当日交易"确认
-
-### 时段特征（A股实证）
-
-| 时段 | 特征 | 操作建议 |
-|------|------|---------|
-| 9:30-9:45 | 开盘区间形成 | 不交易，系统禁止开仓 |
-| 9:45-10:30 | 突破时段 | 信号最佳入场窗口 |
-| 10:30-11:20 | 趋势延续最稳定 | 顺势持仓，不轻易平 |
-| 11:20-13:05 | 午休 | 系统禁止开仓 |
-| 13:05-14:30 | 下午主时段 | 正常交易 |
-| 14:30-15:00 | 尾盘 | 系统禁止开仓，观察不操作 |
-
-### 想要取得的结论
-
-> 每天记录2-3个关键观察：信号发出时的市场状态、你的判断和信号是否一致、最终结果对了还是错了。
+- 标的日内跌/涨 >2%：检查 Daily XGB 持仓 SL 距离
+- IV 突然飙 5pp+：可能事件冲击，先评估
+- Monitor 重启：自动从 `shadow_state.json` + `daily_xgb_positions.json` 恢复
+- Daily XGB executor 重启：从 DB `daily_xgb_trades WHERE status='OPEN'` 恢复
 
 ---
 
-## 四、收盘操作（15:15 - 15:30）
-
-### 执行
+## 四、收盘（15:00 - 17:30）
 
 ```bash
-# 1. 收盘后数据记录
-python scripts/daily_record.py eod
+# 1. EOD 数据归档（17:00 后跑，等 Tushare 出数据）
+make eod
+# 等同: python scripts/daily_record.py eod
+# 入库: futures_daily, options_daily, daily_model_output, account_snapshots, ...
 
 # 2. 持仓分析
 python scripts/portfolio_analysis.py
 
-# 3. 波动率快照（收盘后用snapshot模式）
+# 3. 波动率快照
 python scripts/vol_monitor.py --snapshot
 
-# 4. 象限状态记录
-python scripts/quadrant_monitor.py --once
-
-# 5. 回测今天的日内信号
-python scripts/backtest_signals_day.py --symbol IM --date $(date +%Y%m%d)
+# 4. 回测今天的日内信号（验证 backtest 与实盘 shadow 对齐）
+make backtest
 ```
-
-### 检查清单
-
-- [ ] eod 输出无报错
-- [ ] 账户权益和昨天对比变化多少？
-- [ ] 当日成交记录是否完整？
-- [ ] 模型输出是否正常（IV、VRP、GARCH、Greeks）？
-- [ ] 5分钟线归档成功（应该有48根，每天4小时/5分钟=48根）？
-- [ ] 象限判定和持仓匹配度正常？
-- [ ] Markdown报告已保存？
-- [ ] shadow_trades表有今天的记录？
-- [ ] shadow_trades_new_mapping表有v1的记录？（v1观察期）
-- [ ] executor_log表记录完整？
-- [ ] 回测结果和实盘信号是否一致？
 
 ---
 
-## 五、盘后复盘（18:30 - 19:00）
+## 五、Daily XGB 信号生成（17:30 - 18:00）
 
-> Tushare数据通常18:00后发布。如果eod在15:15跑时Tushare无数据，18:30再跑一次。
-
-### 需要分析的信息
-
-**账户层面**
-- 今日账户权益变动——赚了还是亏了，金额多少
-- PnL归因：Delta贡献多少、Theta贡献多少、Vega贡献多少
-- 哪个持仓赚了、哪个亏了
-
-**信号层面**
 ```bash
-# 查看今日v2 shadow trades（系统理想交易）
-python -c "
-import sqlite3
-conn = sqlite3.connect('data/storage/trading.db')
-rows = conn.execute('''
-    SELECT entry_time, symbol, direction, entry_price,
-           exit_time, exit_price, exit_reason, pnl_pts
-    FROM shadow_trades
-    WHERE trade_date = strftime('%Y%m%d', 'now')
-    ORDER BY entry_time
-''').fetchall()
-print('v2 Shadow trades:')
-for r in rows:
-    print(f'  {r[0]} {r[1]} {r[2]} @{r[3]:.0f} -> {r[4]} @{r[5]:.0f} {r[6]} {r[7]:+.1f}pt')
+# 当日 EOD 完成后，生成次日交易信号
+python -m strategies.daily_xgb.signal_generator
 
-# v1 shadow trades
-rows2 = conn.execute('''
-    SELECT entry_time, symbol, direction, entry_price,
-           exit_time, exit_price, exit_reason, pnl_pts, signal_version
-    FROM shadow_trades_new_mapping
-    WHERE trade_date = strftime('%Y%m%d', 'now')
-    ORDER BY entry_time
-''').fetchall()
-print(f'v1 Shadow trades ({len(rows2)}笔):')
-for r in rows2:
-    print(f'  {r[0]} {r[1]} {r[2]} @{r[3]:.0f} -> {r[4]} @{r[5]:.0f} {r[6]} {r[7]:+.1f}pt [{r[8]}]')
-conn.close()
-"
-
-# 查看今日executor log（实际执行）
-python -c "
-import sqlite3
-conn = sqlite3.connect('data/storage/trading.db')
-rows = conn.execute('''
-    SELECT signal_time, symbol, direction, action,
-           operator_response, filled_lots, filled_price, order_status
-    FROM executor_log
-    WHERE receive_time >= date('now')
-    ORDER BY receive_time
-''').fetchall()
-print('Executor log (实际执行):')
-for r in rows:
-    print(f'  {r[0]} {r[1]} {r[2]} {r[3]} resp={r[4]} filled={r[5]}@{r[6]} status={r[7]}')
-conn.close()
-"
+# 输出:
+#   - tmp/daily_xgb_pending_{date}.json  ← executor 次日早盘消费
+#   - daily_xgb_signals 表新行 (status=PENDING)
+# 训练: 当前实现每日 retrain (用全部历史 ≤ 今日 close)
+#   - 训练时间 ~2 min
+#   - 模型缓存 logs/daily_xgb/models/model_{date}.pkl
 ```
 
-- 今天最强的信号是什么？得分多少？方向对了吗？
-- shadow trades vs 实际执行：差异多大？你选N跳过的信号后来赚了还是亏了？
-- executor有没有撤单或超时？原因是什么？
-- v1 vs v2 shadow trade对比：v1今天跟v2的信号差异多大？v1漏掉了什么？v1多做了什么？
-- 有没有信号系统漏掉的交易机会（你有感觉但系统没给分）？
+每日操作员需要：
+- `cat tmp/daily_xgb_pending_*.json` 查看次日信号
+- 如有 `direction=NONE` 或 `status=SKIPPED_GATE` 则次日无 daily 交易
 
-**波动率层面**
-- ATM IV vs 昨天变化了多少？
-- VRP信号变了吗？
-- Skew变化方向？
-- 你的卖方持仓Theta今天赚了多少？
+---
 
-**市场层面**
-- 今天中证1000/沪深300/上证50表现如何？
-- 有没有异常事件（政策、大资金进出、涨跌停异常）？
-- 今天的走势符合你盘前的Guidance吗？
+## 六、盘后复盘（18:30 - 19:00）
+
+### Intraday 复盘
+
+```sql
+-- shadow trades vs 实际执行差异
+SELECT entry_time, symbol, direction, entry_price,
+       exit_time, exit_price, exit_reason, pnl_pts
+FROM shadow_trades
+WHERE trade_date = strftime('%Y%m%d', 'now')
+ORDER BY entry_time;
+
+-- executor 实际执行
+SELECT signal_time, symbol, direction, action,
+       operator_response, filled_lots, filled_price, order_status
+FROM executor_log
+WHERE receive_time >= date('now')
+ORDER BY receive_time;
+```
+
+### Daily XGB 复盘
+
+```sql
+-- 今日 Daily XGB 信号
+SELECT signal_date, direction, status, hold_days, sl_pct, pred,
+       enhancement_type
+FROM daily_xgb_signals
+WHERE signal_date = strftime('%Y%m%d', 'now')
+ORDER BY created_at DESC;
+
+-- 当前 OPEN 持仓
+SELECT id, signal_date, entry_date, direction, entry_price, entry_lots,
+       sl_price, planned_exit_date, enhancement_type
+FROM daily_xgb_trades
+WHERE status='OPEN'
+ORDER BY entry_date;
+
+-- 今日已平仓
+SELECT signal_date, entry_date, exit_date, direction, entry_price, exit_price,
+       exit_reason, pnl_yuan
+FROM daily_xgb_trades
+WHERE status='CLOSED' AND exit_date = strftime('%Y%m%d', 'now');
+
+-- Daily XGB executor 事件
+SELECT event_time, event_type, order_id, details
+FROM daily_xgb_executor_log
+WHERE event_time >= date('now')
+ORDER BY event_time;
+```
 
 ### 写交易笔记
 
 ```bash
-# 打开今日笔记（如果没有就创建）
 mkdir -p logs/notes
 nano logs/notes/$(date +%Y%m%d).md
 ```
 
-必须记录的内容：
-1. **盘前 Guidance 是什么** → 实际走势是什么 → 判断对了还是错了
-2. **信号 vs 盘感**：今天信号和你的直觉有几次一致、几次矛盾？谁更准？
-3. **关键时刻记录**：最重要的1-2个决策时刻，你怎么想的、怎么做的、结果如何
-4. **改进想法**：有没有发现信号系统的问题或优化方向
-
-### 想要取得的结论
-
-> 回答一个核心问题：今天的操作有没有按纪律执行？如果偏离了纪律，原因是什么？
+记录：
+1. 盘前 Guidance vs 实际走势 — 对了还是错了
+2. Intraday 信号 vs 你的盘感 — 几次一致 / 矛盾
+3. Daily XGB 信号 — 信号方向是否符合 regime 预期
+4. 改进想法
 
 ---
 
-## 六、周末复盘（每周五收盘后额外30分钟）
-
-### 本周数据汇总
+## 七、周末（周五收盘后 30min）
 
 ```bash
-# 本周的账户权益变化
+# 本周账户权益曲线
 python -c "
 import sqlite3, pandas as pd
 conn = sqlite3.connect('data/storage/trading.db')
 df = pd.read_sql('''
     SELECT trade_date, balance, float_profit
     FROM account_snapshots
-    WHERE trade_date >= strftime('%Y%m%d', 'now', '-7 days')
+    WHERE trade_date >= strftime(\"%Y%m%d\", \"now\", \"-7 days\")
     ORDER BY trade_date
 ''', conn)
 print(df.to_string())
-conn.close()
+"
+
+# 本周 Daily XGB PnL
+python -c "
+import sqlite3
+conn = sqlite3.connect('data/storage/trading.db')
+rows = conn.execute('''
+    SELECT entry_date, direction, enhancement_type, pnl_yuan, exit_reason
+    FROM daily_xgb_trades
+    WHERE status=\"CLOSED\"
+        AND exit_date >= strftime(\"%Y%m%d\", \"now\", \"-7 days\")
+    ORDER BY exit_date
+''').fetchall()
+total = 0
+for r in rows:
+    print(r)
+    total += r[3] or 0
+print(f'Total: {total:+,.0f}')
 "
 ```
 
-### 需要回答的问题
-
-**策略层面**
-- 本周哪个策略赚钱了？哪个亏了？
-- vol_arb的Theta收入 vs Vega损失——本周净收多少？
-- 日内策略的信号准确率——本周发了多少个信号，对了几个？
-
-**信号系统**
-- 回顾本周所有 score >= 60 的信号，统计方向正确率
-- v2 和 v3 哪个在实盘中更准？
-- 情绪乘数有没有起到作用？
-
-**你的盘感 vs 系统**
-- 本周有几次你的判断和系统矛盾的情况？谁更准？
-- 有没有你看到的规律是系统捕捉不到的？记录下来
-
-**持仓管理**
-- 到期合约需要滚动吗？
-- Strangle的行权价需要调整吗？
-- 下周有没有重大事件需要提前对冲？
-
-### 想要取得的结论
-
-> 本周学到了什么？下周的操作重点是什么？信号系统需要什么调整？
-
----
-
-## 七、月度回顾（每月最后一个交易日额外1小时）
-
-### 分析内容
-
-- 本月账户权益曲线——画出来看趋势
-- 本月各策略贡献分解：贴水收益、Theta收益、方向性盈亏、Gamma Scalping
-- 信号系统月度统计：总信号数、准确率、盈亏比
-- VRP信号的准确率：VRP信号为"做空波动率"时，后续IV真的下降了吗？
-- 你的交易笔记中出现频率最高的"盘感模式"是什么？能量化吗？
-
-### 想要取得的结论
-
-> 回答：这个月的交易系统在进步还是退步？你对市场的理解有没有加深？下个月的重点方向是什么？
+回答的问题：
+- 本周哪条策略赚钱？哪条亏？
+- Intraday vs Daily XGB 哪个 Sharpe 高
+- Daily XGB enhancement (n5_dip / m7_rip) 触发频率与命中率
+- Risk circuit breaker 有没有触发过
 
 ---
 
 ## 附：常用命令速查
 
+### 信号 / 执行（双策略）
+
 ```bash
-# === 盘前 ===
-cat logs/eod/YYYYMMDD.md                    # 查看某日EOD报告
-cat logs/analysis/YYYYMMDD.md               # 查看某日持仓分析
-cat logs/notes/YYYYMMDD.md                  # 查看某日交易笔记
-python scripts/quadrant_monitor.py --once   # 象限快照
+# === Intraday ===
+make briefing                              # Morning Briefing
+make monitor-im                             # IM 信号 monitor
+make monitor-ic                             # IC 信号 monitor
+make vol                                    # 波动率 monitor
+make quadrant                               # 象限 monitor
+make executor                               # Intraday 半自动下单
+make backtest                               # 回测今天
 
-# === 盘中 ===
-python -m strategies.intraday.monitor       # 日内信号面板
-python scripts/vol_monitor.py               # 波动率面板
-python scripts/quadrant_monitor.py          # 象限监控（持续）
-python scripts/daily_record.py snapshot     # 盘中持仓快照
-
-# === 收盘后 ===
-python scripts/daily_record.py eod          # 完整EOD流程
-python scripts/portfolio_analysis.py        # 持仓分析
-python scripts/vol_monitor.py --snapshot    # 波动率快照
-python scripts/quadrant_monitor.py --once   # 象限快照
-
-# === 回测 ===
-python scripts/backtest_signals_day.py --symbol IM --date 20260327              # 单日回测
-python scripts/backtest_signals_day.py --symbol IM --date 20260220-20260327 --sensitivity  # 敏感性分析
-python scripts/signal_quality_analysis.py --symbol IM                           # 信号质量分析
-
-# === 研究分析 ===
-python scripts/momentum_research.py         # 品种动量特征研究
-streamlit run dashboard/app.py              # Dashboard可视化
-
-# === 一键启动 ===
-make trading-day                    # 全天一键（tmux 4窗口+定时EOD）
-make briefing                       # 只跑morning briefing
-make eod                            # 只跑EOD
-make backtest                       # 回测今天
-make dashboard                      # 启动Dashboard
-
-# === tmux操作 ===
-tmux attach -t trading_YYYYMMDD     # 进入交易session
-# Ctrl-b 0/1/2/3 切换窗口（monitor/vol/quadrant/executor）
-# Ctrl-b d 退出session（不关闭）
+# === Daily XGB ===
+python -m strategies.daily_xgb.signal_generator             # 生成次日信号 (盘后跑)
+python -m strategies.daily_xgb.signal_generator --date YYYYMMDD --dry-run
+python scripts/daily_xgb_executor.py                        # 独立 executor (live)
+python scripts/daily_xgb_executor.py --dry-run              # 模拟
+python scripts/daily_xgb_executor.py --eod-only             # 只跑 EOD 检查
+python scripts/daily_xgb_executor.py --signal-only          # 只处理 pending 一次
+python scripts/daily_xgb_self_backtest.py                   # 自研 backtest 验证生产代码
+python scripts/daily_xgb_tq_backtest.py --start YYYYMMDD --end YYYYMMDD --quick  # 快速 sim
+python scripts/daily_xgb_tq_backtest.py --start YYYYMMDD --end YYYYMMDD          # TqBacktest 完整回放
 ```
+
+### 风险熔断
+
+```bash
+# 紧急停止 Daily XGB 开新仓（不影响已有持仓 EOD 平仓）
+touch tmp/daily_xgb_kill.flag
+
+# 解除
+rm tmp/daily_xgb_kill.flag
+
+# 查看 Daily XGB 风险状态
+python -c "from strategies.daily_xgb.risk_guard import status_report; from strategies.daily_xgb.config import DailyXGBConfig; print(status_report(DailyXGBConfig()))"
+```
+
+### 数据维护
+
+```bash
+make eod                                    # EOD 数据归档
+python scripts/daily_record.py model        # 补跑模型输出
+python scripts/portfolio_analysis.py        # 持仓分析
+python scripts/backfill_minute_bars.py --symbol 000852 --exchange SSE --bars 10000
+```
+
+### tmux session
+
+```bash
+tmux attach -t trading_YYYYMMDD             # 进入交易 session
+# Ctrl-b 0/1/2/3/4/5 切换窗口
+# Ctrl-b d 退出 session（不关闭）
+```
+
+---
+
+## Daily XGB 部署模式说明
+
+**保守模式锁死**（无 conservative/aggressive 切换）：
+- 每信号 1 手
+- 同时持仓上限 10 手（concurrent_cap）
+- ATR×1.5 默认 SL，N5/M7 enhancement 用 ATR×4
+- 单周亏损 > 5% 暂停新开仓
+- 单日亏损 > 3% 暂停新开仓
+- 保证金占用 > 85% 暂停新开仓
+
+**预期收益（walk-forward 2.9 yr）**：
+- 年化 +1,472K / 1 手 (= +23% 账户)
+- MaxDD -536K (= -8.4% 账户)
+- Calmar 2.75，Sharpe 5.37
+- 真实执行（T+1 open 进出场）打 9% 折扣 ≈ +21% 账户
+
+如需切换到激进 2× 模式（年化 +46% 账户但 MaxDD -16.8%），改 `strategies/daily_xgb/config.py` 中 `lots_per_signal` + `concurrent_cap`。

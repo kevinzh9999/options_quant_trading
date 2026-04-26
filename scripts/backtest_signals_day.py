@@ -60,7 +60,11 @@ def _build_15m_from_5m(bar_5m: pd.DataFrame) -> pd.DataFrame:
 def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
             slippage: float = 0, version: str = "auto",
             score_transform=None, threshold_override: int = 0,
-            reversal_mode: str = "off") -> List[Dict]:
+            reversal_mode: str = "off",
+            gate_trend_threshold: float = 0.55,
+            vol_threshold: float = 1.0,
+            vol_ratio_threshold: float = 1.0,
+            vol_slope_threshold: float = 0.0) -> List[Dict]:
     """Replay one day. Returns list of completed trades.
 
     Args:
@@ -72,9 +76,23 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
         threshold_override: 如果>0，用此值替代SYMBOL_PROFILES的threshold。
         reversal_mode: reversal_signal 集成模式
             - "off" (默认): 不使用 reversal，同 baseline
-            - "full": 完整 reversal — 既会 REVERSAL_EXIT 逼出原仓，又会反手开 reversal 仓
-            - "exit_only": 只允许 REVERSAL_EXIT 平原仓，不反手开新仓
+            - "full": 完整 reversal
+            - "exit_only": 只 REVERSAL_EXIT 不反手开仓
+            - "gated_full": full + trend_strength gate
+            - "vol_gated_full": full + volume vs day-baseline（旧版）
+            - "vol_gated_A": full + rev/trend window volume ratio
+            - "vol_gated_B": full + trend window volume slope（趋势段是否缩量）
+            - "vol_gated_AB": full + A 和 B 同时满足
+            - "combo_gated": full + trend gate AND vol_gated_full
             配置从 REVERSAL_CONFIG 读取（仅 IM enabled）。
+        gate_trend_threshold: trend_strength 门槛（默认 0.55）。
+        vol_threshold: vol_gated_full 的 rev/day-baseline 门槛（默认 1.0）。
+        vol_ratio_threshold: vol_gated_A 的 rev_avg/trend_avg 门槛（默认 1.0）。
+            经典 TA "趋势末期缩量 + 反转放量" 对应 >= 1.0。
+        vol_slope_threshold: vol_gated_B 的 trend 段 volume 归一化斜率门槛（默认 0.0）。
+            slope / avg_vol = 每 bar 的 volume 变化占均值的比例。
+            reject if slope > threshold（趋势期 volume 未下降 = 无衰竭）。
+            -0.05 = 要求 trend 期每 bar volume 平均下降 5% 才放行。
     """
     date_dash = f"{td[:4]}-{td[4:6]}-{td[6:]}"
 
@@ -406,8 +424,81 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                         position = None
                         action_str = f"EXIT REVERSAL_EXIT {'+'if _pnl>=0 else ''}{_pnl:.0f}pt {_elap}min"
 
-                    # Case 2: 无 position 且 reversal_mode="full" → 开新仓
-                    if position is None and reversal_mode == "full":
+                    # Case 2: 无 position 且 reversal_mode 允许开仓 → 开新仓
+                    _can_open_rev = False
+                    _gate_reason = ""
+                    _ALLOWED_OPEN_MODES = {
+                        "full", "gated_full", "vol_gated_full",
+                        "vol_gated_A", "vol_gated_B", "vol_gated_AB",
+                        "combo_gated",
+                    }
+                    if position is None and reversal_mode in _ALLOWED_OPEN_MODES:
+                        if reversal_mode == "full":
+                            _can_open_rev = True
+                        else:
+                            _today_slice = all_bars.loc[today_indices[:today_indices.index(idx)+1]] \
+                                if idx in today_indices else None
+                            _trend_pass = True
+                            _vol_pass = True
+                            # --- Trend strength gate ---
+                            if reversal_mode in ("gated_full", "combo_gated"):
+                                if _today_slice is not None and len(_today_slice) > 0:
+                                    _d_open = float(_today_slice.iloc[0]["open"])
+                                    _d_high = float(_today_slice["high"].max())
+                                    _d_low = float(_today_slice["low"].min())
+                                    _d_range = max(_d_high - _d_low, 1.0)
+                                    _trend_now = abs(price - _d_open) / _d_range
+                                    if _trend_now > gate_trend_threshold:
+                                        _trend_pass = False
+                                        _gate_reason = f"trend_skip {_trend_now:.2f}>{gate_trend_threshold}"
+                            # --- Old vol_gated_full: rev/day-baseline ratio ---
+                            if reversal_mode in ("vol_gated_full", "combo_gated"):
+                                if _today_slice is not None and len(_today_slice) >= 18:
+                                    _baseline = _today_slice.iloc[6:-6]
+                                    _rev_bars = _today_slice.iloc[-6:]
+                                    _base_avg = float(_baseline["volume"].mean())
+                                    _rev_avg = float(_rev_bars["volume"].mean())
+                                    _vol_ratio = _rev_avg / max(_base_avg, 1.0)
+                                    if _vol_ratio < vol_threshold:
+                                        _vol_pass = False
+                                        _suffix = f"vol_skip {_vol_ratio:.2f}<{vol_threshold}"
+                                        _gate_reason = f"{_gate_reason}|{_suffix}" if _gate_reason else _suffix
+                            # --- A: rev vs trend window ratio ---
+                            # --- B: trend window volume slope (fraction per bar) ---
+                            # Both require bars[-14:] usable (跳过开盘前 6 bars 后还有 14 bars)
+                            if reversal_mode in ("vol_gated_A", "vol_gated_B", "vol_gated_AB"):
+                                if _today_slice is not None and len(_today_slice) >= 20:
+                                    # 跳过前 6 bars（开盘 30min）
+                                    _usable = _today_slice.iloc[6:]
+                                    if len(_usable) >= 14:
+                                        _trend_win = _usable.iloc[-14:-6]  # 8 bars
+                                        _rev_win = _usable.iloc[-6:]        # 6 bars
+                                        _trend_vol_avg = float(_trend_win["volume"].mean())
+                                        _rev_vol_avg = float(_rev_win["volume"].mean())
+                                        _vol_ratio_A = _rev_vol_avg / max(_trend_vol_avg, 1.0)
+                                        # B: normalized slope = slope / avg
+                                        _tv = _trend_win["volume"].values.astype(float)
+                                        if len(_tv) >= 3:
+                                            _slope = float(np.polyfit(range(len(_tv)), _tv, 1)[0])
+                                            _vol_slope_pct = _slope / max(float(np.mean(_tv)), 1.0)
+                                        else:
+                                            _vol_slope_pct = 0.0
+                                        # Check per mode
+                                        _A_fail = (_vol_ratio_A < vol_ratio_threshold)
+                                        _B_fail = (_vol_slope_pct > vol_slope_threshold)
+                                        if reversal_mode == "vol_gated_A" and _A_fail:
+                                            _vol_pass = False
+                                            _gate_reason = f"volA_skip {_vol_ratio_A:.2f}<{vol_ratio_threshold}"
+                                        elif reversal_mode == "vol_gated_B" and _B_fail:
+                                            _vol_pass = False
+                                            _gate_reason = f"volB_skip slope={_vol_slope_pct:+.3f}>{vol_slope_threshold}"
+                                        elif reversal_mode == "vol_gated_AB":
+                                            if _A_fail or _B_fail:
+                                                _vol_pass = False
+                                                _gate_reason = f"volAB_skip A={_vol_ratio_A:.2f} B={_vol_slope_pct:+.3f}"
+                                # < 20 bars: 不 filter，放行
+                            _can_open_rev = _trend_pass and _vol_pass
+                    if _can_open_rev:
                         _rdir = rev.direction
                         _rep = price + slippage if _rdir == "LONG" else price - slippage
                         _rfe = _lookup_fut(dt_str, _rep)
@@ -447,6 +538,12 @@ def run_day(sym: str, td: str, db: DBManager, verbose: bool = True,
                             action_str += f" | OPEN REV {_rdir} d={rev.depth:.0f}"
                         else:
                             action_str = f"OPEN REV {_rdir} d={rev.depth:.0f}"
+                    elif _gate_reason:
+                        # 触发 gate 拦截（仅做调试可见性，不改变其它逻辑）
+                        if action_str:
+                            action_str += f" | REV_GATED({_gate_reason})"
+                        else:
+                            action_str = f"REV_GATED({_gate_reason})"
 
         # 如果刚在 reversal block 开了新仓，本 bar 不再 check_exit（避开自 SL/EOD）
         _just_opened_rev = "OPEN REV" in action_str
@@ -1301,8 +1398,20 @@ def main():
                         help="Signal version: v2, v3, or auto (use SIGNAL_ROUTING)")
     parser.add_argument("--sensitivity", action="store_true",
                         help="Run sensitivity sweep: slippage 0/5/10 × threshold 50/55/60")
-    parser.add_argument("--reversal", choices=["off", "full", "exit_only"],
-                        default="off", help="Reversal integration: off/full/exit_only")
+    parser.add_argument("--reversal",
+                        choices=["off", "full", "exit_only", "gated_full",
+                                 "vol_gated_full", "vol_gated_A",
+                                 "vol_gated_B", "vol_gated_AB",
+                                 "combo_gated"],
+                        default="off", help="Reversal integration mode")
+    parser.add_argument("--gate-threshold", type=float, default=0.55,
+                        help="trend_strength 门槛")
+    parser.add_argument("--vol-threshold", type=float, default=1.0,
+                        help="vol_gated_full 的 day-baseline 门槛")
+    parser.add_argument("--vol-ratio-threshold", type=float, default=1.0,
+                        help="vol_gated_A 的 rev/trend 门槛")
+    parser.add_argument("--vol-slope-threshold", type=float, default=0.0,
+                        help="vol_gated_B 的 trend 斜率门槛（reject if > this）")
     args = parser.parse_args()
 
     db = get_db()
@@ -1334,7 +1443,11 @@ def main():
     for td in dates:
         trades = run_day(args.symbol, td, db, verbose=(len(dates) <= 3),
                          slippage=args.slippage, version=args.version,
-                         reversal_mode=args.reversal)
+                         reversal_mode=args.reversal,
+                         gate_trend_threshold=args.gate_threshold,
+                         vol_threshold=args.vol_threshold,
+                         vol_ratio_threshold=args.vol_ratio_threshold,
+                         vol_slope_threshold=args.vol_slope_threshold)
         all_trades.extend([(td, t) for t in trades])
 
     if len(dates) > 1:
