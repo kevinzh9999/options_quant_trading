@@ -752,23 +752,44 @@ def _eod_model_output(trade_date: str, db) -> dict | None:
         logger.warning("模型模块导入失败，跳过模型输出: %s", e)
         return None
 
-    # ── 1. IM.CFX 日线，计算 RV & GARCH ────────────────────────────────
+    # ── 1. RV & GARCH ──────────────────────────────────────────────────
+    # CRITICAL: 用 spot index (000852.SH) 计算 RV，与 backfill_iv_history 保持
+    # 一致。Daily XGB 模型基于 spot RV 训练，若改用 futures RV (IM.CFX) 会因贴水
+    # 变化引入 ~3% 噪音，feature 分布漂移导致预测失真。
+    # 时效性守卫仍用 IM.CFX (确保 EOD 期货数据已到位)。
     try:
-        df = db.query_df(
-            "SELECT trade_date, close FROM futures_daily "
+        # Step 1a: 时效性守卫 — 必须有今日 IM.CFX 数据
+        guard_df = db.query_df(
+            "SELECT trade_date FROM futures_daily "
             f"WHERE ts_code='IM.CFX' AND trade_date <= '{trade_date}' "
+            "ORDER BY trade_date DESC LIMIT 1"
+        )
+        if guard_df is None or guard_df.empty:
+            logger.warning("IM.CFX 日线数据缺失，跳过模型输出")
+            return None
+        latest_fut_date = str(guard_df["trade_date"].iloc[0]).replace("-", "")
+        if latest_fut_date != trade_date:
+            logger.warning(
+                "数据时效性守卫：IM.CFX 最新日期 %s ≠ 目标 %s，跳过模型输出",
+                latest_fut_date, trade_date,
+            )
+            return None
+
+        # Step 1b: 用 spot index 000852.SH 算 RV/GARCH
+        df = db.query_df(
+            "SELECT trade_date, close FROM index_daily "
+            f"WHERE ts_code='000852.SH' AND trade_date <= '{trade_date}' "
             "ORDER BY trade_date ASC"
         )
         if df is None or len(df) < 62:
-            logger.warning("IM.CFX 日线数据不足 62 条，跳过模型输出")
+            logger.warning("000852.SH 日线数据不足 62 条，跳过模型输出")
             return None
 
-        # 最终数据时效性守卫：拒绝写入过时数据
-        latest_date = str(df["trade_date"].iloc[-1]).replace("-", "")
-        if latest_date != trade_date:
+        latest_idx_date = str(df["trade_date"].iloc[-1]).replace("-", "")
+        if latest_idx_date != trade_date:
             logger.warning(
-                "数据时效性守卫：IM.CFX 最新日期 %s ≠ 目标 %s，拒绝写入模型输出",
-                latest_date, trade_date,
+                "数据时效性守卫：000852.SH 最新日期 %s ≠ 目标 %s，跳过模型输出",
+                latest_idx_date, trade_date,
             )
             return None
 
@@ -792,6 +813,8 @@ def _eod_model_output(trade_date: str, db) -> dict | None:
 
     # ── 2. MO 期权链 → ATM IV（与 portfolio_analysis.py 完全一致的定价逻辑）──
     # 使用 get_atm_iv()：14天过滤 + PCP 隐含 Forward Price
+    # CRITICAL: 必须按 trade_date 过滤期权数据，不能用 MAX(trade_date)。否则
+    # 历史 audit / 重跑时会拿"未来"期权链（在该 trade_date 还不存在的数据）→ data leakage。
     atm_iv = None
     spot = None
     chain_df = pd.DataFrame()
@@ -801,12 +824,14 @@ def _eod_model_output(trade_date: str, db) -> dict | None:
     try:
         spot_row = db.query_df(
             "SELECT close FROM futures_daily "
-            "WHERE ts_code='IM.CFX' ORDER BY trade_date DESC LIMIT 1"
+            f"WHERE ts_code='IM.CFX' AND trade_date <= '{trade_date}' "
+            "ORDER BY trade_date DESC LIMIT 1"
         )
         spot = float(spot_row["close"].iloc[0]) if spot_row is not None and not spot_row.empty else None
 
         latest_row = db.query_df(
-            "SELECT MAX(trade_date) as dt FROM options_daily WHERE ts_code LIKE 'MO%'"
+            "SELECT MAX(trade_date) as dt FROM options_daily "
+            f"WHERE ts_code LIKE 'MO%' AND trade_date <= '{trade_date}'"
         )
         latest_opt_date = (
             str(latest_row["dt"].iloc[0])
@@ -874,10 +899,11 @@ def _eod_model_output(trade_date: str, db) -> dict | None:
     if iv_for_vrp is not None:
         vrp = iv_for_vrp - blended_rv
         # 历史 VRP 百分位（从 daily_model_output 历史记录计算）
+        # CRITICAL: 严格小于 trade_date，避免比较中包含自己（重跑场景）
         try:
             hist = db.query_df(
                 "SELECT vrp FROM daily_model_output "
-                "WHERE underlying='IM' AND vrp IS NOT NULL "
+                f"WHERE underlying='IM' AND vrp IS NOT NULL AND trade_date < '{trade_date}' "
                 "ORDER BY trade_date ASC"
             )
             if hist is not None and len(hist) >= 20:
@@ -887,11 +913,12 @@ def _eod_model_output(trade_date: str, db) -> dict | None:
             pass
 
         # 主信号：基于IV历史分位（不依赖GARCH）
+        # CRITICAL: 严格小于 trade_date，避免重跑时包含自己
         iv_pctile_hist = None
         try:
             iv_hist = db.query_df(
                 "SELECT atm_iv FROM volatility_history "
-                "WHERE atm_iv IS NOT NULL AND atm_iv > 0"
+                f"WHERE atm_iv IS NOT NULL AND atm_iv > 0 AND trade_date < '{trade_date}'"
             )
             if iv_hist is not None and len(iv_hist) > 50:
                 iv_val_pct = (iv_for_vrp * 100) if iv_for_vrp < 1 else iv_for_vrp
@@ -1023,18 +1050,33 @@ def _eod_model_output(trade_date: str, db) -> dict | None:
     except Exception as e:
         logger.warning("贴水信号计算失败: %s", e)
 
+    # ── 5b. iv_term_spread (近月 ATM IV - 远月 ATM IV) — Daily XGB 必需因子 ──
+    # CRITICAL: 与 backfill_iv_history.calc_iv_term_spread 用同一逻辑，避免 EOD 写入
+    # 时缺列导致 INSERT OR REPLACE 把 backfill 数据覆盖为 NULL。
+    iv_term_spread_val = None
+    try:
+        if spot and not chain_df.empty and expire_map:
+            from scripts.backfill_iv_history import calc_iv_term_spread as _calc_term
+            iv_term_spread_val = _calc_term(chain_df, trade_date, expire_map, spot)
+            if iv_term_spread_val is not None:
+                logger.info("IV term spread: %+.4f (近月 - 远月)", iv_term_spread_val)
+    except Exception as e:
+        logger.warning("iv_term_spread 计算失败: %s", e)
+
     # ── 6. 写入 daily_model_output ────────────────────────────────────
     row = {
         "trade_date":             trade_date,
         "underlying":             "IM",
         "garch_current_vol":      round(garch_current_vol,  6),
         "garch_forecast_vol":     round(garch_forecast_vol, 6),
+        "realized_vol_5d":        round(rv_5d,               6) if rv_5d > 0 else None,
         "realized_vol_20d":       round(rv_20d,              6),
         "realized_vol_60d":       round(rv_60d,              6),
-        "atm_iv":                 round(atm_iv, 6) if atm_iv else None,
-        "atm_iv_market":          round(atm_iv_market, 6) if atm_iv_market else None,
-        "vrp":                    round(vrp, 6)    if vrp    else None,
+        "atm_iv":                 round(atm_iv, 6) if atm_iv is not None else None,
+        "atm_iv_market":          round(atm_iv_market, 6) if atm_iv_market is not None else None,
+        "vrp":                    round(vrp, 6)    if vrp is not None    else None,
         "vrp_percentile":         vrp_percentile,
+        "iv_term_spread":         round(iv_term_spread_val, 6) if iv_term_spread_val is not None else None,
         "signal":                 signal,
         "net_delta":              round(net_delta, 4) if net_delta is not None else None,
         "net_gamma":              round(net_gamma, 6) if net_gamma is not None else None,
