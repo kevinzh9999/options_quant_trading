@@ -52,7 +52,8 @@ def _next_trading_day(date_str: str, calendar: pd.DataFrame) -> str:
 
 
 def generate_signal(date: str, cfg: Optional[DailyXGBConfig] = None,
-                     dry_run: bool = False) -> Dict[str, Any]:
+                     dry_run: bool = False,
+                     force_retrain: bool = False) -> Dict[str, Any]:
     """Generate signal for a given date (T = signal date, T+1 = entry day).
 
     Returns the signal record (JSON-serializable). If LONG/SHORT triggered,
@@ -83,8 +84,12 @@ def generate_signal(date: str, cfg: Optional[DailyXGBConfig] = None,
     atr20 = _compute_atr20(closes, highs, lows)
 
     # Train (or load cached) model with cutoff = date
-    print(f"[*] Loading/training model with cutoff ≤ {date} ...")
-    model = get_or_train_model(ctx, train_end_date=date, cfg=cfg)
+    if force_retrain:
+        print(f"[*] FORCE retraining model with cutoff ≤ {date} ...")
+    else:
+        print(f"[*] Loading/training model with cutoff ≤ {date} ...")
+    model = get_or_train_model(ctx, train_end_date=date, cfg=cfg,
+                                  force_retrain=force_retrain)
     print(f"    Model: train_ic={model.train_ic:+.4f}  "
           f"top_thr={model.top_threshold:+.4f}  bot_thr={model.bot_threshold:+.4f}")
 
@@ -218,6 +223,8 @@ def main():
     ap = argparse.ArgumentParser(description="Daily XGB signal generator")
     ap.add_argument("--date", default=None, help="Signal date (YYYYMMDD), default = today BJ")
     ap.add_argument("--dry-run", action="store_true", help="Don't write JSON or DB")
+    ap.add_argument("--force-retrain", action="store_true",
+                     help="Ignore cached model, retrain from scratch")
     args = ap.parse_args()
 
     cfg = DailyXGBConfig()
@@ -230,7 +237,8 @@ def main():
     print()
 
     try:
-        result = generate_signal(date, cfg, dry_run=args.dry_run)
+        result = generate_signal(date, cfg, dry_run=args.dry_run,
+                                    force_retrain=args.force_retrain)
         if result.get("status") == "PENDING":
             sys.exit(0)
         else:

@@ -22,8 +22,9 @@
 14:30-14:55  Intraday 不开新仓，只管理持仓
 14:55     Daily XGB EOD 检查（TIME/SL 触发的次日开盘平仓 flag）
 15:00     收盘
-17:00-17:30  EOD: daily_record.py eod
-17:30     Daily XGB 信号生成（写次日 pending JSON）
+17:00-17:30  EOD: daily_record.py eod (期权/futures/index 数据归档 + daily_model_output)
+17:30-17:35  Daily XGB 模型重训 (~2 min, 用全部历史 ≤ T close 训新模型)
+17:35     Daily XGB 信号生成（用刚训好的模型预测，写次日 pending JSON）
 18:00-18:30  交易笔记 / 复盘
 ```
 
@@ -152,23 +153,75 @@ make backtest
 
 ---
 
-## 五、Daily XGB 信号生成（17:30 - 18:00）
+## 五、Daily XGB 模型重训 + 信号生成（17:30 - 18:00）
+
+**前提条件**：必须等 `make eod` 完成 (`daily_model_output` 表写入今日 atm_iv_market / rr_25d / vrp / iv_term_spread / rv_5d / rv_20d)，否则因子缺数据信号会 SKIPPED_NAN_FEATURES。
 
 ```bash
-# 当日 EOD 完成后，生成次日交易信号
-python -m strategies.daily_xgb.signal_generator
-
-# 输出:
-#   - tmp/daily_xgb_pending_{date}.json  ← executor 次日早盘消费
-#   - daily_xgb_signals 表新行 (status=PENDING)
-# 训练: 当前实现每日 retrain (用全部历史 ≤ 今日 close)
-#   - 训练时间 ~2 min
-#   - 模型缓存 logs/daily_xgb/models/model_{date}.pkl
+make dxgb-signal
+# 等同: python -m strategies.daily_xgb.signal_generator
 ```
 
-每日操作员需要：
-- `cat tmp/daily_xgb_pending_*.json` 查看次日信号
-- 如有 `direction=NONE` 或 `status=SKIPPED_GATE` 则次日无 daily 交易
+**这一条命令包含两步（自动顺序执行）**：
+
+### Step 1: 模型重训 (~2 min)
+
+`signal_generator` 内部调用 `pipeline.get_or_train_model(date=今日)`：
+
+- **是否 retrain**：检查 `logs/daily_xgb/models/model_{今日}.pkl` 是否存在
+  - 不存在 → 训新模型并保存
+  - 存在（同一 date 重跑） → 直接 load 缓存
+- **训练数据**：所有满足 `iv_dates` 的历史日期 ≤ 今日，去除最后 5 天（保留 forward return 实现期）
+- **重训内容**：
+  - XGBoost 决策树（200 棵 trees, max_depth=4, lr=0.03）
+  - In-sample preds 的 P80/P20 → 次日 LONG/SHORT 阈值
+- **不重训**（hardcoded）：
+  - 21 个因子定义
+  - G3s/N5/M7 regime gate 阈值
+  - XGBoost 超参
+  - 持仓规则 (5d/10d/15d hold)
+
+### Step 2: 信号预测
+
+用刚训好的模型对 **今日 close** 的 21 维特征向量做预测：
+- pred ≥ P80 → LONG
+- pred ≤ P20 → SHORT
+- 中间 → 无信号 (status=SKIPPED_NO_DIRECTION)
+
+然后跑 G3s gate（牛市禁空）和 N5/M7 enhancement，决定 hold_days + atr_k。
+
+### 输出
+
+- `tmp/daily_xgb_pending_{今日}.json`：完整信号 payload (executor 次日 09:25 消费)
+- `daily_xgb_signals` 表新行 (status=PENDING)
+- `logs/daily_xgb/models/model_{今日}.pkl`：本日训好的模型缓存
+
+### 操作员检查
+
+```bash
+# 看次日信号
+cat tmp/daily_xgb_pending_*.json | jq '.'
+
+# 看训练 IC
+sqlite3 data/storage/trading.db \
+  "SELECT signal_date, train_ic, n_train_samples, direction, enhancement_type, sl_pct
+   FROM daily_xgb_signals
+   WHERE signal_date = strftime('%Y%m%d', 'now')
+   ORDER BY created_at DESC LIMIT 1"
+```
+
+异常情况：
+- `direction=NONE` (pred 在阈值之间) → 次日无 daily 交易
+- `status=SKIPPED_GATE` (G3s 拦截 SHORT) → 次日无 daily 交易
+- `status=SKIPPED_NAN_FEATURES` → 检查 daily_model_output 是否完整
+- `train_ic < 0.5` → 异常，需排查（正常 0.7-0.8）
+
+### 重训成本与频率
+
+- 每日 ~2 min CPU（train 阶段，predict <1s）
+- 模型文件 ~2-3MB / 天
+- 长期保留所有日期模型用于 audit / 复盘
+- 想节省成本：改 `pipeline.get_or_train_model` 缓存策略为按月（每月第一个交易日重训）
 
 ---
 
