@@ -1116,8 +1116,39 @@ def _eod_model_output(trade_date: str, db) -> dict | None:
             row["hurst_60d"] = round(_calc_hurst(_hdf["close"].astype(float).values[::-1]), 4)
     except Exception as e:
         logger.debug("Hurst计算跳过: %s", e)
+    # CRITICAL: 用 UPDATE-or-INSERT 而非 INSERT OR REPLACE.
+    # INSERT OR REPLACE 会把本函数没写的列（如 pnl_* / 研究列）擦成 NULL.
+    # UPDATE 只改本函数计算的列，其他列原样保留 (idempotent re-run safe).
     try:
-        db.upsert_dataframe("daily_model_output", pd.DataFrame([row]))
+        existing = db.query_df(
+            "SELECT trade_date FROM daily_model_output "
+            f"WHERE trade_date='{trade_date}' AND underlying='IM'"
+        )
+        if existing is not None and not existing.empty:
+            # UPDATE 现有行 (preserves pnl_*, bf_25d, term_structure_shape 等)
+            sets = []
+            params = []
+            for k, v in row.items():
+                if k in ("trade_date", "underlying"):
+                    continue
+                sets.append(f"{k}=?")
+                params.append(v)
+            params.extend([trade_date, "IM"])
+            db._conn.execute(
+                f"UPDATE daily_model_output SET {','.join(sets)} "
+                "WHERE trade_date=? AND underlying=?",
+                params,
+            )
+        else:
+            # INSERT 新行
+            cols = list(row.keys())
+            placeholders = ",".join("?" * len(cols))
+            col_list = ",".join(cols)
+            db._conn.execute(
+                f"INSERT INTO daily_model_output ({col_list}) VALUES ({placeholders})",
+                [row[c] for c in cols],
+            )
+        db._conn.commit()
         logger.info(
             "模型输出已写入: RV20=%.2f%%  GARCH=%.2f%%  结构IV=%s  市场IV=%s  VRP=%s  信号=%s",
             rv_20d * 100, garch_forecast_vol * 100,
