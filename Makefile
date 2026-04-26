@@ -2,7 +2,8 @@ PYTHON := /opt/homebrew/Caskroom/miniforge/base/envs/quant/bin/python
 PYTEST := /opt/homebrew/Caskroom/miniforge/base/envs/quant/bin/pytest
 
 .PHONY: test test-data test-all briefing monitor monitor-im monitor-ic vol quadrant executor eod backtest dashboard trading-day signal-quality sensitivity \
-        dxgb-signal dxgb-executor dxgb-self-bt dxgb-tq-bt dxgb-status
+        dxgb-signal dxgb-executor dxgb-self-bt dxgb-tq-bt dxgb-status \
+        dxgb-audit dxgb-repair-dirty dxgb-repair-all
 
 test:
 	$(PYTEST) tests/test_data/ -v
@@ -68,6 +69,16 @@ dxgb-tq-bt:
 
 dxgb-status:
 	$(PYTHON) -c "from strategies.daily_xgb.risk_guard import status_report; from strategies.daily_xgb.config import DailyXGBConfig; print(status_report(DailyXGBConfig()))"
+
+# === Daily XGB 数据完整性维护（建议每周或部署前跑一次） ===
+dxgb-audit:
+	$(PYTHON) scripts/audit_daily_model_output.py
+
+dxgb-repair-dirty:
+	$(PYTHON) scripts/repair_daily_model_output.py --dirty-only
+
+dxgb-repair-all:
+	$(PYTHON) scripts/repair_daily_model_output.py --rebuild-all
 
 # 一键全天
 trading-day:

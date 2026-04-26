@@ -290,7 +290,70 @@ nano logs/notes/$(date +%Y%m%d).md
 
 ---
 
-## 七、周末（周五收盘后 30min）
+## 七、Daily XGB 数据完整性维护（每周一次 / 部署前必跑）
+
+`daily_model_output` 是 Daily XGB 信号生成的**唯一基础数据源**。任一关键字段 NULL → XGB 直接 SKIPPED_NAN_FEATURES。任一价源不一致（spot vs futures）→ feature 分布漂移 → 预测失真。
+
+### 周五收盘后 + 重大代码变更后必跑 audit
+
+```bash
+make dxgb-audit
+# = python scripts/audit_daily_model_output.py
+```
+
+audit 输出 4 类检查：
+1. **NULL coverage**: 7 个 critical 字段 (atm_iv_market / rv5/rv20 / iv_term_spread / rr_25d / vrp / iv_percentile_hist) 应该 100%
+2. **Sanity check**: 数值是否在合理范围内 (rr_25d ∈ [-0.5, 0.5], vrp ∈ [-0.5, 0.5] 等)
+3. **价源一致性**: 抽 30 个日期重算 spot RV20，对比 DB 值 (>2% 偏差 = 怀疑 futures 来源)
+4. **Day-over-day jumps**: |Δ| > 0.10 标记，多数是真实市场事件，但需人眼复核
+
+dirty dates 写到 `tmp/daily_model_output_dirty_dates.txt`。
+
+### 发现问题 → 修复
+
+```bash
+# 只修 audit 标记的脏数据
+make dxgb-repair-dirty
+# = python scripts/repair_daily_model_output.py --dirty-only
+
+# 或修一段范围
+python scripts/repair_daily_model_output.py --range 20260316-20260402
+
+# 或单日
+python scripts/repair_daily_model_output.py --date 20260424
+
+# 全量重建（~3 min, 适合大改动后做一次彻底清理）
+make dxgb-repair-all
+```
+
+repair 调用修复后的 `_eod_model_output`：
+- UPDATE-or-INSERT 语义（不擦 pnl_* 等其他列）
+- spot 000852.SH 算 RV
+- 全部 21 因子需要的字段都写
+
+### 修复后再跑一次 audit 验证
+
+```bash
+make dxgb-audit
+# 应该 0 dirty dates 或仅剩 day-over-day jumps（真实市场事件）
+```
+
+### 历史教训（2026-04-26 全量审计发现）
+
+发现的 5 个 critical bug：
+1. `realized_vol_5d` 不写入 → XGB 全部 SKIPPED
+2. `iv_term_spread` 不计算 → 同上
+3. RV 用 IM.CFX (futures) 而非 000852.SH (spot) → 贴水变化引入 ~3% 噪音
+4. `MAX(trade_date)` 查询导致历史回算用未来期权链 → data leakage
+5. `INSERT OR REPLACE` 擦掉 pnl_* 和研究列 → 改 UPDATE-or-INSERT
+
+修复 + 全量 rebuild 910 dates 后：
+- 7 个关键字段 100% 覆盖（除 51 个早期 2022 dates iv_percentile_hist 缺历史）
+- self-backtest 年化 +1,160K (修前 +1,472K 是混合 methodology 的"虚高"，现在是真实可重现)
+
+---
+
+## 八、周末（周五收盘后 30min）
 
 ```bash
 # 本周账户权益曲线
@@ -348,15 +411,25 @@ make executor                               # Intraday 半自动下单
 make backtest                               # 回测今天
 
 # === Daily XGB ===
-python -m strategies.daily_xgb.signal_generator             # 生成次日信号 (盘后跑)
-python -m strategies.daily_xgb.signal_generator --date YYYYMMDD --dry-run
-python scripts/daily_xgb_executor.py                        # 独立 executor (live)
-python scripts/daily_xgb_executor.py --dry-run              # 模拟
-python scripts/daily_xgb_executor.py --eod-only             # 只跑 EOD 检查
-python scripts/daily_xgb_executor.py --signal-only          # 只处理 pending 一次
-python scripts/daily_xgb_self_backtest.py                   # 自研 backtest 验证生产代码
-python scripts/daily_xgb_tq_backtest.py --start YYYYMMDD --end YYYYMMDD --quick  # 快速 sim
-python scripts/daily_xgb_tq_backtest.py --start YYYYMMDD --end YYYYMMDD          # TqBacktest 完整回放
+make dxgb-signal                            # 生成次日信号 (盘后 17:30 跑)
+make dxgb-executor                          # 独立 executor (次日早盘 09:25)
+make dxgb-status                            # 风险熔断状态
+make dxgb-self-bt                           # 自研 backtest 验证生产代码
+make dxgb-tq-bt                             # TqBacktest 实盘模拟
+
+# 数据完整性 (推荐每周或部署前)
+make dxgb-audit                             # 审计 daily_model_output 全部字段
+make dxgb-repair-dirty                      # 修 audit 标记的 dirty dates
+make dxgb-repair-all                        # 全量重建 (~3 min)
+
+# 单日 / 范围操作
+python -m strategies.daily_xgb.signal_generator --date YYYYMMDD --force-retrain
+python scripts/repair_daily_model_output.py --range 20260316-20260402
+python scripts/repair_daily_model_output.py --date 20260424
+python scripts/daily_xgb_executor.py --dry-run                  # 模拟
+python scripts/daily_xgb_executor.py --eod-only                 # 只跑 EOD 检查
+python scripts/daily_xgb_executor.py --signal-only              # 只处理 pending 一次
+python scripts/daily_xgb_tq_backtest.py --start YYYYMMDD --end YYYYMMDD --quick
 ```
 
 ### 风险熔断
